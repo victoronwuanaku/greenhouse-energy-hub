@@ -124,6 +124,12 @@ ETA_TES_STANDING = 0.995     # standing efficiency per hour (0.5%/h loss)
 
 GRID_P_MAX_KW = 2000.0       # grid connection capacity (+- )
 
+# Grid tariff asymmetry: imported energy carries grid-transport + levy charges on
+# top of the wholesale day-ahead price; exported energy is settled at wholesale.
+# This breaks the symmetric buy=sell arbitrage and tempers negative-price gaming.
+# Indicative NL large-consumer transport/levy component (provisional).
+GRID_IMPORT_FEE_EUR_KWH = 0.025
+
 # ---------------------------------------------------------------------------
 # Greenhouse thermal model (single setpoint ODE; WUR-informed parameterisation)
 # ---------------------------------------------------------------------------
@@ -286,8 +292,11 @@ def hub_dynamics(x: dict, u: dict, p: dict) -> dict:
         "Q_air_kW": Q_air,
         "m_h2_prod_kg_h": m_h2_prod,
         "m_h2_fc_kg_h": m_h2_fc,
-        "grid_cost_EUR": P_grid * p.get("price", 0.0) * DT_H,
-        "T_violation_C": max(0.0, T_in - T_MAX_C) + max(0.0, T_MIN_C - T_in),
+        # import pays wholesale + transport/levy; export earns wholesale only
+        "grid_cost_EUR": (P_grid * p.get("price", 0.0)
+                          + GRID_IMPORT_FEE_EUR_KWH * max(0.0, P_grid)) * DT_H,
+        # violation of the temperature REACHED during the hour (the controlled result)
+        "T_violation_C": max(0.0, T_in_next - T_MAX_C) + max(0.0, T_MIN_C - T_in_next),
     }
     return x_next, metrics
 

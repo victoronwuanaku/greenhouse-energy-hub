@@ -53,8 +53,10 @@ def fetch_pvgis() -> pd.DataFrame:
     hourly = raw["outputs"]["hourly"]
     df = pd.DataFrame(hourly)
 
-    # Parse PVGIS timestamp format: "YYYYMMDDhhmm"
-    df["timestamp"] = pd.to_datetime(df["time"], format="%Y%m%d:%H%M", utc=True)
+    # Parse PVGIS timestamp format "YYYYMMDD:HHMM" and floor to the hour: PVGIS marks
+    # hourly values at HH:11 (solar-time offset), so flooring gives clean hourly UTC
+    # stamps that align directly with the price series.
+    df["timestamp"] = pd.to_datetime(df["time"], format="%Y%m%d:%H%M", utc=True).floor("h")
     df = df.rename(columns={"P": "P_kW", "G(i)": "G_Wm2", "T2m": "T2m_C"})
     df = df[["timestamp", "P_kW", "G_Wm2", "T2m_C"]].set_index("timestamp")
 

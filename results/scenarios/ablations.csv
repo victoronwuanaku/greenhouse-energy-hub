@@ -1,0 +1,5 @@
+variant,grid_eur,Tband_viol_Ch,effective_eur,grid_saving_pct,effective_saving_pct
+MPC (full),41153.8,0.0,41153.8,7.12,7.12
+no H2,41907.6,0.0,41907.6,5.42,5.42
+no TES,46036.7,0.0,46036.7,-3.9,-3.9
+myopic (1h),23093.7,2992.3,53016.9,47.88,-19.66

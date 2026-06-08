@@ -8,6 +8,9 @@ __pycache__/
 # OS
 .DS_Store
 
+# Local review/working notes (not part of the published project)
+CLAUDE_REVIEW_BRIEF.md
+
 # Environments
 .venv/
 venv/

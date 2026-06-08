@@ -53,7 +53,8 @@ def lighting_schedule(timestamps: pd.DatetimeIndex) -> np.ndarray:
     """
     doy = timestamps.day_of_year.values
     hour = timestamps.hour.values
-    seasonal = 0.5 * (1 + np.cos(2 * np.pi * (doy - 1) / 365))  # peak Jan, zero Jun
+    # 365.25 keeps the annual phase consistent whether or not the source year is a leap year
+    seasonal = 0.5 * (1 + np.cos(2 * np.pi * (doy - 1) / 365.25))  # peak Jan, zero Jun
     lights_on = ((hour >= 6) & (hour < 22)).astype(float)
     return P_LIGHTING_PEAK_W_M2 * seasonal * lights_on
 

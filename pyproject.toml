@@ -1,0 +1,28 @@
+[project]
+name = "greenhouse-energy-hub-mpc"
+version = "0.1.0"
+description = "Rolling-horizon economic MPC for a multi-carrier greenhouse energy hub (electricity, heat, hydrogen)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Viktor Onwuanaku" }]
+dependencies = [
+    "do-mpc>=5.1.1",
+    "casadi>=3.7.2",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "matplotlib>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "jupyter>=1.0", "ipykernel>=6.0", "nbconvert>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# do-mpc/CasADi emit NumPy 2.0 deprecation + optional-feature warnings that are not
+# actionable here; silence them so test output stays readable.
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]

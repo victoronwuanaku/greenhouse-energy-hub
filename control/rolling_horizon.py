@@ -43,41 +43,50 @@ from models.hub_model import (
     hub_dynamics, initial_state, state_bounds,
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
     HP_P_MAX_KW, HP_COP, EBOILER_P_MAX_KW, ETA_EBOILER,
-    TES_P_MAX_KW, ETA_FC_E, E_H2_LHV_KWH_KG,
+    TES_P_MAX_KW,
     C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
-    Q_CROP_LATENT_KW, T_SETPOINT_C, T_MAX_C, DT_H,
+    Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
-from control.mpc_controller import build_mpc, N_HORIZON
+from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
+# NOTE: build_mpc is imported lazily inside run_simulation() so that importing this
+# module (e.g. for load_data or the baseline) does not pull in the do-mpc/IPOPT stack.
+
+# Fair baseline: a frugal thermostat that holds the LOWER comfort bound (cheapest
+# myopic temperature), so any MPC saving reflects dispatch timing/arbitrage rather
+# than simply running the greenhouse colder than a 19 degC setpoint.
+BASELINE_TARGET_C = T_MIN_C + 0.5
 
 DATA_DIR = ROOT / "data"
-RESULTS_DIR = ROOT / "results"
-RESULTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR = ROOT / "results"   # created in main(), not at import time
 
 # Decision variables solved by the MPC (P_grid is the derived slack bus, not a control)
 INPUT_NAMES = ["P_bat_ch", "P_bat_dis", "P_elz", "P_fc", "P_hp",
                "P_eboiler", "Q_tes_ch", "Q_tes_dis", "vent"]
 
 
-def stored_equiv_kwh(soc_bat: float, soc_h2: float, soc_tes: float) -> float:
-    """
-    Electricity-equivalent value of stored energy [kWh]: the recoverable
-    electricity (battery, H2 via fuel cell) plus heat valued at the HP COP.
-    Used to mark-to-market terminal inventory so the controller comparison is
-    not skewed by one controller ending with more/less stored energy.
-    """
-    return (ETA_BAT_DIS * soc_bat
-            + ETA_FC_E * E_H2_LHV_KWH_KG * soc_h2
-            + (1.0 / HP_COP) * soc_tes)
-
-
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+def _key_by_hour(frame: pd.DataFrame) -> pd.DataFrame:
+    """Index a frame by an explicit (month, day, hour) key, flooring sub-hour stamps.
+
+    PVGIS timestamps fall on HH:11 (solar-time offset); flooring to the hour and
+    keying by (month, day, hour) makes the price/PV/demand alignment explicit and
+    robust to the cross-year (and leap-day) mismatch, instead of relying on row order.
+    """
+    f = frame.copy()
+    f.index = f.index.floor("h")
+    f["_key"] = list(zip(f.index.month, f.index.day, f.index.hour))
+    return f.drop_duplicates("_key").set_index("_key")
+
+
 def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
     """
-    Load and align PV/weather (PVGIS) and price (energy-charts) data to a common
-    hourly index for the requested window. PV/weather and prices may come from
-    different years; they are aligned by day-of-year and hour.
+    Load PV/weather (PVGIS) and price (energy-charts) data and align them on an
+    explicit (month, day, hour) key for the requested window. PV/weather and prices
+    may come from different years (and PVGIS 2020 is a leap year); keying by calendar
+    hour — not array position — makes that alignment explicit. Feb 29 has no price
+    counterpart in a non-leap price year and is simply dropped by the key join.
     """
     pv = pd.read_csv(DATA_DIR / "pv_profile.csv",
                      index_col="timestamp", parse_dates=True)
@@ -87,25 +96,21 @@ def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
                          index_col="timestamp", parse_dates=True)
 
     price_year = prices.index[0].year
-    pv_year = pv.index[0].year
-
     start = pd.Timestamp(f"{price_year}-{start_month:02d}-01", tz="UTC")
     end = start + pd.Timedelta(days=n_days)
     prices_window = prices.loc[start:end].iloc[:-1]
-    n_steps = len(prices_window)
 
-    pv_start = pd.Timestamp(f"{pv_year}-{start_month:02d}-01", tz="UTC")
-    pv_end = pv_start + pd.Timedelta(hours=n_steps)
-    pv_window = pv.loc[pv_start:pv_end].iloc[:n_steps]
-    dem_window = demand.loc[pv_start:pv_end].iloc[:n_steps]
+    pv_k, dem_k = _key_by_hour(pv), _key_by_hour(demand)
+    keys = list(zip(prices_window.index.month, prices_window.index.day,
+                    prices_window.index.hour))
 
     df = pd.DataFrame(index=prices_window.index)
     df["price_EUR_kWh"] = prices_window["price_EUR_kWh"].values
     df["price_EUR_MWh"] = prices_window["price_EUR_MWh"].values
-    df["P_pv_kW"] = pv_window["P_kW"].values * 500.0   # scale 1 kWp -> 500 kWp
-    df["G_Wm2"] = pv_window["G_Wm2"].values
-    df["T_out_C"] = pv_window["T2m_C"].values
-    df["P_elec_kW"] = dem_window["P_elec_kW"].values
+    df["P_pv_kW"] = pv_k["P_kW"].reindex(keys).values * 500.0   # scale 1 kWp -> 500 kWp
+    df["G_Wm2"] = pv_k["G_Wm2"].reindex(keys).values
+    df["T_out_C"] = pv_k["T2m_C"].reindex(keys).values
+    df["P_elec_kW"] = dem_k["P_elec_kW"].reindex(keys).values
 
     df = df.dropna()
     print(f"Simulation: {df.index[0]} -> {df.index[-1]}  ({len(df)} steps)")
@@ -130,8 +135,8 @@ def baseline_control(x: dict, p: dict) -> dict:
     C = C_AIR_KWH_K / DT_H
     U = U_EFF_KW_K
 
-    # Generated heat needed to reach the setpoint this step (vents closed, no TES charge)
-    Q_air_req = T_SETPOINT_C * (C + U) - C * T_in - U * T_out + Q_CROP_LATENT_KW
+    # Generated heat needed to reach the target this step (vents closed, no TES charge)
+    Q_air_req = BASELINE_TARGET_C * (C + U) - C * T_in - U * T_out + Q_CROP_LATENT_KW
     Q_heat_req = max(0.0, Q_air_req - Q_solar)
 
     # Heat dispatch: heat pump (cheapest) -> e-boiler -> TES discharge
@@ -176,8 +181,13 @@ def baseline_control(x: dict, p: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Simulation loop
 # ---------------------------------------------------------------------------
-def run_simulation(df: pd.DataFrame, mode: str = "mpc") -> pd.DataFrame:
-    """Run one full simulation (mode = 'mpc' or 'baseline') over the window."""
+def run_simulation(df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs) -> pd.DataFrame:
+    """
+    Run one full simulation (mode = 'mpc' or 'baseline') over the window.
+
+    Extra keyword arguments (n_horizon, disable_h2, disable_tes, terminal_weight)
+    are forwarded to build_mpc to support ablation studies.
+    """
     assert mode in ("mpc", "baseline"), f"Unknown mode: {mode}"
     n = len(df)
     prices = df["price_EUR_kWh"].values
@@ -189,11 +199,13 @@ def run_simulation(df: pd.DataFrame, mode: str = "mpc") -> pd.DataFrame:
     x = initial_state()
 
     if mode == "mpc":
-        print(f"\nBuilding MPC controller (horizon={N_HORIZON}h)...")
+        from control.mpc_controller import build_mpc, N_HORIZON   # lazy (heavy do-mpc import)
+        print(f"\nBuilding MPC controller (horizon={mpc_kwargs.get('n_horizon', N_HORIZON)}h, "
+              f"{', '.join(k for k, v in mpc_kwargs.items() if v) or 'full'})...")
         mpc, _ = build_mpc(
             price_forecast=prices, pv_forecast=pv,
             load_elec_forecast=p_load, temp_out_forecast=t_out,
-            irr_forecast=irr,
+            irr_forecast=irr, **mpc_kwargs,
         )
         x0 = np.array([x["SOC_bat"], x["SOC_h2"], x["SOC_tes"], x["T_in"]])
         mpc.x0 = x0
@@ -237,7 +249,40 @@ def run_simulation(df: pd.DataFrame, mode: str = "mpc") -> pd.DataFrame:
                   f"SOC_h2={x['SOC_h2']:.1f} SOC_tes={x['SOC_tes']:.0f} "
                   f"T_in={x['T_in']:.1f}C  cum cost EUR{cum:.0f}")
 
+    # Append the TRUE terminal state (state after the final control) as the last row,
+    # so inventory settlement and SOC plots use the real end state, not the pre-step
+    # state of the last step. Controls/cost are zero here (no step is taken).
+    term = {"timestamp": df.index[-1] + pd.Timedelta(hours=DT_H),
+            "SOC_bat_kWh": x["SOC_bat"], "SOC_h2_kg": x["SOC_h2"],
+            "SOC_tes_kWh": x["SOC_tes"], "T_in_C": x["T_in"],
+            **{f"u_{name}": 0.0 for name in INPUT_NAMES}, "u_P_grid": 0.0,
+            "P_pv_kW": np.nan, "P_load_kW": np.nan, "price_EUR_kWh": np.nan,
+            "T_out_C": np.nan, "G_Wm2": np.nan, "grid_cost_EUR": 0.0,
+            "elec_residual_kW": 0.0, "Q_air_kW": np.nan, "T_violation_C": 0.0}
+    records.append(term)
+
     return pd.DataFrame(records).set_index("timestamp")
+
+
+def scenario_tag(start_month: int, n_days: int) -> str:
+    """Human-readable scenario label, e.g. 'winter_m01_14d'."""
+    season = {12: "winter", 1: "winter", 2: "winter",
+              3: "spring", 4: "spring", 5: "spring",
+              6: "summer", 7: "summer", 8: "summer",
+              9: "autumn", 10: "autumn", 11: "autumn"}[start_month]
+    return f"{season}_m{start_month:02d}_{n_days}d"
+
+
+def update_summary(summary_path: Path, row: dict):
+    """Append/replace this scenario's row in an auditable summary table."""
+    cols = list(row.keys())
+    if summary_path.exists():
+        table = pd.read_csv(summary_path)
+        table = table[table["scenario"] != row["scenario"]]   # replace if rerun
+        table = pd.concat([table, pd.DataFrame([row])], ignore_index=True)
+    else:
+        table = pd.DataFrame([row], columns=cols)
+    table.sort_values("scenario").to_csv(summary_path, index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -252,56 +297,57 @@ def main():
                         choices=["mpc", "baseline", "both"])
     args = parser.parse_args()
 
+    RESULTS_DIR.mkdir(exist_ok=True)
+    scen_dir = RESULTS_DIR / "scenarios"
+    scen_dir.mkdir(exist_ok=True)
+    tag = scenario_tag(args.start_month, args.days)
+
     print("=" * 65)
-    print("  Greenhouse Energy Hub MPC - Rolling Horizon Simulation")
+    print(f"  Greenhouse Energy Hub MPC - {tag}")
     print("  Location: Westland/Monster, Netherlands")
     print("=" * 65)
 
     df = load_data(start_month=args.start_month, n_days=args.days)
     results = {}
 
-    if args.mode in ("baseline", "both"):
-        print("\n[1/2] BASELINE (rule-based)...")
-        results["baseline"] = run_simulation(df, mode="baseline")
-        results["baseline"].to_csv(RESULTS_DIR / "baseline_results.csv")
-
-    if args.mode in ("mpc", "both"):
-        print("\n[2/2] MPC...")
-        results["mpc"] = run_simulation(df, mode="mpc")
-        results["mpc"].to_csv(RESULTS_DIR / "mpc_results.csv")
+    for i, mode in enumerate(["baseline", "mpc"]):
+        if args.mode not in (mode, "both"):
+            continue
+        print(f"\n[{i+1}/2] {mode.upper()}...")
+        res = run_simulation(df, mode=mode)
+        results[mode] = res
+        res.to_csv(RESULTS_DIR / f"{mode}_results.csv")          # canonical (latest run)
+        res.to_csv(scen_dir / f"{tag}_{mode}.csv")               # scenario archive
 
     if "baseline" in results and "mpc" in results:
-        base = results["baseline"]["grid_cost_EUR"].sum()
-        mpc_c = results["mpc"]["grid_cost_EUR"].sum()
-        saving = base - mpc_c
-        pct = 100 * saving / abs(base) if base != 0 else 0.0
-        bv = results["baseline"]["T_violation_C"].sum()
-        mv = results["mpc"]["T_violation_C"].sum()
-
-        # Inventory-adjusted (mark-to-market) cost: charge each controller for the
-        # net stored energy it consumed over the window, valued at the mean price.
         x0 = initial_state()
         init_eq = stored_equiv_kwh(x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"])
         settle = results["mpc"]["price_EUR_kWh"].mean()
-
-        def adjusted(r):
-            fin_eq = stored_equiv_kwh(r["SOC_bat_kWh"].iloc[-1],
-                                      r["SOC_h2_kg"].iloc[-1],
-                                      r["SOC_tes_kWh"].iloc[-1])
-            return r["grid_cost_EUR"].sum() + settle * (init_eq - fin_eq)
-
-        base_adj, mpc_adj = adjusted(results["baseline"]), adjusted(results["mpc"])
-        adj_saving = base_adj - mpc_adj
-        adj_pct = 100 * adj_saving / abs(base_adj) if base_adj != 0 else 0.0
+        base, mpc_c = (results["baseline"]["grid_cost_EUR"].sum(),
+                       results["mpc"]["grid_cost_EUR"].sum())
+        base_adj = inventory_adjusted_cost(results["baseline"], init_eq, settle)
+        mpc_adj = inventory_adjusted_cost(results["mpc"], init_eq, settle)
+        bv, mv = (results["baseline"]["T_violation_C"].sum(),
+                  results["mpc"]["T_violation_C"].sum())
 
         print("\n" + "=" * 65)
-        print("  RESULTS SUMMARY")
+        print(f"  RESULTS SUMMARY - {tag}")
         print("=" * 65)
         print(f"  Baseline grid cost      : EUR {base:>9.2f}   T-band viol {bv:>6.1f} degC.h")
         print(f"  MPC grid cost           : EUR {mpc_c:>9.2f}   T-band viol {mv:>6.1f} degC.h")
-        print(f"  Saving (raw grid cost)  : EUR {saving:>9.2f}   ({pct:+.1f}%)")
-        print(f"  Saving (inventory-adj.) : EUR {adj_saving:>9.2f}   ({adj_pct:+.1f}%)")
+        print(f"  Saving (raw grid cost)  : EUR {base - mpc_c:>9.2f}   ({saving_pct(base, mpc_c):+.1f}%)")
+        print(f"  Saving (inventory-adj.) : EUR {base_adj - mpc_adj:>9.2f}   ({saving_pct(base_adj, mpc_adj):+.1f}%)")
         print("=" * 65)
+
+        update_summary(scen_dir / "summary.csv", {
+            "scenario": tag, "window_start": str(df.index[0].date()), "days": args.days,
+            "baseline_eur": round(base, 1), "mpc_eur": round(mpc_c, 1),
+            "saving_pct": round(saving_pct(base, mpc_c), 2),
+            "baseline_adj_eur": round(base_adj, 1), "mpc_adj_eur": round(mpc_adj, 1),
+            "adj_saving_pct": round(saving_pct(base_adj, mpc_adj), 2),
+            "base_viol_Ch": round(bv, 1), "mpc_viol_Ch": round(mv, 1),
+        })
+        print(f"  Scenario archive -> {scen_dir}/{tag}_*.csv  | summary -> {scen_dir}/summary.csv")
 
 
 if __name__ == "__main__":

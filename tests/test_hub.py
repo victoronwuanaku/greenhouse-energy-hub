@@ -130,6 +130,23 @@ def test_mpc_builds_steps_and_respects_balance():
 
 
 # ---------------------------------------------------------------------------
+# 2b. Fast deterministic end-to-end integration (does NOT rely on committed CSVs)
+# ---------------------------------------------------------------------------
+def test_integration_short_run_mpc_not_worse_than_baseline():
+    """Run a short real-data window for both controllers and check the headline
+    claim (MPC <= baseline cost) plus physical invariants, regenerated from code."""
+    from control.rolling_horizon import load_data, run_simulation
+    df = load_data(start_month=1, n_days=2)          # deterministic 2-day winter window
+    base = run_simulation(df, mode="baseline")
+    mpc = run_simulation(df, mode="mpc")
+    for d in (base, mpc):
+        assert d["elec_residual_kW"].abs().max() < 1e-6
+        assert ((d.u_P_bat_ch > 1) & (d.u_P_bat_dis > 1)).sum() == 0
+        assert ((d.u_Q_tes_ch > 1) & (d.u_Q_tes_dis > 1)).sum() == 0
+    assert mpc["grid_cost_EUR"].sum() <= base["grid_cost_EUR"].sum() + 1e-6
+
+
+# ---------------------------------------------------------------------------
 # 3. Invariants on saved simulation results
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")

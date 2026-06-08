@@ -21,29 +21,44 @@ This repo implements the **economic-dispatch layer**: a rolling-horizon MPC that
 
 ## Results
 
-14-day rolling-horizon simulation, do-mpc / IPOPT, 24-hour receding horizon, hourly steps, perfect-foresight forecasts. The MPC is compared against a naive rule-based baseline (tracks the 19 °C setpoint reactively, simple battery rule, no look-ahead). Cost is reported both as raw grid cost and **inventory-adjusted** (the net change in stored energy is marked to market at the mean price, so neither controller is rewarded for merely ending the window with more/less storage).
+14-day rolling-horizon simulation, do-mpc / IPOPT, 24-hour receding horizon, hourly steps, perfect-foresight forecasts. The MPC is compared against a **fair rule-based baseline** — a frugal thermostat that holds the *lower* comfort bound (16.5 °C) reactively, with a simple battery rule and no look-ahead. Holding the lower bound (rather than a 19 °C setpoint) means the MPC's saving reflects dispatch skill, not merely running the greenhouse colder. Imports pay wholesale + a transport/levy surcharge; exports earn wholesale. Cost is reported as raw grid cost and **inventory-adjusted** (net stored-energy change marked to market at the mean price, so neither controller is rewarded for merely ending with more/less storage).
 
 | Window | Baseline cost | MPC cost | Saving (raw) | Saving (inv.-adjusted) | Comfort-band violation |
 |--------|--------------:|---------:|:------------:|:----------------------:|:----------------------:|
-| **Winter** (Jan 1–14) | €37,387 | €32,888 | **+12.0 %** | **+11.8 %** (€4,415) | 0 °C·h (both) |
-| **Summer** (Jun 1–14) | €2,959 | €157 | +94.7 % | +92.6 % (€2,791) | ~29 °C·h (both) |
+| **Winter** (Jan 1–14) | €44,308 | €41,154 | **+7.1 %** | **+6.9 %** (€3,073) | 0 °C·h (both) |
+| **Summer** (Jun 1–14) | €3,461 | €1,574 | +54.5 % | +53.1 % (€1,869) | ~29 °C·h (both) |
 
-**Winter is the headline result** and the one that matters for SPROUT: a credible **~12 % operating-cost reduction** on large absolute winter costs, achieved purely by smarter dispatch. The summer percentage is large only because absolute costs are tiny (high PV makes the hub near net-zero) and partly reflects being paid to consume during negative-price hours — a legitimate but flattering demand-response effect; the absolute summer saving is small.
+**Winter is the headline result** and the one that matters for SPROUT: a credible **~7 % operating-cost reduction** on large absolute winter costs, achieved purely by smarter dispatch against a fair baseline. The summer percentage is large because absolute costs are small (high PV makes the hub near net-zero) and partly reflects paid consumption during negative-price hours — a real but flattering demand-response effect; the absolute summer saving is modest.
 
-Every reported run satisfies the physical invariants checked in `tests/`: the electricity balance closes exactly (residual < 10⁻⁶ kW), no store ever charges and discharges in the same hour, and all states stay within bounds.
+Both scenarios are reproducible from committed scenario files (`results/scenarios/`) and summarised in `results/scenarios/summary.csv`. Every reported run satisfies the invariants checked in `tests/`: the electricity balance closes exactly (residual < 10⁻⁶ kW), no store ever charges and discharges in the same hour, and all states stay within bounds.
 
 ### How the MPC wins
 
 ![Cumulative cost](results/figures/fig1_cumulative_cost.png)
 
-- **Storage arbitrage** — the battery cycles its full range daily (charge cheap, discharge expensive); the H₂ tank buffers across multiple days (8 → 158 kg swings) via electrolyser/fuel-cell round-trips.
-- **Power-to-heat load-shifting** — the MPC runs the electric boiler in cheap hours and banks heat in the thermal store, displacing expensive-hour heating (e-boiler use 17 MWh vs 1.5 MWh for the baseline).
-- **Thermal comfort band as flexibility** — instead of holding 19 °C, the MPC lets the greenhouse drift to the 16 °C lower bound when power is expensive and pre-heats the structure's thermal mass when it is cheap. This is the demand-side flexibility SPROUT seeks.
+- **Storage arbitrage** — the battery cycles daily (charge cheap, discharge expensive); the H₂ tank buffers across multiple days via electrolyser/fuel-cell round-trips.
+- **Power-to-heat load-shifting** — the MPC runs the electric boiler in cheap hours and banks heat in the thermal store, displacing expensive-hour heating.
+- **Thermal-mass pre-heating** — both controllers sit near the 16 °C floor, but the MPC additionally pre-heats the greenhouse's thermal mass when power is cheap and coasts when it is expensive — demand-side flexibility within the crop comfort band.
 
 ![Grid exchange vs price](results/figures/fig2_grid_vs_price.png)
 ![Temperature vs comfort band](results/figures/fig4_temperature.png)
 ![Storage trajectories](results/figures/fig3_soc_trajectories.png)
 ![Power-to-heat load-shifting](results/figures/fig5_heat_shifting.png)
+
+### Ablation — where the value comes from
+
+Re-running the winter window with capabilities disabled isolates each contribution. *Effective* cost charges comfort-band violations at the MPC's internal rate (10 €/°C·h), so a controller cannot look cheap by letting the greenhouse drift out of band.
+
+| Variant | Grid cost | Comfort violation | Effective saving vs baseline |
+|---------|----------:|------------------:|:----------------------------:|
+| **MPC (full)** | €41,154 | 0 °C·h | **+7.1 %** |
+| no H₂ | €41,908 | 0 °C·h | +5.4 % |
+| no thermal store | €46,037 | 0 °C·h | **−3.9 %** |
+| myopic (1 h horizon) | €23,094 | 2,992 °C·h | **−19.7 %** |
+
+![Ablation](results/figures/fig6_ablation.png)
+
+The **thermal store is the decisive driver** — remove it and the MPC *loses* to the baseline (−3.9 %), underscoring power-to-heat as the CHP-flexibility replacement. The **H₂ buffer adds ~1.7 points**. The **myopic controller** looks 48 % cheaper on grid cost alone, but only by under-heating and racking up 2,992 °C·h of crop-comfort violation; once that is valued, it is far *worse* (−19.7 %) — i.e. **price foresight is essential to hold the comfort band**, which is the core justification for MPC here.
 
 ---
 
@@ -85,6 +100,7 @@ subject to
 
 - **Storage dynamics** — battery SOC, H₂ inventory, thermal store, greenhouse temperature (implicit-Euler thermal node, unconditionally stable).
 - **Electricity balance** — $P_{\text{grid}} + P_{\text{pv}} + P_{\text{bat,dis}} + P_{\text{fc}} = P_{\text{load}} + P_{\text{bat,ch}} + P_{\text{elz}} + P_{\text{hp}} + P_{\text{eb}}$. The grid is the **slack bus** (a derived expression), so the balance holds *exactly by construction* — avoiding the degenerate squared-equality constraint of the original prototype.
+- **Asymmetric grid tariff** — imported energy pays wholesale price + a transport/levy surcharge; exports earn wholesale only. This breaks symmetric buy=sell arbitrage and tempers negative-price gaming. The import volume uses a smooth $\max(0, P_{\text{grid}})$ so the objective stays differentiable for IPOPT.
 - **Power-to-heat feasibility** — the thermal store can only charge from generated heat.
 - **Comfort band** — $T_{\text{in}}\in[16,24]\,°\mathrm{C}$ as a *soft* constraint (slack-penalised), so the problem stays feasible when summer solar gain physically exceeds ventilation capacity.
 - **Anti-cycling** — per-kWh throughput costs plus a complementarity penalty eliminate simultaneous charge/discharge.
@@ -102,19 +118,24 @@ greenhouse-energy-hub-mpc/
 │   ├── fetch_pvgis.py        # PVGIS API — Westland NL solar + weather
 │   ├── fetch_prices.py       # energy-charts.info — NL day-ahead prices
 │   ├── generate_demand.py    # synthetic greenhouse ELECTRICITY load (WUR params)
-│   └── *.csv                 # generated inputs
+│   └── *.csv                 # generated inputs (hourly UTC)
 ├── models/
 │   └── hub_model.py          # assets, bounds, plant dynamics (Geidl–Andersson hub)
 ├── control/
 │   ├── mpc_controller.py     # do-mpc symbolic MPC (CasADi / IPOPT)
-│   └── rolling_horizon.py    # simulation loop + rule-based baseline
+│   └── rolling_horizon.py    # data alignment, simulation loop, fair baseline, CLI
+├── accounting.py             # shared cost/saving calc (CLI, notebook, tests agree)
+├── experiments/
+│   └── ablations.py          # winter ablation study (no-H2 / no-TES / myopic)
 ├── tests/
-│   └── test_hub.py           # physical & control invariants (pytest)
+│   └── test_hub.py           # physical + control invariants & integration (pytest)
 ├── notebooks/
 │   └── results_analysis.ipynb
+├── pyproject.toml            # metadata, Python ≥3.11, pytest config
 └── results/
-    ├── *.csv
-    └── figures/
+    ├── *.csv                 # canonical (latest) run
+    ├── scenarios/            # per-scenario archives + summary.csv + ablations.csv
+    └── figures/              # fig1–fig6 (committed, used by the README)
 ```
 
 ---
@@ -124,19 +145,20 @@ greenhouse-energy-hub-mpc/
 ```bash
 git clone https://github.com/victoronwuanaku/greenhouse-energy-hub-mpc
 cd greenhouse-energy-hub-mpc
-pip install -r requirements.txt
+pip install -r requirements.txt      # or: pip install -e ".[dev]"
 
 # Generate inputs (PV/weather + NL prices, then the electrical load)
-python data/fetch_pvgis.py
-python data/fetch_prices.py
-python data/generate_demand.py
+python3 data/fetch_pvgis.py
+python3 data/fetch_prices.py
+python3 data/generate_demand.py
 
-# Run both controllers (winter and summer fortnights)
-python control/rolling_horizon.py --days 14 --start-month 1   # winter
-python control/rolling_horizon.py --days 14 --start-month 6   # summer
+# Run both controllers (scenario-tagged outputs land in results/scenarios/)
+python3 control/rolling_horizon.py --days 14 --start-month 1   # winter (headline)
+python3 control/rolling_horizon.py --days 14 --start-month 6   # summer
 
-# Tests and analysis
-pytest tests/ -q
+# Ablation study, tests, and analysis
+python3 experiments/ablations.py --days 14 --start-month 1
+python3 -m pytest tests/ -q
 jupyter nbconvert --to notebook --execute --inplace notebooks/results_analysis.ipynb
 ```
 
@@ -150,7 +172,7 @@ jupyter nbconvert --to notebook --execute --inplace notebooks/results_analysis.i
 | NL day-ahead prices | energy-charts.info (Fraunhofer ISE / ENTSO-E) | 2023, hourly |
 | Greenhouse electrical load | Synthetic, WUR-parameterised (Warmenhoven et al. 2023) | hourly |
 
-PV/weather (2020) and prices (2023) are aligned by day-of-year — a deliberate simplification for this synthetic study (`load_data` handles it year-agnostically; switch the PVGIS database to ERA5/2023 for a fully single-year dataset). Heat demand is **not** prescribed: it is implicit in the greenhouse temperature ODE.
+PV/weather (2020) and prices (2023) come from different years; `load_data` aligns them **explicitly by (month, day, hour)** after flooring the PVGIS `:11` solar-time stamps to the hour (Feb 29 has no non-leap-year price counterpart and is dropped by the key join). This is a deliberate simplification for a synthetic study — switch the PVGIS database to ERA5/2023 for a fully single-year dataset. Heat demand is **not** prescribed: it is implicit in the greenhouse temperature ODE.
 
 ---
 
@@ -168,9 +190,11 @@ PV/weather (2020) and prices (2023) are aligned by day-of-year — a deliberate 
 
 ## Honest limitations
 
-- **Perfect foresight.** Forecasts are the realised data — an upper bound on achievable savings. A natural next step is to add forecast error / robust or stochastic MPC. (That MPC beats the baseline even *with* perfect foresight confirms the value comes from the formulation, not from forecast luck.)
+- **Perfect foresight.** Forecasts are the realised data — an upper bound on achievable savings. A natural next step is forecast error / robust or stochastic MPC.
+- **Naive (if fair) baseline.** The baseline is a frugal reactive thermostat, not a tuned commercial greenhouse EMS; the saving is "MPC vs. a sensible naive rule," not vs. the state of the art.
+- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore still somewhat optimistic.
 - **Toy thermal model.** A single-zone lumped-capacitance ODE; humidity, CO₂ and crop growth are out of scope.
-- **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling). This is reported honestly rather than hidden.
+- **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling). Reported honestly rather than hidden.
 - **Indicative asset sizing.** Capacities are reasonable for a high-tech 1 ha greenhouse but are provisional, not calibrated to a specific site.
 
 ---

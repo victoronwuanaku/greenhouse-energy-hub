@@ -49,6 +49,7 @@ References
 
 import numpy as np
 import do_mpc
+from casadi import sqrt
 
 from models.hub_model import (
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
@@ -56,7 +57,7 @@ from models.hub_model import (
     FC_P_MAX_KW, ETA_FC_E, ETA_FC_H,
     HP_COP, ETA_EBOILER,
     TES_P_MAX_KW, ETA_TES_STANDING,
-    GRID_P_MAX_KW,
+    GRID_P_MAX_KW, GRID_IMPORT_FEE_EUR_KWH,
     C_AIR_KWH_K, U_EFF_KW_K, K_VENT_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
     Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, T_SETPOINT_C,
     state_bounds, input_bounds, STATE_SCALE, INPUT_SCALE,
@@ -83,7 +84,11 @@ def build_mpc(price_forecast: np.ndarray,
               pv_forecast: np.ndarray,
               load_elec_forecast: np.ndarray,
               temp_out_forecast: np.ndarray,
-              irr_forecast: np.ndarray) -> tuple:
+              irr_forecast: np.ndarray,
+              n_horizon: int = N_HORIZON,
+              disable_h2: bool = False,
+              disable_tes: bool = False,
+              terminal_weight: float = W_TERMINAL) -> tuple:
     """
     Construct and return a configured do-mpc MPC controller for the hub.
 
@@ -94,6 +99,10 @@ def build_mpc(price_forecast: np.ndarray,
     load_elec_forecast : [n] array, kW (lighting + base electrical load)
     temp_out_forecast  : [n] array, degC
     irr_forecast       : [n] array, W/m2
+    n_horizon          : prediction horizon [h]; set 1 for a myopic (no-foresight) ablation
+    disable_h2         : if True, lock electrolyser + fuel cell off (no-H2 ablation)
+    disable_tes        : if True, lock the thermal store off (no-TES ablation)
+    terminal_weight    : weight on the terminal stored-energy value (0 disables it)
 
     Returns
     -------
@@ -173,7 +182,7 @@ def build_mpc(price_forecast: np.ndarray,
     # ------------------------------------------------------------------
     mpc = do_mpc.controller.MPC(model)
     mpc.set_param(
-        n_horizon=N_HORIZON,
+        n_horizon=n_horizon,
         t_step=DT_H * 3600,      # do-mpc expects seconds
         n_robust=0,
         store_full_solution=True,
@@ -195,8 +204,12 @@ def build_mpc(price_forecast: np.ndarray,
     # ------------------------------------------------------------------
     # 3. Objective
     # ------------------------------------------------------------------
+    # Imported energy pays wholesale + a transport/levy surcharge; exports earn
+    # wholesale only. import_kw is a smooth max(0, P_grid) so IPOPT stays differentiable.
+    P_grid_expr = model.aux["P_grid"]
+    import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + 1.0))
     lterm = (
-        price * model.aux["P_grid"] * DT_H
+        (price * P_grid_expr + GRID_IMPORT_FEE_EUR_KWH * import_kw) * DT_H
         + W_BAT_THRU * (P_bat_ch + P_bat_dis) * DT_H
         + W_TES_THRU * (Q_tes_ch + Q_tes_dis) * DT_H
         + W_ELZ_WEAR * P_elz * DT_H
@@ -220,7 +233,7 @@ def build_mpc(price_forecast: np.ndarray,
     stored_value = (lam_avg * ETA_BAT_DIS * SOC_bat                       # battery -> elec
                     + lam_avg * ETA_FC_E * E_H2_LHV_KWH_KG * SOC_h2       # H2 -> elec (lossy)
                     + lam_heat * SOC_tes)                                 # TES -> heating elec
-    mterm = -W_TERMINAL * stored_value
+    mterm = -terminal_weight * stored_value
 
     mpc.set_objective(lterm=lterm, mterm=mterm)
     mpc.set_rterm(P_bat_ch=W_RTERM, P_bat_dis=W_RTERM,
@@ -251,6 +264,14 @@ def build_mpc(price_forecast: np.ndarray,
         mpc.bounds["lower", "_u", uname] = lo
         mpc.bounds["upper", "_u", uname] = hi
 
+    # Ablations: lock selected assets off by pinning their upper bound to zero.
+    if disable_h2:
+        mpc.bounds["upper", "_u", "P_elz"] = 0.0
+        mpc.bounds["upper", "_u", "P_fc"] = 0.0
+    if disable_tes:
+        mpc.bounds["upper", "_u", "Q_tes_ch"] = 0.0
+        mpc.bounds["upper", "_u", "Q_tes_dis"] = 0.0
+
     # ------------------------------------------------------------------
     # 6. Time-varying parameters (perfect-foresight forecasts)
     # ------------------------------------------------------------------
@@ -266,7 +287,7 @@ def build_mpc(price_forecast: np.ndarray,
 
     def tvp_fun(t_now):
         k = int(round(float(np.squeeze(t_now)) / (DT_H * 3600)))
-        for i in range(N_HORIZON + 1):
+        for i in range(n_horizon + 1):
             idx = min(k + i, n - 1)
             for key, arr in forecasts.items():
                 tvp_template["_tvp", i, key] = float(arr[idx])
