@@ -1,0 +1,14 @@
+# Core MPC stack
+do-mpc>=5.1.1          # CasADi-based MPC framework (pulls in CasADi + IPOPT)
+casadi>=3.7.2          # symbolic optimisation / auto-differentiation
+
+# Data & numerics
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.9
+
+# Notebook & tests
+jupyter>=1.0
+ipykernel>=6.0
+nbconvert>=7.0
+pytest>=8.0
