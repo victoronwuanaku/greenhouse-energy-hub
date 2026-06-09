@@ -316,7 +316,7 @@ def main():
 
     print("=" * 65)
     print(f"  Greenhouse Energy Hub MPC - {tag}")
-    print("  Location: Westland/Monster, Netherlands")
+    print("  Location: Westland, Netherlands")
     print("=" * 65)
 
     df = load_data(start_month=args.start_month, n_days=args.days)

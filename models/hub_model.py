@@ -2,7 +2,7 @@
 Multi-carrier greenhouse energy hub — component models.
 
 Framework: Geidl & Andersson (2007) energy hub formulation.
-Location:  Division Q, Monster / Westland, Netherlands (1 ha high-tech greenhouse).
+Location:  Representative Dutch (Westland) greenhouse, Netherlands (1 ha high-tech).
 
 This module defines the physical plant: asset sizing, control/state bounds, and the
 discrete-time state-transition function used by both the MPC internal model
@@ -28,7 +28,7 @@ Hub assets (sized for a high-tech, fully-lit 1 ha greenhouse)
   9. Grid connection      — bidirectional, +-2000 kW (realistic for a lit 1 ha site)
 
 The electrolyser + tank + fuel cell together are the green analogue of the gas CHP
-that SPROUT replaces: cheap/surplus electricity -> H2 -> electricity + heat on demand.
+being phased out: cheap/surplus electricity -> H2 -> electricity + heat on demand.
 
 State variables (x)
 -------------------

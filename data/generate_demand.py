@@ -2,7 +2,7 @@
 Generate the synthetic greenhouse ELECTRICITY demand profile.
 
 Parameterised from published WUR (Wageningen University & Research) data for a
-typical Dutch Westland/Monster-area tomato greenhouse (1 ha = 10,000 m2).
+typical Dutch Westland-area tomato greenhouse (1 ha = 10,000 m2).
 
 Note on heat
 ------------

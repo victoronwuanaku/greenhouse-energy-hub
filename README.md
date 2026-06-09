@@ -1,14 +1,14 @@
 # Greenhouse Energy Hub MPC
 
-Rolling-horizon economic **Model Predictive Control (MPC)** for a multi-carrier greenhouse energy hub (electricity · heat · hydrogen). A portfolio project demonstrating engagement with predictive control and energy-systems optimisation, motivated by the [SPROUT project](https://www.tudelft.nl/) — a €5.6M RVO-funded consortium replacing the grid flexibility of Dutch greenhouse CHP units with MPC-controlled hybrid storage hubs.
+Rolling-horizon economic **Model Predictive Control (MPC)** for a multi-carrier greenhouse energy hub (electricity · heat · hydrogen). The controller coordinates solar PV, a battery, a hydrogen electrolyser/fuel-cell buffer, a heat pump, an electric boiler and thermal storage against real Dutch day-ahead electricity prices, minimising operating cost while keeping the crop inside its temperature comfort band.
 
-**Site modelled:** Division Q / Westland greenhouse cluster, Monster, Netherlands · **Scale:** 1 ha (10,000 m²) high-tech lit tomato greenhouse.
+**System modelled:** a representative 1 ha (10,000 m²) high-tech, lit Dutch (Westland) tomato greenhouse.
 
 ---
 
 ## Motivation
 
-Dutch greenhouses have historically provided grid flexibility through **Combined Heat and Power (CHP)** units — gas engines producing electricity (sold to the grid) and heat (for the crop). As the Netherlands phases out fossil CHP, that dispatchable flexibility disappears. SPROUT replaces it with an MPC-orchestrated multi-carrier hub combining:
+Dutch greenhouses have historically provided grid flexibility through **Combined Heat and Power (CHP)** units — gas engines producing electricity (sold to the grid) and heat (for the crop). As the Netherlands phases out fossil CHP, that dispatchable flexibility disappears. Replacing it requires an MPC-orchestrated multi-carrier hub combining:
 
 - **Battery** — short-term price arbitrage and peak shaving
 - **Electrolyser + H₂ tank + fuel cell** — a multi-day buffer; the *green analogue of the CHP* (surplus electricity → H₂ → electricity **and** heat on demand)
@@ -28,7 +28,7 @@ This repo implements the **economic-dispatch layer**: a rolling-horizon MPC that
 | **Winter** (Jan 1–14) | €44,308 | €41,154 | **+7.1 %** | **+6.9 %** (€3,073) | 0 °C·h (both) |
 | **Summer** (Jun 1–14) | €3,461 | €1,574 | +54.5 % | +53.1 % (€1,869) | ~29 °C·h (both) |
 
-**Winter is the headline result** and the one that matters for SPROUT: a credible **~7 % operating-cost reduction** on large absolute winter costs, achieved purely by smarter dispatch against a fair baseline. The summer percentage is large because absolute costs are small (high PV makes the hub near net-zero) and partly reflects paid consumption during negative-price hours — a real but flattering demand-response effect; the absolute summer saving is modest.
+**Winter is the headline result**: a credible **~7 % operating-cost reduction** on large absolute winter costs, achieved purely by smarter dispatch against a fair baseline. The summer percentage is large because absolute costs are small (high PV makes the hub near net-zero) and partly reflects paid consumption during negative-price hours — a real but flattering demand-response effect; the absolute summer saving is modest.
 
 These are **simulation (prototype) results** under perfect foresight and a deliberately simplified market — credible as a research prototype, **not** decision-grade evidence for a specific site. Of the omitted market features, **time-of-use network/capacity tariffs would most affect the winter number** (they reward avoiding peak-hour import, which the MPC already does, so they would likely *widen* the gap), while forecast uncertainty would *narrow* it.
 
@@ -203,7 +203,7 @@ PV/weather (2020) and prices (2023) come from different years; `load_data` align
 
 ## Key references
 
-1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278* — foundational paper from the SPROUT supervisor; this project implements the economic-MPC layer that RL guidance targets.
+1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278* — recent work combining reinforcement learning with predictive control for greenhouse climate management.
 2. **Fiedler, F. et al. (2023).** do-mpc: Towards FAIR nonlinear and robust MPC. *Control Engineering Practice, 140*, 105676.
 3. **Geidl, M. & Andersson, G. (2007).** Optimal power flow of multiple energy carriers. *IEEE Trans. Power Syst. 22*(1), 145–155 — the energy-hub framework used in `hub_model.py`.
 4. **Coordinated distributed MPC for multi-energy carrier systems** (2024). *Scientific Reports.*
@@ -211,8 +211,6 @@ PV/weather (2020) and prices (2023) come from different years; `load_data` align
 
 ---
 
-## SPROUT context
+## License
 
-This project addresses SPROUT's core control challenge: replacing the dispatchable flexibility of phased-out CHP units with an MPC-orchestrated multi-carrier storage hub. The economic-dispatch layer demonstrated here — coordinating battery, hydrogen and thermal storage and power-to-heat against real NL price signals — is the foundation on which the hierarchical RL-guided MPC of McAllister et al. (2025) operates.
-
-Viktor Onwuanaku holds an MSc from Wageningen University (2025), a SPROUT consortium partner, and brings energy-systems modelling experience (PyPSA, HOMER Pro, DIgSILENT PowerFactory) from a techno-economic HRES optimisation thesis — a direct bridge to the SPROUT team's modelling and experimental infrastructure.
+MIT — see `pyproject.toml`.

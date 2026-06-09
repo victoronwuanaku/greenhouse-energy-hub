@@ -1,7 +1,7 @@
 """
 Fetch hourly solar PV generation data from the PVGIS API (EU JRC).
 
-Location: Division Q greenhouse, Monster, Netherlands (52.04°N, 4.16°E).
+Location: Westland glasshouse district, Netherlands (52.0°N, 4.25°E).
 System:   1 kWp crystalline silicon, 30° tilt, south-facing, 14% system loss.
 Year:     2020 (most recent full year in PVGIS-SARAH2 database; API caps at 2020).
           Price data uses 2023 — datasets are reindexed to a common 8760-hour
@@ -19,10 +19,9 @@ import urllib.request
 import pandas as pd
 from pathlib import Path
 
-# --- Site parameters (Westland greenhouse cluster, NL) ---
-# Note: Monster coast (52.04, 4.16) is classified as sea by PVGIS.
-# Using nearest inland point in the Westland glasshouse district (52.0°N, 4.25°E),
-# ~4 km east of Division Q — climatically identical at this resolution.
+# --- Site parameters (Westland glasshouse district, NL) ---
+# An inland point in the Westland greenhouse district; coastal points are classified
+# as sea by PVGIS, so a nearby inland coordinate is used (climatically equivalent).
 LAT = 52.0
 LON = 4.25
 YEAR = 2020  # PVGIS-SARAH2 available 2005–2020
