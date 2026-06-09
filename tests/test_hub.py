@@ -130,19 +130,44 @@ def test_mpc_builds_steps_and_respects_balance():
 
 
 # ---------------------------------------------------------------------------
+# Shared physical-invariant suite — used by BOTH the regenerated integration run and
+# the committed-CSV checks, so they assert exactly the same things.
+# ---------------------------------------------------------------------------
+def operating_rows(df):
+    """Drop the terminal-state row (NaN exogenous inputs); keep true operating hours."""
+    return df[df["price_EUR_kWh"].notna()]
+
+
+def assert_physical_invariants(df):
+    op = operating_rows(df)
+    # electricity balance closes exactly (slack-bus construction)
+    assert df["elec_residual_kW"].abs().max() < 1e-6
+    # no store charges and discharges in the same operating hour (battery, TES, H2)
+    assert ((op.u_P_bat_ch > 1.0) & (op.u_P_bat_dis > 1.0)).sum() == 0
+    assert ((op.u_Q_tes_ch > 1.0) & (op.u_Q_tes_dis > 1.0)).sum() == 0
+    assert ((op.u_P_elz > 1.0) & (op.u_P_fc > 1.0)).sum() == 0
+    # storage within physical limits [0, capacity]
+    for col, cap in [("SOC_bat_kWh", BAT_CAPACITY_KWH), ("SOC_h2_kg", H2_CAPACITY_KG),
+                     ("SOC_tes_kWh", TES_CAPACITY_KWH)]:
+        assert df[col].min() >= -1.0, f"{col} below 0"
+        assert df[col].max() <= cap + 1.0, f"{col} above capacity"
+    # temperature within hard safety bounds
+    assert df.T_in_C.min() >= T_HARD_MIN_C - 1e-6
+    assert df.T_in_C.max() <= T_HARD_MAX_C + 1e-6
+
+
+# ---------------------------------------------------------------------------
 # 2b. Fast deterministic end-to-end integration (does NOT rely on committed CSVs)
 # ---------------------------------------------------------------------------
-def test_integration_short_run_mpc_not_worse_than_baseline():
-    """Run a short real-data window for both controllers and check the headline
-    claim (MPC <= baseline cost) plus physical invariants, regenerated from code."""
+def test_integration_short_run_full_invariants_and_mpc_not_worse():
+    """Regenerate a short real-data window for both controllers and assert the SAME
+    physical-invariant suite used on committed results, plus MPC <= baseline cost."""
     from control.rolling_horizon import load_data, run_simulation
     df = load_data(start_month=1, n_days=2)          # deterministic 2-day winter window
     base = run_simulation(df, mode="baseline")
     mpc = run_simulation(df, mode="mpc")
-    for d in (base, mpc):
-        assert d["elec_residual_kW"].abs().max() < 1e-6
-        assert ((d.u_P_bat_ch > 1) & (d.u_P_bat_dis > 1)).sum() == 0
-        assert ((d.u_Q_tes_ch > 1) & (d.u_Q_tes_dis > 1)).sum() == 0
+    assert_physical_invariants(base)
+    assert_physical_invariants(mpc)
     assert mpc["grid_cost_EUR"].sum() <= base["grid_cost_EUR"].sum() + 1e-6
 
 
@@ -153,30 +178,23 @@ def test_integration_short_run_mpc_not_worse_than_baseline():
 def results():
     b, m = RESULTS / "baseline_results.csv", RESULTS / "mpc_results.csv"
     if not (b.exists() and m.exists()):
-        pytest.skip("Run `python control/rolling_horizon.py` first to generate results.")
+        pytest.skip("Run `python3 control/rolling_horizon.py` first to generate results.")
     return pd.read_csv(b), pd.read_csv(m)
 
 
-def test_results_balance_residual_zero(results):
+def test_results_physical_invariants(results):
     for d in results:
-        assert d["elec_residual_kW"].abs().max() < 1e-6
+        assert_physical_invariants(d)
 
 
-def test_results_no_simultaneous_charge_discharge(results):
+def test_results_terminal_row_schema(results):
+    """Each results frame has exactly one terminal row, flagged both by is_terminal
+    and by NaN exogenous price (so downstream code can filter it reliably)."""
     for d in results:
-        assert ((d.u_P_bat_ch > 1.0) & (d.u_P_bat_dis > 1.0)).sum() == 0
-        assert ((d.u_Q_tes_ch > 1.0) & (d.u_Q_tes_dis > 1.0)).sum() == 0
-        assert ((d.u_P_elz > 1.0) & (d.u_P_fc > 1.0)).sum() == 0
-
-
-def test_results_soc_within_physical_bounds(results):
-    """Both controllers must keep storage within physical limits [0, capacity]."""
-    caps = {"SOC_bat_kWh": BAT_CAPACITY_KWH, "SOC_h2_kg": H2_CAPACITY_KG,
-            "SOC_tes_kWh": TES_CAPACITY_KWH}
-    for d in results:
-        for col, cap in caps.items():
-            assert d[col].min() >= -1.0
-            assert d[col].max() <= cap + 1.0
+        assert "is_terminal" in d.columns
+        is_term = d["is_terminal"].astype(str).str.strip().str.lower().isin(["true", "1"])
+        assert is_term.sum() == 1
+        assert (is_term.values == d["price_EUR_kWh"].isna().values).all()
 
 
 def test_mpc_respects_operational_soc_bounds(results):
@@ -196,12 +214,41 @@ def test_mpc_respects_operational_soc_bounds(results):
     assert m.SOC_tes_kWh.max() <= sb["SOC_tes"][1] + tol
 
 
-def test_results_temperature_within_hard_bounds(results):
-    for d in results:
-        assert d.T_in_C.min() >= T_HARD_MIN_C - 1e-6
-        assert d.T_in_C.max() <= T_HARD_MAX_C + 1e-6
-
-
 def test_mpc_beats_or_matches_baseline(results):
     b, m = results
     assert m["grid_cost_EUR"].sum() <= b["grid_cost_EUR"].sum()
+
+
+# ---------------------------------------------------------------------------
+# 4. Published-artifact consistency and accounting bounds
+# ---------------------------------------------------------------------------
+def test_summary_consistent_with_scenario_csvs():
+    """results/scenarios/summary.csv must be reproducible from the committed scenario
+    CSVs via the shared accounting module — so the published table cannot drift from
+    the underlying data without a test failing."""
+    scen = RESULTS / "scenarios"
+    if not (scen / "summary.csv").exists():
+        pytest.skip("No scenario summary committed yet.")
+    from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
+    x0 = initial_state()
+    init_eq = stored_equiv_kwh(x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"])
+    summ = pd.read_csv(scen / "summary.csv")
+    for _, row in summ.iterrows():
+        b = pd.read_csv(scen / f"{row.scenario}_baseline.csv")
+        m = pd.read_csv(scen / f"{row.scenario}_mpc.csv")
+        settle = m["price_EUR_kWh"].mean()
+        assert b["grid_cost_EUR"].sum() == pytest.approx(row.baseline_eur, abs=1.0)
+        assert m["grid_cost_EUR"].sum() == pytest.approx(row.mpc_eur, abs=1.0)
+        assert inventory_adjusted_cost(b, init_eq, settle) == pytest.approx(row.baseline_adj_eur, abs=1.0)
+        assert inventory_adjusted_cost(m, init_eq, settle) == pytest.approx(row.mpc_adj_eur, abs=1.0)
+        assert saving_pct(b["grid_cost_EUR"].sum(), m["grid_cost_EUR"].sum()) == pytest.approx(row.saving_pct, abs=0.2)
+
+
+def test_import_fee_smoothing_error_is_bounded():
+    """The MPC's smooth import volume tracks the exact max(0, P_grid) used by the plant
+    to within the documented epsilon (worst case 0.5 kW at P_grid=0), so the solver
+    objective stays close to the realised/reported cost."""
+    P = np.linspace(-2000.0, 2000.0, 4001)
+    smooth = 0.5 * (P + np.sqrt(P**2 + 1.0))   # must match mpc_controller IMPORT_SMOOTH_EPS2
+    exact = np.maximum(0.0, P)
+    assert np.max(np.abs(smooth - exact)) <= 0.5 + 1e-9

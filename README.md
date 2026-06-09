@@ -30,6 +30,8 @@ This repo implements the **economic-dispatch layer**: a rolling-horizon MPC that
 
 **Winter is the headline result** and the one that matters for SPROUT: a credible **~7 % operating-cost reduction** on large absolute winter costs, achieved purely by smarter dispatch against a fair baseline. The summer percentage is large because absolute costs are small (high PV makes the hub near net-zero) and partly reflects paid consumption during negative-price hours — a real but flattering demand-response effect; the absolute summer saving is modest.
 
+These are **simulation (prototype) results** under perfect foresight and a deliberately simplified market — credible as a research prototype, **not** decision-grade evidence for a specific site. Of the omitted market features, **time-of-use network/capacity tariffs would most affect the winter number** (they reward avoiding peak-hour import, which the MPC already does, so they would likely *widen* the gap), while forecast uncertainty would *narrow* it.
+
 Both scenarios are reproducible from committed scenario files (`results/scenarios/`) and summarised in `results/scenarios/summary.csv`. Every reported run satisfies the invariants checked in `tests/`: the electricity balance closes exactly (residual < 10⁻⁶ kW), no store ever charges and discharges in the same hour, and all states stay within bounds.
 
 ### How the MPC wins
@@ -192,7 +194,7 @@ PV/weather (2020) and prices (2023) come from different years; `load_data` align
 
 - **Perfect foresight.** Forecasts are the realised data — an upper bound on achievable savings. A natural next step is forecast error / robust or stochastic MPC.
 - **Naive (if fair) baseline.** The baseline is a frugal reactive thermostat, not a tuned commercial greenhouse EMS; the saving is "MPC vs. a sensible naive rule," not vs. the state of the art.
-- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore still somewhat optimistic.
+- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore still somewhat optimistic. The MPC objective uses a smooth `max(0, P_grid)` (ε = 1 kW) for the import fee; the reported cost uses the exact `max`, so published savings are unaffected (bounded in `tests/`).
 - **Toy thermal model.** A single-zone lumped-capacitance ODE; humidity, CO₂ and crop growth are out of scope.
 - **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling). Reported honestly rather than hidden.
 - **Indicative asset sizing.** Capacities are reasonable for a high-tech 1 ha greenhouse but are provisional, not calibrated to a specific site.

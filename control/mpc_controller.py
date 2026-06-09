@@ -204,10 +204,15 @@ def build_mpc(price_forecast: np.ndarray,
     # ------------------------------------------------------------------
     # 3. Objective
     # ------------------------------------------------------------------
-    # Imported energy pays wholesale + a transport/levy surcharge; exports earn
-    # wholesale only. import_kw is a smooth max(0, P_grid) so IPOPT stays differentiable.
+    # Imported energy pays wholesale + a transport/levy surcharge; exports earn wholesale.
+    # import_kw is a smooth max(0, P_grid) = 0.5*(P + sqrt(P^2 + eps^2)) so the objective
+    # stays C-infinity for IPOPT. eps = 1 kW; this charges a tiny phantom import (~0.5 kW
+    # at P_grid=0, i.e. ~0.0125 EUR/h of surcharge) that biases the SOLVER objective only.
+    # The realised/reported grid cost in hub_dynamics uses the EXACT max(0, P_grid), so
+    # published savings are unaffected; tests/test_hub.py bounds this approximation error.
+    IMPORT_SMOOTH_EPS2 = 1.0
     P_grid_expr = model.aux["P_grid"]
-    import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + 1.0))
+    import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + IMPORT_SMOOTH_EPS2))
     lterm = (
         (price * P_grid_expr + GRID_IMPORT_FEE_EUR_KWH * import_kw) * DT_H
         + W_BAT_THRU * (P_bat_ch + P_bat_dis) * DT_H

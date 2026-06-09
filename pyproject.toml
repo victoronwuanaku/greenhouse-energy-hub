@@ -20,9 +20,10 @@ dev = ["pytest>=8.0", "jupyter>=1.0", "ipykernel>=6.0", "nbconvert>=7.0"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-# do-mpc/CasADi emit NumPy 2.0 deprecation + optional-feature warnings that are not
-# actionable here; silence them so test output stays readable.
+# Narrowly silence only the known, non-actionable third-party warnings (do-mpc optional
+# features + the NumPy 2.0 __array_wrap__ deprecation triggered via CasADi) so test output
+# stays readable WITHOUT hiding future project or dependency warnings.
 filterwarnings = [
-    "ignore::DeprecationWarning",
-    "ignore::UserWarning",
+    "ignore::UserWarning:do_mpc",
+    "ignore:.*__array_wrap__.*:DeprecationWarning",
 ]

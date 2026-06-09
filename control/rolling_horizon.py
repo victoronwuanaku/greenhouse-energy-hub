@@ -16,16 +16,25 @@ Heat is implicit: there is no prescribed heat-demand series. Both controllers
 must keep the greenhouse temperature inside the comfort band by supplying heat
 (heat pump, e-boiler, fuel-cell heat, TES) and opening ventilation.
 
-Baseline controller (naive, no look-ahead)
-------------------------------------------
-  - Heat to hold the setpoint reactively: heat pump first, then e-boiler, then TES.
+Baseline controller (fair, naive, no look-ahead)
+------------------------------------------------
+  - A frugal thermostat: reactively heats to hold the LOWER comfort bound
+    (BASELINE_TARGET_C = T_MIN + 0.5 = 16.5 degC), the cheapest in-band temperature,
+    via heat pump first, then e-boiler, then TES discharge.
+  - Holding the lower bound (not a 19 degC setpoint) makes the comparison fair: any
+    MPC saving reflects dispatch timing/arbitrage, not simply running colder.
   - Vent fully when solar gain would push the air above the comfort band.
   - Battery charges from PV surplus, discharges when price > 0.12 EUR/kWh.
   - No hydrogen use, no thermal pre-storage, no price look-ahead.
 
+Result schema note: each results frame has one row per simulated hour plus a final
+`is_terminal=True` row carrying the true terminal state (zero controls/cost, NaN
+exogenous inputs) so inventory settlement uses the real end state. Operating-step
+aggregations should filter `is_terminal == False`.
+
 Usage
 -----
-    python control/rolling_horizon.py [--days 14] [--start-month 6] [--mode both]
+    python3 control/rolling_horizon.py [--days 14] [--start-month 6] [--mode both]
     # winter fortnight: --start-month 1 ;  summer fortnight: --start-month 6
 """
 
@@ -126,7 +135,8 @@ def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
 # Baseline controller (rule-based, no look-ahead)
 # ---------------------------------------------------------------------------
 def baseline_control(x: dict, p: dict) -> dict:
-    """Naive reactive dispatch: hold setpoint with HP/e-boiler/TES, simple battery."""
+    """Naive reactive dispatch: hold the lower comfort bound (BASELINE_TARGET_C)
+    with HP/e-boiler/TES, plus a simple PV-charge / high-price-discharge battery rule."""
     sb = state_bounds()
     T_in, T_out, G = x["T_in"], p["T_out"], p["G_Wm2"]
     P_pv, P_load, price = p["P_pv"], p["P_load"], p["price"]
@@ -239,6 +249,7 @@ def run_simulation(df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs) -> pd.Data
             "elec_residual_kW": metrics["elec_residual_kW"],
             "Q_air_kW": metrics["Q_air_kW"],
             "T_violation_C": metrics["T_violation_C"],
+            "is_terminal": False,
         }
         records.append(rec)
         x = x_next
@@ -258,7 +269,8 @@ def run_simulation(df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs) -> pd.Data
             **{f"u_{name}": 0.0 for name in INPUT_NAMES}, "u_P_grid": 0.0,
             "P_pv_kW": np.nan, "P_load_kW": np.nan, "price_EUR_kWh": np.nan,
             "T_out_C": np.nan, "G_Wm2": np.nan, "grid_cost_EUR": 0.0,
-            "elec_residual_kW": 0.0, "Q_air_kW": np.nan, "T_violation_C": 0.0}
+            "elec_residual_kW": 0.0, "Q_air_kW": np.nan, "T_violation_C": 0.0,
+            "is_terminal": True}
     records.append(term)
 
     return pd.DataFrame(records).set_index("timestamp")
