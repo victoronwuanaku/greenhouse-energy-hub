@@ -47,6 +47,67 @@ def _sample_params():
     return {"P_pv": 80.0, "P_load": 600.0, "price": 0.10, "T_out": 5.0, "G_Wm2": 0.0}
 
 
+def test_characterizes_nominal_multicarrier_step_and_exact_import_fee():
+    """Freeze verified legacy plant outputs before the expression layer moves."""
+    x_next, metrics = hub_dynamics(initial_state(), _sample_controls(), _sample_params())
+
+    assert x_next == pytest.approx(
+        {
+            "SOC_bat": 596.0,
+            "SOC_h2": 60.975097509750974,
+            "SOC_tes": 1742.0,
+            "T_in": 15.919402985074626,
+        }
+    )
+    assert metrics["P_grid_kW"] == pytest.approx(970.0)
+    assert metrics["grid_cost_EUR"] == pytest.approx(121.25)
+    assert metrics["Q_hp_kW"] == pytest.approx(350.0)
+    assert metrics["Q_eboiler_kW"] == pytest.approx(198.0)
+    assert metrics["m_h2_prod_kg_h"] == pytest.approx(0.9750975097509752)
+    assert metrics["elec_residual_kW"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_characterizes_limited_baseline_policy_at_fixed_fixtures():
+    """Freeze policy decisions without endorsing legacy fairness claims."""
+    from control.rolling_horizon import baseline_control
+
+    cold_expensive = baseline_control(
+        initial_state(),
+        {"P_pv": 0.0, "P_load": 400.0, "price": 0.20, "T_out": 5.0, "G_Wm2": 0.0},
+    )
+    assert cold_expensive == pytest.approx(
+        {
+            "P_bat_ch": 0.0,
+            "P_bat_dis": 384.0,
+            "P_elz": 0.0,
+            "P_fc": 0.0,
+            "P_hp": 122.97619047619044,
+            "P_eboiler": 0.0,
+            "Q_tes_ch": 0.0,
+            "Q_tes_dis": 0.0,
+            "vent": 0.0,
+        }
+    )
+
+    sunny_surplus = baseline_control(
+        initial_state(),
+        {"P_pv": 1000.0, "P_load": 100.0, "price": 0.05, "T_out": 20.0, "G_Wm2": 700.0},
+    )
+    assert sunny_surplus == pytest.approx(
+        {
+            "P_bat_ch": 416.6666666666667,
+            "P_bat_dis": 0.0,
+            "P_elz": 0.0,
+            "P_fc": 0.0,
+            "P_hp": 0.0,
+            "P_eboiler": 0.0,
+            "Q_tes_ch": 0.0,
+            "Q_tes_dis": 0.0,
+            "vent": 1.0,
+        }
+    )
+
+
 def test_electricity_balance_is_exact():
     """Derived P_grid must close the electricity balance exactly (slack bus)."""
     x, u, p = initial_state(), _sample_controls(), _sample_params()
