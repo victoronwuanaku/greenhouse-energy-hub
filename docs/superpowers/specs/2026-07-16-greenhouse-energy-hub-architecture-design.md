@@ -1,6 +1,6 @@
 # Greenhouse Energy Hub Architecture Design
 
-**Review status:** Complete written design awaiting user approval
+**Review status:** Approved by the user on 2026-07-17
 
 ## Purpose
 
