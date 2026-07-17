@@ -12,7 +12,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "results" / "runs"
-CANDIDATE_INDEX = ROOT / "results" / "diagnostics" / "publication-candidates.json"
+DIAGNOSTICS = ROOT / "results" / "diagnostics"
+CANDIDATE_INDEX = DIAGNOSTICS / "publication-candidates.json"
 
 EXPECTED_PUBLICATION_CANDIDATE_KEYS = frozenset(
     {
@@ -37,6 +38,31 @@ EXPECTED_UTC_WINDOWS = {
         "2023-06-14T22:00:00Z",
         "2023-06-15T22:00:00Z",
     ),
+}
+FULL_ASSET_CAPABILITIES = {
+    "battery": True,
+    "hydrogen": True,
+    "thermal_store": True,
+}
+EXPECTED_CANDIDATE_SEMANTICS = {
+    "ablation-full": ("winter-2023-14d", "mpc", 24, FULL_ASSET_CAPABILITIES),
+    "ablation-no-h2": (
+        "winter-2023-14d",
+        "mpc",
+        24,
+        {"battery": True, "hydrogen": False, "thermal_store": True},
+    ),
+    "ablation-no-tes": (
+        "winter-2023-14d",
+        "mpc",
+        24,
+        {"battery": True, "hydrogen": True, "thermal_store": False},
+    ),
+    "ablation-one-step": ("winter-2023-14d", "mpc", 1, FULL_ASSET_CAPABILITIES),
+    "summer-baseline": ("summer-2023-14d", "baseline", None, FULL_ASSET_CAPABILITIES),
+    "summer-mpc": ("summer-2023-14d", "mpc", 24, FULL_ASSET_CAPABILITIES),
+    "winter-baseline": ("winter-2023-14d", "baseline", None, FULL_ASSET_CAPABILITIES),
+    "winter-mpc": ("winter-2023-14d", "mpc", 24, FULL_ASSET_CAPABILITIES),
 }
 
 BASELINE_CAPABILITY_POLICY = {
@@ -145,6 +171,7 @@ def _generated_publication_candidates() -> dict[str, str]:
         and re.fullmatch(r"[0-9a-f]{64}", identifier)
         for identifier in candidates.values()
     )
+    assert len(set(candidates.values())) == len(candidates)
     return candidates
 
 
@@ -438,6 +465,10 @@ def test_generated_bundle_full_scope_evidence():
     from greenhouse_energy_hub.evaluation import load_run_bundle, verify_run_bundle
 
     candidates = _generated_publication_candidates()
+    assert sorted(
+        path.relative_to(DIAGNOSTICS).as_posix()
+        for path in DIAGNOSTICS.rglob("*")
+    ) == ["publication-candidates.json"]
     verified_bundles = {}
     for key, identifier in candidates.items():
         resolved = load_run_bundle(RUNS, identifier, repository_root=ROOT)
@@ -456,6 +487,12 @@ def test_generated_bundle_full_scope_evidence():
         scenario = manifest_member["scenario"]
         controller = manifest_member["controller"]
         provenance = manifest_member["code_provenance"]
+        (
+            expected_scenario_name,
+            expected_controller_name,
+            expected_horizon_steps,
+            expected_asset_capabilities,
+        ) = EXPECTED_CANDIDATE_SEMANTICS[key]
         summary = json.loads((bundle.path / "summary.json").read_text(encoding="utf-8"))
         validation = json.loads(
             (bundle.path / "validation.json").read_text(encoding="utf-8")
@@ -466,6 +503,13 @@ def test_generated_bundle_full_scope_evidence():
             "controller_diagnostics.csv",
         )
 
+        assert scenario["name"] == expected_scenario_name
+        assert controller["name"] == expected_controller_name
+        assert manifest_member["asset_capabilities"] == expected_asset_capabilities
+        if expected_horizon_steps is None:
+            assert "horizon_steps" not in controller["configuration"]
+        else:
+            assert controller["configuration"]["horizon_steps"] == expected_horizon_steps
         assert scenario["operating_step_count"] == 336
         assert len(validation["steps"]) == 336
         assert len(trajectory_rows) == len(diagnostic_rows) == 336
@@ -537,5 +581,3 @@ def test_generated_bundle_full_scope_evidence():
             re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in provenance["executable_path_hashes"].values()
         ), key
-
-    assert not list((ROOT / "results" / "diagnostics").rglob("failure.json"))
