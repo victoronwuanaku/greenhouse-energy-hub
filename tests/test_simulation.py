@@ -943,6 +943,38 @@ def test_mpc_enables_operational_terminal_bounds():
         assert float(mpc.terminal_bounds["upper", model_name]) == pytest.approx(upper)
 
 
+def test_horizon_length_does_not_change_successor_state_bounds():
+    from greenhouse_energy_hub.controllers.mpc import MpcConfiguration, build_mpc
+    from greenhouse_energy_hub.hub import (
+        HubConfiguration,
+        STATE_MODEL_NAMES,
+        operational_state_bounds,
+    )
+
+    hub_config = HubConfiguration()
+    one_step, _ = build_mpc(hub_config, MpcConfiguration(horizon_steps=1))
+    publication_horizon, _ = build_mpc(
+        hub_config,
+        MpcConfiguration(horizon_steps=24),
+    )
+
+    assert one_step.settings.use_terminal_bounds is True
+    assert publication_horizon.settings.use_terminal_bounds is True
+    for field_name, expected_bounds in operational_state_bounds(hub_config).items():
+        model_name = STATE_MODEL_NAMES[field_name]
+        one_step_bounds = (
+            float(one_step.terminal_bounds["lower", model_name]),
+            float(one_step.terminal_bounds["upper", model_name]),
+        )
+        publication_bounds = (
+            float(publication_horizon.terminal_bounds["lower", model_name]),
+            float(publication_horizon.terminal_bounds["upper", model_name]),
+        )
+        assert one_step_bounds == pytest.approx(expected_bounds)
+        assert publication_bounds == pytest.approx(expected_bounds)
+        assert one_step_bounds == pytest.approx(publication_bounds)
+
+
 @pytest.mark.parametrize("capability", ["battery", "hydrogen", "thermal_store"])
 def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
     from greenhouse_energy_hub.controllers.mpc import MpcConfiguration, build_mpc

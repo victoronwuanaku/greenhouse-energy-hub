@@ -595,6 +595,188 @@ def test_generated_bundle_full_scope_evidence():
         ), key
 
 
+def test_publication_manifest_recomputes_every_pinned_summary():
+    from greenhouse_energy_hub.evaluation import (
+        load_run_bundle,
+        publication_ablation_rows,
+        publication_bundle_ids,
+        publication_candidates_from_manifest,
+        publication_comparison_rows,
+        read_publication_manifest,
+        validate_committed_publication_bundles,
+        verify_run_bundle,
+    )
+
+    publication = read_publication_manifest(
+        ROOT / "results" / "publication_manifest.json"
+    )
+    candidates = publication_candidates_from_manifest(publication)
+    identifiers = publication_bundle_ids(publication)
+    assert len(candidates) == len(identifiers) == 8
+    assert len(set(identifiers)) == 8
+    assert all(re.fullmatch(r"[0-9a-f]{64}", identifier) for identifier in identifiers)
+
+    validate_committed_publication_bundles(
+        publication,
+        runs_root=RUNS,
+        repository_root=ROOT,
+    )
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files", "--cached", "results/runs"],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+    )
+
+    summaries = {}
+    total_line_items = 0
+    total_sensitivities = 0
+    economic_fields = (
+        "grid_cost_eur",
+        "battery_wear_eur",
+        "thermal_store_wear_eur",
+        "electrolyser_wear_eur",
+        "fuel_cell_wear_eur",
+        "operating_cost_eur",
+        "comfort_violation_c_h",
+    )
+    wear_fields = (
+        "battery_wear_eur",
+        "thermal_store_wear_eur",
+        "electrolyser_wear_eur",
+        "fuel_cell_wear_eur",
+    )
+
+    for candidate_key, identifier in candidates.items():
+        loaded = load_run_bundle(RUNS, identifier, repository_root=ROOT)
+        verified = verify_run_bundle(
+            loaded.path,
+            expected_identifier=identifier,
+            repository_root=ROOT,
+        )
+        assert loaded.identifier == verified.identifier == identifier
+        members = [member for member in verified.path.iterdir() if member.is_file()]
+        assert len(members) == 5
+        assert {
+            member.relative_to(ROOT).as_posix() for member in members
+        } <= tracked
+
+        summary = json.loads(
+            (verified.path / "summary.json").read_text(encoding="utf-8")
+        )
+        validation = json.loads(
+            (verified.path / "validation.json").read_text(encoding="utf-8")
+        )
+        trajectory_rows = _csv_member_rows(verified.path, "trajectory.csv")
+        diagnostic_rows = _csv_member_rows(
+            verified.path,
+            "controller_diagnostics.csv",
+        )
+        line_items = summary["step_line_items"]
+        nominal = summary["nominal"]
+        assert len(trajectory_rows) == 336
+        assert len(diagnostic_rows) == 336
+        assert len(validation["steps"]) == 336
+        assert len(line_items) == 336
+
+        for field in economic_fields:
+            assert nominal[field] == pytest.approx(
+                sum(float(item[field]) for item in line_items),
+                rel=1e-12,
+                abs=1e-9,
+            )
+        for item in line_items:
+            assert item["operating_cost_eur"] == pytest.approx(
+                item["grid_cost_eur"]
+                + sum(float(item[field]) for field in wear_fields),
+                rel=1e-12,
+                abs=1e-9,
+            )
+        assert nominal["inventory_adjusted_cost_eur"] == pytest.approx(
+            nominal["operating_cost_eur"] + nominal["inventory_settlement_eur"],
+            rel=1e-12,
+            abs=1e-9,
+        )
+
+        assert summary["policy"]["sensitivity_multipliers"] == [0.0, 1.0, 2.0]
+        assert set(summary["wear_sensitivities"]) == {"0x", "1x", "2x"}
+        nominal_wear = sum(float(nominal[field]) for field in wear_fields)
+        for label, multiplier in (("0x", 0.0), ("1x", 1.0), ("2x", 2.0)):
+            sensitivity = summary["wear_sensitivities"][label]
+            for field in wear_fields:
+                assert sensitivity[field] == pytest.approx(
+                    multiplier * nominal[field],
+                    rel=1e-12,
+                    abs=1e-9,
+                )
+            expected_operating = nominal["grid_cost_eur"] + multiplier * nominal_wear
+            assert sensitivity["grid_cost_eur"] == pytest.approx(
+                nominal["grid_cost_eur"]
+            )
+            assert sensitivity["operating_cost_eur"] == pytest.approx(
+                expected_operating,
+                rel=1e-12,
+                abs=1e-9,
+            )
+            assert sensitivity["inventory_settlement_eur"] == pytest.approx(
+                nominal["inventory_settlement_eur"]
+            )
+            assert sensitivity["inventory_adjusted_cost_eur"] == pytest.approx(
+                expected_operating + nominal["inventory_settlement_eur"],
+                rel=1e-12,
+                abs=1e-9,
+            )
+            assert sensitivity["comfort_violation_c_h"] == pytest.approx(
+                nominal["comfort_violation_c_h"]
+            )
+
+        summaries[candidate_key] = summary
+        total_line_items += len(line_items)
+        total_sensitivities += len(summary["wear_sensitivities"])
+
+    comparison_rows = publication_comparison_rows(summaries)
+    assert tuple(row["window"] for row in comparison_rows) == ("Winter", "Summer")
+    assert len(comparison_rows) == 2
+    for row, baseline_key, mpc_key in zip(
+        comparison_rows,
+        ("winter-baseline", "summer-baseline"),
+        ("winter-mpc", "summer-mpc"),
+        strict=True,
+    ):
+        baseline_cost = summaries[baseline_key]["nominal"][
+            "inventory_adjusted_cost_eur"
+        ]
+        mpc_cost = summaries[mpc_key]["nominal"]["inventory_adjusted_cost_eur"]
+        assert row["saving_percent"] == pytest.approx(
+            100.0 * (baseline_cost - mpc_cost) / baseline_cost
+        )
+
+    ablation_rows = publication_ablation_rows(summaries)
+    assert tuple(row["candidate_key"] for row in ablation_rows) == (
+        "ablation-full",
+        "ablation-no-h2",
+        "ablation-no-tes",
+        "ablation-one-step",
+    )
+    assert len(ablation_rows) == 4
+    full_cost = summaries["ablation-full"]["nominal"][
+        "inventory_adjusted_cost_eur"
+    ]
+    for row in ablation_rows:
+        cost = summaries[row["candidate_key"]]["nominal"][
+            "inventory_adjusted_cost_eur"
+        ]
+        assert row["cost_difference_vs_full_percent"] == pytest.approx(
+            100.0 * (cost - full_cost) / abs(full_cost)
+        )
+
+    assert total_line_items == 2_688
+    assert total_sensitivities == 24
+
+
 def test_publisher_builds_the_exact_verified_full_id_recipe(tmp_path):
     from greenhouse_energy_hub.evaluation import build_publication_manifest
 
