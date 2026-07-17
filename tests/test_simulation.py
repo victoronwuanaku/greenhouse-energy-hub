@@ -47,11 +47,13 @@ class _FailedMpc:
         self.x0 = None
         self.solver_stats: dict[str, object] = {}
         self.u0 = {name: np.array([[1.0]]) for name in INPUT_NAMES}
+        self.make_step_calls: list[np.ndarray] = []
 
     def set_initial_guess(self) -> None:
         return None
 
-    def make_step(self, _x0: np.ndarray) -> np.ndarray:
+    def make_step(self, x0: np.ndarray) -> np.ndarray:
+        self.make_step_calls.append(np.asarray(x0).copy())
         self.solver_stats = {
             "success": False,
             "return_status": "Infeasible_Problem_Detected",
@@ -82,10 +84,22 @@ def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch,
     monkeypatch.setattr(hub_model, "hub_dynamics", counted_hub_dynamics)
     monkeypatch.setattr(rolling_horizon, "hub_dynamics", counted_hub_dynamics)
 
-    outcome = rolling_horizon.run_simulation(hourly_frame.iloc[:1], mode="mpc")
+    # Forty-nine points give the default 24-step controller ample initial coverage,
+    # so only the injected solver failure may classify this Run as invalid.
+    outcome = rolling_horizon.run_simulation(hourly_frame, mode="mpc")
 
-    assert plant_calls == 0
-    assert type(outcome).__name__ == "InvalidRun"
+    observed = (
+        len(failed_mpc.make_step_calls),
+        plant_calls,
+        getattr(outcome, "failure_code", None),
+    )
+    assert observed == (1, 0, "solver_failure")
+
+    # Keep the not-yet-existing outcome type inside the regression body so legacy
+    # collection remains possible until the fail-closed simulation interface lands.
+    from control.rolling_horizon import InvalidRun
+
+    assert isinstance(outcome, InvalidRun)
 
 
 @pytest.mark.xfail(strict=True, reason="PF-02: disabled assets retain non-zero state and capacity")

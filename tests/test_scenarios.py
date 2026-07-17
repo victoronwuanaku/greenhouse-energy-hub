@@ -4,6 +4,42 @@ import pandas as pd
 import pytest
 
 
+def test_known_good_winter_source_fixture_alignment_is_stable():
+    """Freeze one non-DST, non-year-end legacy alignment window before it moves."""
+    from control.rolling_horizon import load_data
+
+    frame = load_data(start_month=1, n_days=2)
+
+    # Characterize the complete inner UTC date shared by legacy and future local
+    # window semantics; the outer window boundaries intentionally remain unfrozen.
+    fixture = frame.loc[
+        pd.Timestamp("2023-01-01 00:00:00", tz="UTC") :
+        pd.Timestamp("2023-01-01 23:00:00", tz="UTC")
+    ]
+    expected_index = pd.date_range(
+        "2023-01-01 00:00:00",
+        periods=24,
+        freq="h",
+        tz="UTC",
+    )
+    assert len(fixture) == 24
+    assert fixture.index.equals(expected_index)
+
+    aligned = fixture.loc[
+        pd.Timestamp("2023-01-01 09:00:00", tz="UTC"),
+        ["price_EUR_kWh", "P_pv_kW", "G_Wm2", "T_out_C", "P_elec_kW"],
+    ]
+    assert aligned.to_dict() == pytest.approx(
+        {
+            "price_EUR_kWh": 0.00099,
+            "P_pv_kW": 9.24,
+            "G_Wm2": 34.06,
+            "T_out_C": 1.88,
+            "P_elec_kW": 1238.256,
+        }
+    )
+
+
 @pytest.mark.xfail(strict=True, reason="PF-07: insufficient year-end coverage is silently truncated")
 def test_december_window_is_complete_or_explicitly_rejected():
     from control.rolling_horizon import load_data

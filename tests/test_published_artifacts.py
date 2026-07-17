@@ -18,7 +18,33 @@ BASELINE_CAPABILITY_POLICY = {
     "battery_discharge_price_threshold_eur_per_kwh": 0.12,
 }
 
-
+REQUIRED_CAUSAL_ABLATIONS = frozenset({"no-h2", "no-tes", "one-step"})
+CAUSAL_TOPIC_PATTERNS = {
+    "no-h2": re.compile(r"\b(?:h2|hydrogen|electrolys(?:er|is)|fuel[- ]?cell)\b"),
+    "no-tes": re.compile(
+        r"\b(?:tes|thermal(?: energy)? (?:store|storage)|heat (?:store|storage))\b"
+    ),
+    "one-step": re.compile(
+        r"\b(?:foresight|look[- ]?ahead|myop(?:ic|ia)|forecast horizon|"
+        r"horizon length|one[- ]?step)\b"
+    ),
+}
+CAUSAL_LANGUAGE = re.compile(
+    r"\b(?:account(?:s|ed|ing)? for|add(?:s|ed|ing)?|"
+    r"attribut(?:e|es|ed|ing|ion)|benefit(?:s|ed|ing)?|buffer(?:s|ed|ing)?|"
+    r"caus(?:e|es|ed|ing|al)|contribut(?:e|es|ed|ing|ion)|cut(?:s|ting)?|"
+    r"deliver(?:s|ed|ing)?|depend(?:s|ed|ing)? on|displac(?:e|es|ed|ing)|"
+    r"driv(?:e|es|en|ing|er)|enabl(?:e|es|ed|ing)|explain(?:s|ed|ing)?|"
+    r"improv(?:e|es|ed|ing)|increas(?:e|es|ed|ing)|is essential|is decisive|"
+    r"is responsible|is key|is critical|is necessary|lead(?:s|ing)? to|"
+    r"lower(?:s|ed|ing)?|produc(?:e|es|ed|ing)|provid(?:e|es|ed|ing)|"
+    r"reduc(?:e|es|ed|ing|tion)|sav(?:e|es|ed|ing)|shift(?:s|ed|ing)?|"
+    r"win(?:s|ning)?|worsen(?:s|ed|ing)?|contribution|reason|source)\b"
+)
+OUTCOME_LANGUAGE = re.compile(
+    r"\b(?:comfort|costs?|economic|performance|saving|value|violation|"
+    r"cheap(?:er)?|expensive|better|worse|points?|percent(?:age)?)\b|[%€]"
+)
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -31,6 +57,48 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _readme_result_statements(markdown: str) -> list[str]:
+    section = re.search(
+        r"(?ms)^## Results\s*$\n(?P<body>.*?)(?=^##\s|\Z)",
+        markdown,
+    )
+    if section is None:
+        raise AssertionError("README has no Results section")
+
+    statements: list[str] = []
+    for raw_line in section.group("body").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "|", "![", "<!--")):
+            continue
+        statements.extend(
+            statement.strip()
+            for statement in re.split(r"(?<=[.!?])\s+", line)
+            if statement.strip()
+        )
+    return statements
+
+
+def _uncited_causal_claims(
+    markdown: str,
+    ablation_ids: dict[str, str],
+) -> list[tuple[str, str]]:
+    uncited: list[tuple[str, str]] = []
+    for statement in _readme_result_statements(markdown):
+        normalized = statement.casefold().replace("h₂", "h2")
+        # In a Results section, any capability mention tied to an outcome is an
+        # attribution even if its verb is reworded; functional causal verbs are
+        # also caught when no numeric/economic outcome term appears.
+        is_causal = bool(CAUSAL_LANGUAGE.search(normalized)) or bool(
+            OUTCOME_LANGUAGE.search(normalized)
+        )
+        if not is_causal:
+            continue
+        for ablation, topic_pattern in CAUSAL_TOPIC_PATTERNS.items():
+            if topic_pattern.search(normalized) and ablation_ids[ablation] not in statement:
+                uncited.append((ablation, statement))
+    return uncited
 
 
 def _write_handcrafted_bundle(
@@ -137,23 +205,57 @@ def test_each_causal_claim_cites_its_corresponding_ablation_bundle():
         (ROOT / "results" / "publication_manifest.json").read_text(encoding="utf-8")
     )
     ablations = publication["ablations"]
-    for bundle_id in ablations.values():
-        assert re.fullmatch(r"[0-9a-f]{64}", bundle_id)
+    assert REQUIRED_CAUSAL_ABLATIONS <= set(ablations)
+    for ablation in sorted(REQUIRED_CAUSAL_ABLATIONS):
+        assert re.fullmatch(r"[0-9a-f]{64}", ablations[ablation])
 
-    claim_requirements = {
-        "no-h2": ("h₂ buffer adds", "h2 buffer adds", "hydrogen buffer adds"),
-        "no-tes": ("thermal store is the decisive driver", "thermal store, displacing"),
-        "one-step": ("price foresight is essential", "myopic controller"),
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    unsupported = _uncited_causal_claims(readme, ablations)
+    detail = "\n".join(f"{ablation}: {claim}" for ablation, claim in unsupported)
+    assert not unsupported, f"causal claims lack exact ablation bundle IDs:\n{detail}"
+
+
+@pytest.mark.parametrize(
+    ("ablation", "reworded_claim"),
+    [
+        ("no-h2", "Hydrogen dispatch accounts for lower winter operating cost"),
+        ("no-tes", "Heat storage enables the controller to avoid expensive hours"),
+        ("one-step", "Longer look-ahead reduces the reported comfort violation"),
+    ],
+)
+def test_causal_claim_scan_catches_reworded_unsupported_attribution(
+    ablation,
+    reworded_claim,
+):
+    ablations = {
+        "no-h2": "a" * 64,
+        "no-tes": "b" * 64,
+        "one-step": "c" * 64,
     }
-    readme_lines = (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
-    for ablation, phrases in claim_requirements.items():
-        matching_lines = [
-            line
-            for line in readme_lines
-            if any(phrase in line.casefold() for phrase in phrases)
-        ]
-        for line in matching_lines:
-            assert ablations[ablation] in line
+    unsupported_readme = f"# Study\n\n## Results\n\n{reworded_claim}.\n\n## Methods\n"
+    assert _uncited_causal_claims(unsupported_readme, ablations) == [
+        (ablation, f"{reworded_claim}.")
+    ]
+
+    cited_readme = (
+        f"# Study\n\n## Results\n\n{reworded_claim} "
+        f"(`{ablations[ablation]}`).\n\n## Methods\n"
+    )
+    assert _uncited_causal_claims(cited_readme, ablations) == []
+
+
+def test_causal_claim_scan_allows_genuinely_noncausal_method_description():
+    ablations = {
+        "no-h2": "a" * 64,
+        "no-tes": "b" * 64,
+        "one-step": "c" * 64,
+    }
+    readme = (
+        "# Study\n\n## Results\n\n"
+        "The evaluated configuration contains hydrogen, thermal storage, and a 24-hour horizon.\n\n"
+        "## Methods\n"
+    )
+    assert _uncited_causal_claims(readme, ablations) == []
 
 
 @pytest.mark.xfail(strict=True, reason="PF-06: publication accepts failed validation evidence")
