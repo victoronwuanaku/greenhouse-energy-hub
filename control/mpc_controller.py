@@ -55,6 +55,7 @@ import numpy as np
 import do_mpc
 from casadi import DM, sqrt
 
+from accounting import EvaluationPolicy
 from control.rolling_horizon import (
     ControlDecision,
     ControllerFailure,
@@ -93,6 +94,19 @@ W_TERMINAL  = 1.0       # terminal stored-energy value weight
 W_RTERM     = 1e-4      # input-move smoothing (rterm)
 
 
+def _immutable_metadata(values: Mapping[str, object]) -> Mapping[str, object]:
+    def freeze(value: object) -> object:
+        if isinstance(value, Mapping):
+            return MappingProxyType(
+                {str(key): freeze(item) for key, item in value.items()}
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(item) for item in value)
+        return value
+
+    return freeze(values)
+
+
 @dataclass(frozen=True)
 class MpcConfiguration:
     horizon_steps: int = N_HORIZON
@@ -106,6 +120,68 @@ class MpcConfiguration:
     input_move_weight: float = W_RTERM
     solver_max_iterations: int = 800
     solver_tolerance: float = 1e-6
+
+    @classmethod
+    def from_evaluation_policy(
+        cls,
+        policy: EvaluationPolicy,
+        **solver_configuration: object,
+    ) -> "MpcConfiguration":
+        """Bind declared evaluation wear terms into the Solver Objective."""
+        if not isinstance(policy, EvaluationPolicy):
+            raise TypeError("policy must be an EvaluationPolicy")
+        if policy.grid_import_fee_eur_per_kwh != GRID_IMPORT_FEE_EUR_KWH:
+            raise ValueError(
+                "MPC currently supports only the declared grid import fee "
+                f"{GRID_IMPORT_FEE_EUR_KWH} EUR/kWh"
+            )
+        economic_names = {
+            "battery_wear_eur_per_kwh",
+            "thermal_store_wear_eur_per_kwh",
+            "electrolyser_wear_eur_per_kwh",
+            "fuel_cell_wear_eur_per_kwh",
+        }
+        conflicting = economic_names.intersection(solver_configuration)
+        if conflicting:
+            names = ", ".join(sorted(conflicting))
+            raise TypeError(
+                f"Solver economic terms come from EvaluationPolicy, not overrides: {names}"
+            )
+        return cls(
+            battery_wear_eur_per_kwh=policy.wear.battery_eur_per_kwh,
+            thermal_store_wear_eur_per_kwh=(
+                policy.wear.thermal_store_eur_per_kwh
+            ),
+            electrolyser_wear_eur_per_kwh=(
+                policy.wear.electrolyser_eur_per_kwh
+            ),
+            fuel_cell_wear_eur_per_kwh=policy.wear.fuel_cell_eur_per_kwh,
+            **solver_configuration,
+        )
+
+    def to_controller_metadata(self) -> dict[str, object]:
+        """Separate realized economic terms from solver-only diagnostics."""
+        return {
+            "horizon_steps": self.horizon_steps,
+            "solver_objective_economic_terms": {
+                "battery_wear_eur_per_kwh": self.battery_wear_eur_per_kwh,
+                "thermal_store_wear_eur_per_kwh": (
+                    self.thermal_store_wear_eur_per_kwh
+                ),
+                "electrolyser_wear_eur_per_kwh": (
+                    self.electrolyser_wear_eur_per_kwh
+                ),
+                "fuel_cell_wear_eur_per_kwh": self.fuel_cell_wear_eur_per_kwh,
+            },
+            "solver_diagnostics": {
+                "terminal_weight": self.terminal_weight,
+                "complementarity_weight": self.complementarity_weight,
+                "comfort_slack_weight": self.comfort_slack_weight,
+                "input_move_weight": self.input_move_weight,
+                "solver_max_iterations": self.solver_max_iterations,
+                "solver_tolerance": self.solver_tolerance,
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -181,8 +257,8 @@ class MpcControllerAdapter:
     ) -> None:
         self._mpc = mpc
         self.forecast_horizon_steps = forecast_horizon_steps
-        self.configuration = MappingProxyType(dict(configuration))
-        self.capability_policy = MappingProxyType(dict(capability_policy))
+        self.configuration = _immutable_metadata(configuration)
+        self.capability_policy = _immutable_metadata(capability_policy)
 
     def decide(
         self,

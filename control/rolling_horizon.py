@@ -10,19 +10,19 @@ Workflow
       apply the first control action; (baseline) apply the rule-based action.
    b. Advance the plant through the shared numerical hub adapter.
    c. Record states, controls, costs and diagnostics.
-4. Run the identical loop for both controllers and compare total grid cost.
+4. Run the identical loop for both controllers and apply one named scorecard.
 
 Heat is implicit: there is no prescribed heat-demand series. Both controllers
 must keep the greenhouse temperature inside the comfort band by supplying heat
 (heat pump, e-boiler, fuel-cell heat, TES) and opening ventilation.
 
-Baseline controller (fair, naive, no look-ahead)
-------------------------------------------------
+Baseline controller (limited capability, naive, no look-ahead)
+---------------------------------------------------------------
   - A frugal thermostat: reactively heats to hold the LOWER comfort bound
     (BASELINE_TARGET_C = T_MIN + 0.5 = 16.5 degC), the cheapest in-band temperature,
     via heat pump first, then e-boiler, then TES discharge.
-  - Holding the lower bound (not a 19 degC setpoint) makes the comparison fair: any
-    MPC saving reflects dispatch timing/arbitrage, not simply running colder.
+  - Holding the lower bound (not a 19 degC setpoint) aligns the comfort target, while
+    its exact capability limits remain explicit in every comparison.
   - Vent fully when solar gain would push the air above the comfort band.
   - Battery charges from PV surplus, discharges when price > 0.12 EUR/kWh.
   - No hydrogen use, no thermal pre-storage, no price look-ahead.
@@ -65,7 +65,12 @@ from models.hub_model import (
     C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
     GRID_IMPORT_FEE_EUR_KWH, Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
-from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
+from accounting import (
+    DEFAULT_EVALUATION_POLICY,
+    EvaluationPolicy,
+    evaluate_run,
+    saving_percent,
+)
 from scenarios import (
     Scenario,
     ScenarioCoverageError,
@@ -76,9 +81,8 @@ from scenarios import (
 # NOTE: build_mpc is imported lazily inside run_simulation() so that importing this
 # module (e.g. for load_data or the baseline) does not pull in the do-mpc/IPOPT stack.
 
-# Fair baseline: a frugal thermostat that holds the LOWER comfort bound (cheapest
-# myopic temperature), so any MPC saving reflects dispatch timing/arbitrage rather
-# than simply running the greenhouse colder than a 19 degC setpoint.
+# Limited-capability Baseline: a frugal thermostat that holds the lower comfort
+# bound. Its exact missing capabilities are declared by BaselineControllerAdapter.
 BASELINE_TARGET_C = T_MIN_C + 0.5
 
 DATA_DIR = ROOT / "data"
@@ -95,7 +99,16 @@ JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 def _read_only_mapping(
     values: Mapping[str, JSONValue],
 ) -> Mapping[str, JSONValue]:
-    return MappingProxyType(dict(values))
+    def freeze(value: object) -> object:
+        if isinstance(value, Mapping):
+            return MappingProxyType(
+                {str(key): freeze(item) for key, item in value.items()}
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(item) for item in value)
+        return value
+
+    return freeze(values)
 
 
 # Temporary import aliases keep pre-migration characterization helpers importable;
@@ -1089,11 +1102,14 @@ def run_simulation(
     data: Scenario | pd.DataFrame,
     mode: str = "mpc",
     hub_config: HubConfiguration = HubConfiguration(),
+    evaluation_policy: EvaluationPolicy = DEFAULT_EVALUATION_POLICY,
     **mpc_kwargs: object,
 ) -> ValidRun | InvalidRun:
     """Run one Controller against a Scenario (or a test-only frame adapter)."""
     if mode not in ("mpc", "baseline"):
         raise ValueError(f"Unknown mode: {mode}")
+    if not isinstance(evaluation_policy, EvaluationPolicy):
+        raise TypeError("evaluation_policy must be an EvaluationPolicy")
 
     if mode == "baseline":
         if mpc_kwargs:
@@ -1132,13 +1148,28 @@ def run_simulation(
             f"unexpected MPC options: {names}; pass asset capabilities via "
             "hub_config"
         )
+    economic_field_names = {
+        "battery_wear_eur_per_kwh",
+        "thermal_store_wear_eur_per_kwh",
+        "electrolyser_wear_eur_per_kwh",
+        "fuel_cell_wear_eur_per_kwh",
+    }
+    economic_overrides = economic_field_names.intersection(mpc_kwargs)
+    if economic_overrides:
+        names = ", ".join(sorted(economic_overrides))
+        raise TypeError(
+            f"MPC wear terms come from evaluation_policy, not overrides: {names}"
+        )
     config_values = {
         key: value
         for key, value in mpc_kwargs.items()
-        if key in config_field_names
+        if key in config_field_names and key not in economic_field_names
     }
     config_values["horizon_steps"] = horizon_steps
-    mpc_config = MpcConfiguration(**config_values)
+    mpc_config = MpcConfiguration.from_evaluation_policy(
+        evaluation_policy,
+        **config_values,
+    )
     mpc, _ = build_mpc(
         hub_config,
         mpc_config,
@@ -1148,7 +1179,7 @@ def run_simulation(
     controller = MpcControllerAdapter(
         mpc=mpc,
         forecast_horizon_steps=horizon_steps,
-        configuration=asdict(mpc_config),
+        configuration=mpc_config.to_controller_metadata(),
         capability_policy=asdict(hub_config.capabilities),
     )
     if isinstance(data, Scenario):
@@ -1224,13 +1255,18 @@ def main():
     print("=" * 65)
 
     scenario = load_data(start_month=args.start_month, n_days=args.days)
-    results = {}
+    runs: dict[str, ValidRun] = {}
 
     for i, mode in enumerate(["baseline", "mpc"]):
         if args.mode not in (mode, "both"):
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
-        outcome = run_simulation(scenario, mode=mode, hub_config=hub_config)
+        outcome = run_simulation(
+            scenario,
+            mode=mode,
+            hub_config=hub_config,
+            evaluation_policy=DEFAULT_EVALUATION_POLICY,
+        )
         if not isinstance(outcome, ValidRun):
             print(
                 f"  INVALID RUN at step {outcome.failed_step}: "
@@ -1238,45 +1274,95 @@ def main():
             )
             continue
         res = outcome.to_frame()
-        results[mode] = res
+        runs[mode] = outcome
         res.to_csv(RESULTS_DIR / f"{mode}_results.csv")          # canonical (latest run)
         res.to_csv(scen_dir / f"{tag}_{mode}.csv")               # scenario archive
 
-    if "baseline" in results and "mpc" in results:
-        x0 = initial_state(hub_config)
-        init_eq = stored_equiv_kwh(
-            x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"], hub_config
+    if "baseline" in runs and "mpc" in runs:
+        baseline_report = evaluate_run(
+            runs["baseline"], DEFAULT_EVALUATION_POLICY
         )
-        settle = results["mpc"]["price_EUR_kWh"].mean()
-        base, mpc_c = (results["baseline"]["grid_cost_EUR"].sum(),
-                       results["mpc"]["grid_cost_EUR"].sum())
-        base_adj = inventory_adjusted_cost(
-            results["baseline"], init_eq, settle, hub_config
-        )
-        mpc_adj = inventory_adjusted_cost(
-            results["mpc"], init_eq, settle, hub_config
-        )
-        bv, mv = (results["baseline"]["T_violation_C"].sum(),
-                  results["mpc"]["T_violation_C"].sum())
+        mpc_report = evaluate_run(runs["mpc"], DEFAULT_EVALUATION_POLICY)
+        baseline = baseline_report.nominal
+        mpc = mpc_report.nominal
 
         print("\n" + "=" * 65)
         print(f"  RESULTS SUMMARY - {tag}")
         print("=" * 65)
-        print(f"  Baseline grid cost      : EUR {base:>9.2f}   T-band viol {bv:>6.1f} degC.h")
-        print(f"  MPC grid cost           : EUR {mpc_c:>9.2f}   T-band viol {mv:>6.1f} degC.h")
-        print(f"  Saving (raw grid cost)  : EUR {base - mpc_c:>9.2f}   ({saving_pct(base, mpc_c):+.1f}%)")
-        print(f"  Saving (inventory-adj.) : EUR {base_adj - mpc_adj:>9.2f}   ({saving_pct(base_adj, mpc_adj):+.1f}%)")
+        print(
+            "  Baseline (limited capability): "
+            f"Grid EUR {baseline.grid_cost_eur:>9.2f}; "
+            f"Operating EUR {baseline.operating_cost_eur:>9.2f}; "
+            f"Inventory-Adjusted EUR "
+            f"{baseline.inventory_adjusted_cost_eur:>9.2f}; "
+            f"Comfort {baseline.comfort_violation_c_h:>6.1f} C.h"
+        )
+        print(
+            "  MPC                          : "
+            f"Grid EUR {mpc.grid_cost_eur:>9.2f}; "
+            f"Operating EUR {mpc.operating_cost_eur:>9.2f}; "
+            f"Inventory-Adjusted EUR "
+            f"{mpc.inventory_adjusted_cost_eur:>9.2f}; "
+            f"Comfort {mpc.comfort_violation_c_h:>6.1f} C.h"
+        )
+        print(
+            "  Inventory-Adjusted saving   : "
+            f"EUR {baseline.inventory_adjusted_cost_eur - mpc.inventory_adjusted_cost_eur:>9.2f} "
+            f"({saving_percent(baseline.inventory_adjusted_cost_eur, mpc.inventory_adjusted_cost_eur):+.1f}%)"
+        )
         print("=" * 65)
 
         update_summary(scen_dir / "summary.csv", {
             "scenario": tag,
             "window_start": str(pd.Timestamp(scenario.operating_start).date()),
             "days": args.days,
-            "baseline_eur": round(base, 1), "mpc_eur": round(mpc_c, 1),
-            "saving_pct": round(saving_pct(base, mpc_c), 2),
-            "baseline_adj_eur": round(base_adj, 1), "mpc_adj_eur": round(mpc_adj, 1),
-            "adj_saving_pct": round(saving_pct(base_adj, mpc_adj), 2),
-            "base_viol_Ch": round(bv, 1), "mpc_viol_Ch": round(mv, 1),
+            "baseline_grid_eur": round(baseline.grid_cost_eur, 1),
+            "mpc_grid_eur": round(mpc.grid_cost_eur, 1),
+            "baseline_operating_eur": round(baseline.operating_cost_eur, 1),
+            "mpc_operating_eur": round(mpc.operating_cost_eur, 1),
+            "baseline_inventory_adjusted_eur": round(
+                baseline.inventory_adjusted_cost_eur, 1
+            ),
+            "mpc_inventory_adjusted_eur": round(
+                mpc.inventory_adjusted_cost_eur, 1
+            ),
+            "inventory_adjusted_saving_pct": round(
+                saving_percent(
+                    baseline.inventory_adjusted_cost_eur,
+                    mpc.inventory_adjusted_cost_eur,
+                ),
+                2,
+            ),
+            "baseline_comfort_violation_Ch": round(
+                baseline.comfort_violation_c_h, 1
+            ),
+            "mpc_comfort_violation_Ch": round(
+                mpc.comfort_violation_c_h, 1
+            ),
+            "baseline_wear_0x_inventory_adjusted_eur": round(
+                baseline_report.wear_sensitivities[
+                    "0x"
+                ].inventory_adjusted_cost_eur,
+                1,
+            ),
+            "baseline_wear_2x_inventory_adjusted_eur": round(
+                baseline_report.wear_sensitivities[
+                    "2x"
+                ].inventory_adjusted_cost_eur,
+                1,
+            ),
+            "mpc_wear_0x_inventory_adjusted_eur": round(
+                mpc_report.wear_sensitivities[
+                    "0x"
+                ].inventory_adjusted_cost_eur,
+                1,
+            ),
+            "mpc_wear_2x_inventory_adjusted_eur": round(
+                mpc_report.wear_sensitivities[
+                    "2x"
+                ].inventory_adjusted_cost_eur,
+                1,
+            ),
         })
         print(f"  Scenario archive -> {scen_dir}/{tag}_*.csv  | summary -> {scen_dir}/summary.csv")
 

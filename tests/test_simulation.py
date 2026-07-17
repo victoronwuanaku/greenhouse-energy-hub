@@ -1332,3 +1332,118 @@ def test_first_control_is_independent_of_out_of_horizon_prices():
         atol=1e-4,
         rtol=0.0,
     )
+
+
+def test_mpc_configuration_has_exact_stable_fields_and_policy_separation():
+    from dataclasses import fields
+
+    from accounting import EvaluationPolicy, WearCoefficients
+    from control.mpc_controller import MpcConfiguration
+
+    assert [field.name for field in fields(MpcConfiguration)] == [
+        "horizon_steps",
+        "terminal_weight",
+        "battery_wear_eur_per_kwh",
+        "thermal_store_wear_eur_per_kwh",
+        "electrolyser_wear_eur_per_kwh",
+        "fuel_cell_wear_eur_per_kwh",
+        "complementarity_weight",
+        "comfort_slack_weight",
+        "input_move_weight",
+        "solver_max_iterations",
+        "solver_tolerance",
+    ]
+    policy = EvaluationPolicy(
+        wear=WearCoefficients(0.011, 0.022, 0.033, 0.044)
+    )
+    config = MpcConfiguration.from_evaluation_policy(
+        policy,
+        horizon_steps=6,
+        terminal_weight=2.0,
+        complementarity_weight=0.3,
+        comfort_slack_weight=40.0,
+        input_move_weight=0.05,
+    )
+    metadata = config.to_controller_metadata()
+
+    assert metadata["solver_objective_economic_terms"] == {
+        "battery_wear_eur_per_kwh": 0.011,
+        "thermal_store_wear_eur_per_kwh": 0.022,
+        "electrolyser_wear_eur_per_kwh": 0.033,
+        "fuel_cell_wear_eur_per_kwh": 0.044,
+    }
+    assert metadata["solver_diagnostics"] == {
+        "terminal_weight": 2.0,
+        "complementarity_weight": 0.3,
+        "comfort_slack_weight": 40.0,
+        "input_move_weight": 0.05,
+        "solver_max_iterations": 800,
+        "solver_tolerance": 1e-6,
+    }
+    assert metadata["horizon_steps"] == 6
+    assert set(metadata) == {
+        "horizon_steps",
+        "solver_objective_economic_terms",
+        "solver_diagnostics",
+    }
+
+
+def test_run_simulation_threads_named_evaluation_policy_into_mpc_configuration(
+    monkeypatch,
+    hourly_frame,
+):
+    from accounting import EvaluationPolicy, WearCoefficients
+    from control import mpc_controller, rolling_horizon
+
+    captured = {}
+
+    class InertMpc:
+        x0 = None
+
+        def set_initial_guess(self):
+            return None
+
+    def capture_build_mpc(hub_config, config):
+        captured["hub_config"] = hub_config
+        captured["config"] = config
+        return InertMpc(), object()
+
+    def capture_simulate_run(scenario, controller, hub_config):
+        captured["controller_configuration"] = controller.configuration
+        return "simulation-not-needed"
+
+    monkeypatch.setattr(mpc_controller, "build_mpc", capture_build_mpc)
+    monkeypatch.setattr(rolling_horizon, "simulate_run", capture_simulate_run)
+    policy = EvaluationPolicy(
+        name="shared-test-policy",
+        wear=WearCoefficients(0.101, 0.202, 0.303, 0.404),
+    )
+
+    outcome = rolling_horizon.run_simulation(
+        hourly_frame.iloc[:2],
+        mode="mpc",
+        n_horizon=1,
+        evaluation_policy=policy,
+    )
+
+    assert outcome == "simulation-not-needed"
+    assert captured["config"].battery_wear_eur_per_kwh == 0.101
+    assert captured["config"].thermal_store_wear_eur_per_kwh == 0.202
+    assert captured["config"].electrolyser_wear_eur_per_kwh == 0.303
+    assert captured["config"].fuel_cell_wear_eur_per_kwh == 0.404
+    assert captured["controller_configuration"][
+        "solver_objective_economic_terms"
+    ] == {
+        "battery_wear_eur_per_kwh": 0.101,
+        "thermal_store_wear_eur_per_kwh": 0.202,
+        "electrolyser_wear_eur_per_kwh": 0.303,
+        "fuel_cell_wear_eur_per_kwh": 0.404,
+    }
+    with pytest.raises(TypeError):
+        captured["controller_configuration"][
+            "solver_objective_economic_terms"
+        ]["battery_wear_eur_per_kwh"] = 999.0
+    with pytest.raises(TypeError):
+        captured["controller_configuration"]["solver_diagnostics"][
+            "terminal_weight"
+        ] = 999.0
