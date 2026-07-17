@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scenarios import (
+from greenhouse_energy_hub.scenarios import (
     FLOOR_AREA_M2,
     P_BASE_W_M2,
     P_LIGHTING_PEAK_W_M2,
@@ -28,8 +28,8 @@ from scenarios import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_PATH = Path(__file__).parent / "demand_profile.csv"
-PROVENANCE_PATH = Path(__file__).parent / "demand_profile.provenance.json"
+OUTPUT_PATH = ROOT / "data" / "derived" / "demand_profile.csv"
+PROVENANCE_PATH = ROOT / "data" / "derived" / "demand_profile.provenance.json"
 
 
 def materialize_demand(target_year: int) -> pd.DataFrame:

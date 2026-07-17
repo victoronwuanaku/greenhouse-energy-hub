@@ -7,7 +7,7 @@ Year:     2020 (most recent full year in PVGIS-SARAH2 database; API caps at 2020
           Price data uses 2023 — datasets are reindexed to a common 8760-hour
           timeline in rolling_horizon.py. Climatically representative for NL.
 
-Output: data/pv_profile.csv
+Output: data/source/pv_profile.csv
     Columns: timestamp (UTC), P_kW (AC power per kWp), G_Wm2 (irradiance W/m²),
              T2m_C (ambient temperature °C)
 
@@ -21,7 +21,11 @@ import urllib.request
 import pandas as pd
 from pathlib import Path
 
-from scenarios import _read_validated_source, _utc_coverage, sha256_file
+from greenhouse_energy_hub.scenarios import (
+    _read_validated_source,
+    _utc_coverage,
+    sha256_file,
+)
 
 # --- Site parameters (Westland glasshouse district, NL) ---
 # An inland point in the Westland greenhouse district; coastal points are classified
@@ -34,9 +38,9 @@ TILT = 30              # degrees from horizontal
 ASPECT = 0             # 0 = south-facing
 LOSS = 14              # system losses (%)
 
-OUTPUT_PATH = Path(__file__).parent / "pv_profile.csv"
-PROVENANCE_PATH = Path(__file__).parent / "pv_profile.provenance.json"
 ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_PATH = ROOT / "data" / "source" / "pv_profile.csv"
+PROVENANCE_PATH = ROOT / "data" / "source" / "pv_profile.provenance.json"
 SOURCE_URL = "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
 
 

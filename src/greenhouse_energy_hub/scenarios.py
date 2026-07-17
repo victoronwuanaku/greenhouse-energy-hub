@@ -26,12 +26,13 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
+SOURCE_DATA_DIR = DATA_DIR / "source"
 AMSTERDAM_TIMEZONE = "Europe/Amsterdam"
 UTC_TIMEZONE = "UTC"
 ONE_HOUR = timedelta(hours=1)
 
-PRICE_PATH = DATA_DIR / "grid_price_signal.csv"
-PV_PATH = DATA_DIR / "pv_profile.csv"
+PRICE_PATH = SOURCE_DATA_DIR / "grid_price_signal.csv"
+PV_PATH = SOURCE_DATA_DIR / "pv_profile.csv"
 
 PV_CAPACITY_KWP = 500.0
 FLOOR_AREA_M2 = 10_000

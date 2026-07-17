@@ -2,7 +2,7 @@
   "historic_acquisition_time": null,
   "original_timezone": "UTC",
   "output": {
-    "path": "data/grid_price_signal.csv",
+    "path": "data/source/grid_price_signal.csv",
     "sha256": "6fb88162430934af362a55423bfbf76e8ff27db8990a880b6961a3ebf553c768"
   },
   "parameters": {

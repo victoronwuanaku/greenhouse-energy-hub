@@ -6,7 +6,7 @@ Bidding zone: NL (Netherlands, 10YNL----------L)
 Year: 2023
 Unit: EUR/MWh (converted to EUR/kWh for hub model)
 
-Output: data/grid_price_signal.csv
+Output: data/source/grid_price_signal.csv
     Columns: timestamp (UTC), price_EUR_MWh, price_EUR_kWh
 
 The NL price signal exhibits:
@@ -25,13 +25,17 @@ import urllib.request
 import pandas as pd
 from pathlib import Path
 
-from scenarios import _read_validated_source, _utc_coverage, sha256_file
+from greenhouse_energy_hub.scenarios import (
+    _read_validated_source,
+    _utc_coverage,
+    sha256_file,
+)
 
 YEAR = 2023
 BZN = "NL"
-OUTPUT_PATH = Path(__file__).parent / "grid_price_signal.csv"
-PROVENANCE_PATH = Path(__file__).parent / "grid_price_signal.provenance.json"
 ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_PATH = ROOT / "data" / "source" / "grid_price_signal.csv"
+PROVENANCE_PATH = ROOT / "data" / "source" / "grid_price_signal.provenance.json"
 SOURCE_URL = "https://api.energy-charts.info/price"
 
 # Fetch in monthly chunks to stay within API limits

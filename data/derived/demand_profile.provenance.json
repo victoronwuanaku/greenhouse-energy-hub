@@ -2,7 +2,7 @@
   "historic_acquisition_time": null,
   "inputs": [
     {
-      "path": "data/pv_profile.csv",
+      "path": "data/source/pv_profile.csv",
       "row_count": 8784,
       "sha256": "ae8f4aa914d07f44457a6eebb6e11a209d2cbb64c5c41df5c45bf050bf4860ab",
       "utc_coverage": {
@@ -15,7 +15,7 @@
   ],
   "original_timezone": "UTC",
   "output": {
-    "path": "data/demand_profile.csv",
+    "path": "data/derived/demand_profile.csv",
     "sha256": "0620149d343737d11c6170f6796b9a9b003b51f467a869d5e67e5bd2bd8f1c28"
   },
   "parameters": {

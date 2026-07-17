@@ -13,6 +13,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
+SOURCE_DATA_DIR = DATA_DIR / "source"
+DERIVED_DATA_DIR = DATA_DIR / "derived"
 
 
 def _sha256(path: Path) -> str:
@@ -383,12 +385,14 @@ def test_source_provenance_is_complete_repo_relative_and_deeply_immutable():
     scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
 
     assert {item.source_path for item in scenario.provenance} == {
-        "data/grid_price_signal.csv",
-        "data/pv_profile.csv",
+        "data/source/grid_price_signal.csv",
+        "data/source/pv_profile.csv",
     }
     expected_hashes = {
-        "data/grid_price_signal.csv": _sha256(DATA_DIR / "grid_price_signal.csv"),
-        "data/pv_profile.csv": _sha256(DATA_DIR / "pv_profile.csv"),
+        "data/source/grid_price_signal.csv": _sha256(
+            SOURCE_DATA_DIR / "grid_price_signal.csv"
+        ),
+        "data/source/pv_profile.csv": _sha256(SOURCE_DATA_DIR / "pv_profile.csv"),
     }
     for item in scenario.provenance:
         assert len(item.sha256) == 64
@@ -592,8 +596,8 @@ def test_normal_scenario_provenance_is_anchored_to_validated_sidecars():
 
     scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
     expected_alignment = {
-        "data/grid_price_signal.csv": ("direct_utc_instant_mapping",),
-        "data/pv_profile.csv": (
+        "data/source/grid_price_signal.csv": ("direct_utc_instant_mapping",),
+        "data/source/pv_profile.csv": (
             "source_utc_calendar_transplant",
             "scale_pv_1_kwp_to_500_kwp",
             "derive_electrical_demand_on_target_clock",
@@ -627,28 +631,33 @@ def test_normal_scenario_provenance_is_anchored_to_validated_sidecars():
 
 def test_provenance_sidecars_match_exact_materialized_bytes_and_schema():
     expected = {
-        "grid_price_signal": (
+        "source/grid_price_signal": (
             8760,
             "legacy-import",
             "2023-01-01T00:00:00+00:00",
             "2023-12-31T23:00:00+00:00",
         ),
-        "pv_profile": (
+        "source/pv_profile": (
             8784,
             "legacy-import",
             "2020-01-01T00:00:00+00:00",
             "2020-12-31T23:00:00+00:00",
         ),
-        "demand_profile": (
+        "derived/demand_profile": (
             8760,
             "derived-materialization",
             "2023-01-01T00:00:00+00:00",
             "2023-12-31T23:00:00+00:00",
         ),
     }
-    for stem, (row_count, status, coverage_start, coverage_end) in expected.items():
-        csv_path = DATA_DIR / f"{stem}.csv"
-        sidecar_path = DATA_DIR / f"{stem}.provenance.json"
+    for relative_stem, (
+        row_count,
+        status,
+        coverage_start,
+        coverage_end,
+    ) in expected.items():
+        csv_path = DATA_DIR / f"{relative_stem}.csv"
+        sidecar_path = DATA_DIR / f"{relative_stem}.provenance.json"
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
 
         assert sidecar["schema_version"] == "source-provenance-v1"
@@ -659,7 +668,7 @@ def test_provenance_sidecars_match_exact_materialized_bytes_and_schema():
         assert sidecar["parameters"]
         assert sidecar["original_timezone"] == "UTC"
         assert sidecar["row_count"] == row_count
-        assert sidecar["output"]["path"] == f"data/{stem}.csv"
+        assert sidecar["output"]["path"] == f"data/{relative_stem}.csv"
         assert sidecar["output"]["sha256"] == _sha256(csv_path)
         assert sidecar["utc_coverage"]["step"] == "PT1H"
         assert sidecar["utc_coverage"]["start"] == coverage_start
@@ -677,10 +686,12 @@ def test_materialized_demand_matches_scenario_owned_derivation():
     )
 
     demand = pd.read_csv(
-        DATA_DIR / "demand_profile.csv", index_col="timestamp", parse_dates=True
+        DERIVED_DATA_DIR / "demand_profile.csv",
+        index_col="timestamp",
+        parse_dates=True,
     )
     pv = _read_validated_source(
-        DATA_DIR / "pv_profile.csv", "PV/weather", ("G_Wm2",)
+        SOURCE_DATA_DIR / "pv_profile.csv", "PV/weather", ("G_Wm2",)
     )
     expected_index = pd.date_range(
         "2023-01-01", "2024-01-01", freq="h", inclusive="left", tz="UTC"

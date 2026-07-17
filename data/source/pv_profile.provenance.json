@@ -2,7 +2,7 @@
   "historic_acquisition_time": null,
   "original_timezone": "UTC",
   "output": {
-    "path": "data/pv_profile.csv",
+    "path": "data/source/pv_profile.csv",
     "sha256": "ae8f4aa914d07f44457a6eebb6e11a209d2cbb64c5c41df5c45bf050bf4860ab"
   },
   "parameters": {
