@@ -42,6 +42,7 @@ import argparse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from numbers import Integral, Real
 import sys
 from pathlib import Path
 from types import MappingProxyType
@@ -55,7 +56,7 @@ sys.path.insert(0, str(ROOT))
 
 from models.hub_model import (
     AssetCapabilities, ExogenousInputs, HubConfiguration, HubControl, HubFlows,
-    HubState, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
+    HubState, HubStep, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
     initial_state, normalize_control, state_bounds, validate_control, validate_flows,
     validate_successor, SOLVER_BOUND_TOLERANCE_KW,
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
@@ -365,7 +366,7 @@ class BaselineControllerAdapter:
     )
     capability_policy: Mapping[str, JSONValue] = _read_only_mapping(
         {
-            "hydrogen": False,
+            "hydrogen_dispatch": False,
             "thermal_store_charging": False,
             "grid_battery_charging": False,
             "battery_discharge_price_threshold_eur_per_kwh": 0.12,
@@ -492,6 +493,258 @@ def _issue_message(issues: tuple[ValidationIssue, ...]) -> str:
     )
 
 
+def _validate_decision_diagnostics(
+    diagnostics: object,
+    controller: ControllerAdapter,
+    expected_status: str,
+) -> tuple[ValidationIssue, ...]:
+    """Validate controller evidence without reaching back into controller internals."""
+    if not isinstance(diagnostics, DecisionDiagnostics):
+        return (
+            ValidationIssue(
+                code="schema_error",
+                field="diagnostics",
+                message="controller diagnostics must be DecisionDiagnostics",
+            ),
+        )
+
+    issues: list[ValidationIssue] = []
+
+    if not isinstance(diagnostics.adapter, str) or not diagnostics.adapter:
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="adapter",
+                message="adapter must be a nonempty string",
+            )
+        )
+    elif diagnostics.adapter != controller.name:
+        issues.append(
+            ValidationIssue(
+                code="adapter_mismatch",
+                field="adapter",
+                message=(
+                    f"diagnostics adapter {diagnostics.adapter!r} does not match "
+                    f"controller {controller.name!r}"
+                ),
+            )
+        )
+
+    if diagnostics.decision_status != expected_status:
+        issues.append(
+            ValidationIssue(
+                code="branch_mismatch",
+                field="decision_status",
+                message=(
+                    f"{type(diagnostics).__name__} status must be "
+                    f"{expected_status!r}"
+                ),
+            )
+        )
+
+    if diagnostics.solver_success is not None and type(
+        diagnostics.solver_success
+    ) is not bool:
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="solver_success",
+                message="solver_success must be bool or None",
+            )
+        )
+
+    if diagnostics.solver_return_status is not None and not isinstance(
+        diagnostics.solver_return_status, str
+    ):
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="solver_return_status",
+                message="solver_return_status must be str or None",
+            )
+        )
+
+    iterations = diagnostics.solver_iterations
+    if iterations is not None and (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, Integral)
+        or iterations < 0
+    ):
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="solver_iterations",
+                message="solver_iterations must be a nonnegative int or None",
+            )
+        )
+
+    wall_seconds = diagnostics.solver_wall_seconds
+    if wall_seconds is not None and (
+        isinstance(wall_seconds, bool)
+        or not isinstance(wall_seconds, Real)
+        or not np.isfinite(float(wall_seconds))
+        or wall_seconds < 0
+    ):
+        issues.append(
+            ValidationIssue(
+                code="non_finite",
+                field="solver_wall_seconds",
+                message="solver_wall_seconds must be finite, nonnegative, or None",
+                actual=(
+                    float(wall_seconds)
+                    if isinstance(wall_seconds, Real)
+                    and not isinstance(wall_seconds, bool)
+                    else None
+                ),
+            )
+        )
+
+    forecast_start = diagnostics.forecast_start_utc
+    forecast_end = diagnostics.forecast_end_utc
+    if forecast_start is not None and not isinstance(forecast_start, datetime):
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="forecast_start_utc",
+                message="forecast_start_utc must be datetime or None",
+            )
+        )
+    if forecast_end is not None and not isinstance(forecast_end, datetime):
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="forecast_end_utc",
+                message="forecast_end_utc must be datetime or None",
+            )
+        )
+    if (forecast_start is None) != (forecast_end is None):
+        issues.append(
+            ValidationIssue(
+                code="schema_error",
+                field="forecast_window_utc",
+                message="forecast timestamps must both be present or both be None",
+            )
+        )
+    elif isinstance(forecast_start, datetime) and isinstance(forecast_end, datetime):
+        try:
+            reversed_window = forecast_start > forecast_end
+        except TypeError:
+            reversed_window = True
+        if reversed_window:
+            issues.append(
+                ValidationIssue(
+                    code="chronology_error",
+                    field="forecast_window_utc",
+                    message="forecast_start_utc must not follow forecast_end_utc",
+                )
+            )
+
+    for field_name in (
+        "terminal_electric_value_eur_per_kwh",
+        "terminal_heat_value_eur_per_kwhth",
+    ):
+        value = getattr(diagnostics, field_name)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not np.isfinite(float(value))
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="non_finite",
+                    field=field_name,
+                    message=f"{field_name} must be finite numeric or None",
+                    actual=(
+                        float(value)
+                        if isinstance(value, Real) and not isinstance(value, bool)
+                        else None
+                    ),
+                )
+            )
+
+    if expected_status == "success":
+        if controller.name == "mpc":
+            if diagnostics.solver_success is not True:
+                issues.append(
+                    ValidationIssue(
+                        code="branch_mismatch",
+                        field="solver_success",
+                        message="successful MPC decision requires solver_success=True",
+                    )
+                )
+            if not (
+                isinstance(diagnostics.solver_return_status, str)
+                and diagnostics.solver_return_status.strip()
+            ):
+                issues.append(
+                    ValidationIssue(
+                        code="schema_error",
+                        field="solver_return_status",
+                        message=(
+                            "successful MPC decision requires a nonempty "
+                            "solver_return_status"
+                        ),
+                    )
+                )
+        elif controller.name == "baseline":
+            for field_name in (
+                "solver_success",
+                "solver_return_status",
+                "solver_iterations",
+                "solver_wall_seconds",
+            ):
+                if getattr(diagnostics, field_name) is not None:
+                    issues.append(
+                        ValidationIssue(
+                            code="branch_mismatch",
+                            field=field_name,
+                            message=(
+                                "successful Baseline decision requires empty "
+                                "solver diagnostics"
+                            ),
+                        )
+                    )
+        elif diagnostics.solver_success is False:
+            issues.append(
+                ValidationIssue(
+                    code="branch_mismatch",
+                    field="solver_success",
+                    message="successful decision cannot report solver_success=False",
+                )
+            )
+    else:
+        if diagnostics.solver_success is True:
+            issues.append(
+                ValidationIssue(
+                    code="branch_mismatch",
+                    field="solver_success",
+                    message="ControllerFailure cannot report solver_success=True",
+                )
+            )
+        if controller.name == "mpc":
+            if diagnostics.solver_success is not False:
+                issues.append(
+                    ValidationIssue(
+                        code="branch_mismatch",
+                        field="solver_success",
+                        message="MPC ControllerFailure requires solver_success=False",
+                    )
+                )
+            if not (
+                isinstance(diagnostics.solver_return_status, str)
+                and diagnostics.solver_return_status.strip()
+            ):
+                issues.append(
+                    ValidationIssue(
+                        code="schema_error",
+                        field="solver_return_status",
+                        message="MPC ControllerFailure requires a nonempty return status",
+                    )
+                )
+
+    return tuple(issues)
+
+
 def _exogenous_from_point(point: _LegacyScenarioPoint) -> ExogenousInputs:
     exogenous = ExogenousInputs(
         pv_kw=float(point.pv_kw),
@@ -548,19 +801,7 @@ def simulate_run(
                 records,
                 diagnostics,
             )
-        if isinstance(decision, ControllerFailure):
-            diagnostics.append(decision.diagnostics)
-            return _invalid_run(
-                scenario,
-                controller,
-                hub_config,
-                operating_step,
-                decision.code,
-                decision.message,
-                records,
-                diagnostics,
-            )
-        if not isinstance(decision, ControlDecision):
+        if not isinstance(decision, (ControlDecision, ControllerFailure)):
             return _invalid_run(
                 scenario,
                 controller,
@@ -571,7 +812,38 @@ def simulate_run(
                 records,
                 diagnostics,
             )
-        diagnostics.append(decision.diagnostics)
+        expected_status = (
+            "success" if isinstance(decision, ControlDecision) else "failure"
+        )
+        diagnostics_issues = _validate_decision_diagnostics(
+            decision.diagnostics,
+            controller,
+            expected_status,
+        )
+        if isinstance(decision.diagnostics, DecisionDiagnostics):
+            diagnostics.append(decision.diagnostics)
+        if diagnostics_issues:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "invalid_diagnostics",
+                _issue_message(diagnostics_issues),
+                records,
+                diagnostics,
+            )
+        if isinstance(decision, ControllerFailure):
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                decision.code,
+                decision.message,
+                records,
+                diagnostics,
+            )
 
         # Gate 2: validate and normalize the returned control before physics.
         control_issues = validate_control(
@@ -608,6 +880,20 @@ def simulate_run(
                 operating_step,
                 "physics_error",
                 str(exc),
+                records,
+                diagnostics,
+            )
+        if not isinstance(step, HubStep):
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "physics_schema_error",
+                (
+                    "advance_hub returned "
+                    f"{type(step).__name__}; expected HubStep"
+                ),
                 records,
                 diagnostics,
             )

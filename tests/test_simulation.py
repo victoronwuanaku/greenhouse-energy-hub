@@ -18,20 +18,24 @@ INPUT_NAMES = (
 )
 
 
-def _test_diagnostics(forecast):
+def _test_diagnostics(forecast, **overrides):
     from control.rolling_horizon import DecisionDiagnostics
 
+    values = {
+        "adapter": "baseline",
+        "decision_status": "success",
+        "solver_success": None,
+        "solver_return_status": None,
+        "solver_iterations": None,
+        "solver_wall_seconds": None,
+        "forecast_start_utc": forecast[0].timestamp_utc,
+        "forecast_end_utc": forecast[-1].timestamp_utc,
+        "terminal_electric_value_eur_per_kwh": None,
+        "terminal_heat_value_eur_per_kwhth": None,
+    }
+    values.update(overrides)
     return DecisionDiagnostics(
-        adapter="test",
-        decision_status="success",
-        solver_success=None,
-        solver_return_status=None,
-        solver_iterations=None,
-        solver_wall_seconds=None,
-        forecast_start_utc=forecast[0].timestamp_utc,
-        forecast_end_utc=forecast[-1].timestamp_utc,
-        terminal_electric_value_eur_per_kwh=None,
-        terminal_heat_value_eur_per_kwhth=None,
+        **values,
     )
 
 
@@ -132,6 +136,176 @@ def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch,
     from control.rolling_horizon import InvalidRun
 
     assert isinstance(outcome, InvalidRun)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "failure_status",
+        "solver_failure",
+        "wrong_adapter",
+        "missing_mpc_status",
+        "invalid_iteration_type",
+        "non_finite_wall_time",
+        "reversed_forecast",
+        "non_finite_terminal_value",
+        "wrong_schema",
+    ],
+)
+def test_malformed_success_diagnostics_fail_before_physics(
+    monkeypatch, hourly_frame, case
+):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControlDecision, InvalidRun
+    from models.hub_model import HubConfiguration
+
+    def decide(_state, forecast):
+        if case == "wrong_schema":
+            diagnostics = object()
+        else:
+            overrides = {
+                "adapter": "mpc",
+                "solver_success": True,
+                "solver_return_status": "Solve_Succeeded",
+                "solver_iterations": 3,
+                "solver_wall_seconds": 0.01,
+            }
+            if case == "failure_status":
+                overrides["decision_status"] = "failure"
+            elif case == "solver_failure":
+                overrides["solver_success"] = False
+            elif case == "wrong_adapter":
+                overrides["adapter"] = "baseline"
+            elif case == "missing_mpc_status":
+                overrides["solver_return_status"] = None
+            elif case == "invalid_iteration_type":
+                overrides["solver_iterations"] = 3.5
+            elif case == "non_finite_wall_time":
+                overrides["solver_wall_seconds"] = np.nan
+            elif case == "reversed_forecast":
+                overrides["forecast_end_utc"] = (
+                    forecast[0].timestamp_utc - timedelta(hours=1)
+                )
+            elif case == "non_finite_terminal_value":
+                overrides["terminal_electric_value_eur_per_kwh"] = np.inf
+            diagnostics = _test_diagnostics(forecast, **overrides)
+        return ControlDecision(control=_zero_control(), diagnostics=diagnostics)
+
+    controller = SimpleNamespace(
+        name="mpc",
+        configuration={},
+        capability_policy={},
+        forecast_horizon_steps=0,
+        requires_operational_storage_bounds=True,
+        decide=decide,
+    )
+    scenario = rolling_horizon._legacy_scenario_from_frame(
+        hourly_frame.iloc[:1], forecast_horizon_steps=0
+    )
+    plant_calls = 0
+
+    def must_not_advance(*_args, **_kwargs):
+        nonlocal plant_calls
+        plant_calls += 1
+        raise AssertionError("invalid diagnostics must not reach the hub")
+
+    monkeypatch.setattr(rolling_horizon, "advance_hub", must_not_advance)
+
+    outcome = rolling_horizon.simulate_run(
+        scenario, controller, HubConfiguration()
+    )
+
+    assert isinstance(outcome, InvalidRun)
+    assert outcome.failure_code == "invalid_diagnostics"
+    assert outcome.failed_step == 0
+    assert outcome.partial_records == ()
+    assert plant_calls == 0
+
+
+def test_controller_failure_requires_failure_diagnostics(monkeypatch, hourly_frame):
+    from types import SimpleNamespace
+
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControllerFailure, InvalidRun
+    from models.hub_model import HubConfiguration
+
+    def decide(_state, forecast):
+        return ControllerFailure(
+            code="forced_failure",
+            message="forced failure",
+            diagnostics=_test_diagnostics(forecast, decision_status="success"),
+        )
+
+    controller = SimpleNamespace(
+        name="baseline",
+        configuration={},
+        capability_policy={},
+        forecast_horizon_steps=0,
+        requires_operational_storage_bounds=False,
+        decide=decide,
+    )
+    scenario = rolling_horizon._legacy_scenario_from_frame(
+        hourly_frame.iloc[:1], forecast_horizon_steps=0
+    )
+    monkeypatch.setattr(
+        rolling_horizon,
+        "advance_hub",
+        lambda *_args, **_kwargs: pytest.fail("failure diagnostics reached the hub"),
+    )
+
+    outcome = rolling_horizon.simulate_run(
+        scenario, controller, HubConfiguration()
+    )
+
+    assert isinstance(outcome, InvalidRun)
+    assert outcome.failure_code == "invalid_diagnostics"
+    assert outcome.partial_records == ()
+
+
+def test_baseline_success_requires_empty_solver_diagnostics(monkeypatch, hourly_frame):
+    from types import SimpleNamespace
+
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControlDecision, InvalidRun
+    from models.hub_model import HubConfiguration
+
+    def decide(_state, forecast):
+        return ControlDecision(
+            control=_zero_control(),
+            diagnostics=_test_diagnostics(
+                forecast,
+                solver_success=True,
+                solver_return_status="not-applicable",
+            ),
+        )
+
+    controller = SimpleNamespace(
+        name="baseline",
+        configuration={},
+        capability_policy={},
+        forecast_horizon_steps=0,
+        requires_operational_storage_bounds=False,
+        decide=decide,
+    )
+    scenario = rolling_horizon._legacy_scenario_from_frame(
+        hourly_frame.iloc[:1], forecast_horizon_steps=0
+    )
+    monkeypatch.setattr(
+        rolling_horizon,
+        "advance_hub",
+        lambda *_args, **_kwargs: pytest.fail("solver diagnostics reached the hub"),
+    )
+
+    outcome = rolling_horizon.simulate_run(
+        scenario, controller, HubConfiguration()
+    )
+
+    assert isinstance(outcome, InvalidRun)
+    assert outcome.failure_code == "invalid_diagnostics"
+    assert outcome.partial_records == ()
 
 
 @pytest.mark.parametrize(
@@ -236,6 +410,50 @@ def test_invalid_successor_or_flows_never_append_an_operating_record(
     assert outcome.partial_records == ()
 
 
+@pytest.mark.parametrize("malformed_shape", ["object", "missing_flows"])
+def test_malformed_physics_schema_returns_invalid_run_without_record(
+    monkeypatch, hourly_frame, malformed_shape
+):
+    from types import SimpleNamespace
+
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControlDecision, InvalidRun
+    from models.hub_model import HubState
+
+    def decide(_self, _state, forecast):
+        return ControlDecision(
+            control=_zero_control(), diagnostics=_test_diagnostics(forecast)
+        )
+
+    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    malformed_step = (
+        object()
+        if malformed_shape == "object"
+        else SimpleNamespace(
+            successor=HubState(
+                soc_battery_kwh=500.0,
+                soc_hydrogen_kg=60.0,
+                soc_thermal_kwh=1600.0,
+                indoor_temperature_c=19.0,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        rolling_horizon,
+        "advance_hub",
+        lambda *_args, **_kwargs: malformed_step,
+    )
+
+    outcome = rolling_horizon.run_simulation(
+        hourly_frame.iloc[:1], mode="baseline"
+    )
+
+    assert isinstance(outcome, InvalidRun)
+    assert outcome.failure_code == "physics_schema_error"
+    assert outcome.failed_step == 0
+    assert outcome.partial_records == ()
+
+
 def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
     monkeypatch, hourly_frame
 ):
@@ -284,7 +502,21 @@ def test_run_configuration_mappings_are_read_only(hourly_frame):
     with pytest.raises(TypeError):
         outcome.controller_configuration["mutated"] = True
     with pytest.raises(TypeError):
-        outcome.capability_policy["hydrogen"] = True
+        outcome.capability_policy["hydrogen_dispatch"] = True
+
+
+def test_baseline_run_records_exact_capability_policy(hourly_frame):
+    from control.rolling_horizon import ValidRun, run_simulation
+
+    outcome = run_simulation(hourly_frame.iloc[:1], mode="baseline")
+
+    assert isinstance(outcome, ValidRun)
+    assert outcome.capability_policy == {
+        "hydrogen_dispatch": False,
+        "thermal_store_charging": False,
+        "grid_battery_charging": False,
+        "battery_discharge_price_threshold_eur_per_kwh": 0.12,
+    }
 
 
 def test_mpc_adapter_configuration_mappings_are_read_only_copies():
