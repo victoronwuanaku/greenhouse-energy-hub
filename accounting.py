@@ -13,29 +13,62 @@ Two cost notions:
                                more/less storage.
 """
 
-from models.hub_model import ETA_BAT_DIS, ETA_FC_E, E_H2_LHV_KWH_KG, HP_COP
+from models.hub_model import (
+    E_H2_LHV_KWH_KG,
+    ETA_BAT_DIS,
+    ETA_FC_E,
+    HP_COP,
+    HubConfiguration,
+)
 
 
-def stored_equiv_kwh(soc_bat: float, soc_h2: float, soc_tes: float) -> float:
+def stored_equiv_kwh(
+    soc_bat: float,
+    soc_h2: float,
+    soc_tes: float,
+    config: HubConfiguration = HubConfiguration(),
+) -> float:
     """Electricity-equivalent value of stored energy [kWh]: recoverable electricity
-    (battery, H2 via fuel cell) plus heat valued at the heat-pump COP."""
-    return (ETA_BAT_DIS * soc_bat
-            + ETA_FC_E * E_H2_LHV_KWH_KG * soc_h2
-            + (1.0 / HP_COP) * soc_tes)
+    (battery, H2 via fuel cell) plus heat valued at the heat-pump COP.
+
+    Disabled Assets retain schema fields but contribute exactly zero inventory.
+    """
+    capabilities = config.capabilities
+    return (
+        ETA_BAT_DIS * soc_bat if capabilities.battery else 0.0
+    ) + (
+        ETA_FC_E * E_H2_LHV_KWH_KG * soc_h2
+        if capabilities.hydrogen
+        else 0.0
+    ) + (
+        (1.0 / HP_COP) * soc_tes if capabilities.thermal_store else 0.0
+    )
 
 
-def stored_equiv_from_row(row) -> float:
+def stored_equiv_from_row(
+    row, config: HubConfiguration = HubConfiguration()
+) -> float:
     """Electricity-equivalent of a results row (uses the SOC_* columns)."""
-    return stored_equiv_kwh(row["SOC_bat_kWh"], row["SOC_h2_kg"], row["SOC_tes_kWh"])
+    return stored_equiv_kwh(
+        row["SOC_bat_kWh"],
+        row["SOC_h2_kg"],
+        row["SOC_tes_kWh"],
+        config,
+    )
 
 
-def inventory_adjusted_cost(results_df, init_equiv: float, settle_price: float) -> float:
+def inventory_adjusted_cost(
+    results_df,
+    init_equiv: float,
+    settle_price: float,
+    config: HubConfiguration = HubConfiguration(),
+) -> float:
     """Raw grid cost + mark-to-market of net stored energy consumed over the window.
 
     The final row of a results frame is the true terminal state (see
     rolling_horizon.run_simulation, which appends it), so iloc[-1] is exact.
     """
-    final_equiv = stored_equiv_from_row(results_df.iloc[-1])
+    final_equiv = stored_equiv_from_row(results_df.iloc[-1], config)
     return results_df["grid_cost_EUR"].sum() + settle_price * (init_equiv - final_equiv)
 
 

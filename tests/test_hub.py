@@ -207,6 +207,257 @@ def test_invalid_control_reports_simultaneous_flows_above_exact_tolerance():
     ]
 
 
+def _parity_case_values():
+    """Cover nominal, every state/control edge, and deterministic interiors."""
+    from models.hub_model import (
+        CONTROL_MODEL_NAMES,
+        STATE_MODEL_NAMES,
+        AssetCapabilities,
+        HubConfiguration,
+        control_bounds,
+        operational_state_bounds,
+        physical_state_bounds,
+    )
+
+    config = HubConfiguration()
+    nominal_state = {
+        "soc_battery_kwh": 500.0,
+        "soc_hydrogen_kg": 60.0,
+        "soc_thermal_kwh": 1600.0,
+        "indoor_temperature_c": 19.0,
+    }
+    nominal_control = {
+        "battery_charge_kw": 100.0,
+        "battery_discharge_kw": 0.0,
+        "electrolyser_kw": 50.0,
+        "fuel_cell_kw": 0.0,
+        "heat_pump_kw": 100.0,
+        "electric_boiler_kw": 200.0,
+        "thermal_charge_kw": 150.0,
+        "thermal_discharge_kw": 0.0,
+        "ventilation_fraction": 0.0,
+    }
+    nominal_exogenous = {
+        "pv_kw": 80.0,
+        "electric_load_kw": 600.0,
+        "price_eur_per_kwh": 0.10,
+        "outdoor_temperature_c": 5.0,
+        "irradiance_w_per_m2": 0.0,
+    }
+
+    cases = [("nominal", config, nominal_state, nominal_control, nominal_exogenous)]
+    for bound_policy, bounds in (
+        ("physical", physical_state_bounds(config)),
+        ("operational", operational_state_bounds(config)),
+    ):
+        for field_name in STATE_MODEL_NAMES:
+            for edge_name, value in zip(
+                ("lower", "upper"),
+                bounds[field_name],
+                strict=True,
+            ):
+                cases.append(
+                    (
+                        f"state-{bound_policy}-{field_name}-{edge_name}",
+                        config,
+                        {**nominal_state, field_name: value},
+                        nominal_control,
+                        nominal_exogenous,
+                    )
+                )
+    for field_name in CONTROL_MODEL_NAMES:
+        for edge_name, value in zip(
+            ("lower", "upper"),
+            control_bounds(config)[field_name],
+            strict=True,
+        ):
+            cases.append(
+                (
+                    f"control-{field_name}-{edge_name}",
+                    config,
+                    nominal_state,
+                    {**nominal_control, field_name: value},
+                    nominal_exogenous,
+                )
+            )
+
+    rng = np.random.default_rng(20260717)
+    state_limits = physical_state_bounds(config)
+    control_limits = control_bounds(config)
+    for index in range(8):
+        random_state = {
+            field_name: rng.uniform(lower, upper)
+            for field_name, (lower, upper) in state_limits.items()
+        }
+        random_control = {
+            field_name: rng.uniform(lower, upper)
+            for field_name, (lower, upper) in control_limits.items()
+        }
+        random_exogenous = {
+            "pv_kw": rng.uniform(0.0, 500.0),
+            "electric_load_kw": rng.uniform(0.0, 1000.0),
+            "price_eur_per_kwh": rng.uniform(-0.10, 0.40),
+            "outdoor_temperature_c": rng.uniform(-10.0, 35.0),
+            "irradiance_w_per_m2": rng.uniform(0.0, 1000.0),
+        }
+        cases.append(
+            (
+                f"random-interior-{index}",
+                config,
+                random_state,
+                random_control,
+                random_exogenous,
+            )
+        )
+
+    for name, capabilities in (
+        ("no-hydrogen", AssetCapabilities(hydrogen=False)),
+        ("no-thermal-store", AssetCapabilities(thermal_store=False)),
+    ):
+        cases.append(
+            (
+                name,
+                HubConfiguration(capabilities=capabilities),
+                nominal_state,
+                nominal_control,
+                nominal_exogenous,
+            )
+        )
+    return cases
+
+
+@pytest.mark.parametrize(
+    ("_case_name", "config", "state_values", "control_values", "exogenous_values"),
+    _parity_case_values(),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_shared_hub_expressions_match_numerical_adapter(
+    _case_name, config, state_values, control_values, exogenous_values
+):
+    """The CasADi and numerical adapters must evaluate one physical owner."""
+    from casadi import Function, SX, vertcat
+
+    from models.hub_model import (
+        CONTROL_MODEL_NAMES,
+        EXOGENOUS_MODEL_NAMES,
+        STATE_MODEL_NAMES,
+        ExogenousInputs,
+        HubControl,
+        HubState,
+        advance_hub,
+        hub_step_expressions,
+    )
+
+    state_symbol = SX.sym("state", len(STATE_MODEL_NAMES))
+    control_symbol = SX.sym("control", len(CONTROL_MODEL_NAMES))
+    exogenous_symbol = SX.sym("exogenous", len(EXOGENOUS_MODEL_NAMES))
+    symbolic_step = hub_step_expressions(
+        HubState(
+            **{
+                field_name: state_symbol[index]
+                for index, field_name in enumerate(STATE_MODEL_NAMES)
+            }
+        ),
+        HubControl(
+            **{
+                field_name: control_symbol[index]
+                for index, field_name in enumerate(CONTROL_MODEL_NAMES)
+            }
+        ),
+        ExogenousInputs(
+            **{
+                field_name: exogenous_symbol[index]
+                for index, field_name in enumerate(EXOGENOUS_MODEL_NAMES)
+            }
+        ),
+        config,
+    )
+    symbolic_function = Function(
+        "shared_hub_step",
+        [state_symbol, control_symbol, exogenous_symbol],
+        [
+            vertcat(
+                *(
+                    getattr(symbolic_step.successor, field_name)
+                    for field_name in STATE_MODEL_NAMES
+                ),
+                symbolic_step.flows.grid_kw,
+                symbolic_step.flows.generated_heat_kw,
+                symbolic_step.flows.heat_to_air_kw,
+                symbolic_step.flows.thermal_charge_margin_kw,
+                symbolic_step.flows.hydrogen_production_kg_per_h,
+                symbolic_step.flows.hydrogen_consumption_kg_per_h,
+            )
+        ],
+    )
+
+    numerical_step = advance_hub(
+        HubState(**state_values),
+        HubControl(**control_values),
+        ExogenousInputs(**exogenous_values),
+        config,
+    )
+    numerical_values = np.asarray(
+        [
+            *(getattr(numerical_step.successor, name) for name in STATE_MODEL_NAMES),
+            numerical_step.flows.grid_kw,
+            numerical_step.flows.generated_heat_kw,
+            numerical_step.flows.heat_to_air_kw,
+            numerical_step.flows.thermal_charge_margin_kw,
+            numerical_step.flows.hydrogen_production_kg_per_h,
+            numerical_step.flows.hydrogen_consumption_kg_per_h,
+        ],
+        dtype=float,
+    )
+    symbolic_values = np.asarray(
+        symbolic_function(
+            [state_values[name] for name in STATE_MODEL_NAMES],
+            [control_values[name] for name in CONTROL_MODEL_NAMES],
+            [exogenous_values[name] for name in EXOGENOUS_MODEL_NAMES],
+        )
+    ).reshape(-1)
+
+    np.testing.assert_allclose(
+        symbolic_values,
+        numerical_values,
+        rtol=0.0,
+        atol=1e-8,
+    )
+
+
+def test_shared_thermal_charge_margin_is_signed_and_validated_numerically():
+    from models.hub_model import (
+        ExogenousInputs,
+        HubConfiguration,
+        HubControl,
+        HubState,
+        advance_hub,
+        validate_flows,
+    )
+
+    state = HubState(500.0, 60.0, 1600.0, 19.0)
+    exogenous = ExogenousInputs(0.0, 0.0, 0.0, 5.0, 0.0)
+    feasible = advance_hub(
+        state,
+        HubControl(0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 5.0, 0.0, 0.0),
+        exogenous,
+    )
+    infeasible = advance_hub(
+        state,
+        HubControl(0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 36.0, 0.0, 0.0),
+        exogenous,
+        HubConfiguration(),
+    )
+
+    assert feasible.flows.generated_heat_kw == pytest.approx(35.0)
+    assert feasible.flows.thermal_charge_margin_kw == pytest.approx(-30.0)
+    assert validate_flows(feasible.flows) == ()
+    assert infeasible.flows.thermal_charge_margin_kw == pytest.approx(1.0)
+    assert [issue.code for issue in validate_flows(infeasible.flows)] == [
+        "thermal_charge_infeasible"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------

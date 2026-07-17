@@ -6,7 +6,7 @@ Location:  Representative Dutch (Westland) greenhouse, Netherlands (1 ha high-te
 
 This module defines the physical plant: asset sizing, control/state bounds, and the
 discrete-time state-transition function used by both the MPC internal model
-(`control/mpc_controller.py`, symbolic CasADi mirror) and the rolling-horizon plant
+(`control/mpc_controller.py`, CasADi adapter) and the rolling-horizon numerical
 simulation (`control/rolling_horizon.py`).
 
 Energy carriers
@@ -315,16 +315,20 @@ T_HARD_MAX_C = 40.0
 def physical_state_bounds(
     config: HubConfiguration,
 ) -> dict[str, tuple[float, float]]:
-    """Physical Run bounds: zero-to-capacity storage and hard temperature limits.
-
-    Asset capability zeroing is deliberately deferred to the disabled-asset task;
-    the configuration is accepted now so this stable interface need not change.
-    """
-    del config
+    """Physical Run bounds, with Disabled Assets pinned exactly to zero."""
+    capabilities = config.capabilities
     return {
-        "soc_battery_kwh": (0.0, BAT_CAPACITY_KWH),
-        "soc_hydrogen_kg": (0.0, H2_CAPACITY_KG),
-        "soc_thermal_kwh": (0.0, TES_CAPACITY_KWH),
+        "soc_battery_kwh": (
+            (0.0, BAT_CAPACITY_KWH) if capabilities.battery else (0.0, 0.0)
+        ),
+        "soc_hydrogen_kg": (
+            (0.0, H2_CAPACITY_KG) if capabilities.hydrogen else (0.0, 0.0)
+        ),
+        "soc_thermal_kwh": (
+            (0.0, TES_CAPACITY_KWH)
+            if capabilities.thermal_store
+            else (0.0, 0.0)
+        ),
         "indoor_temperature_c": (T_HARD_MIN_C, T_HARD_MAX_C),
     }
 
@@ -333,19 +337,25 @@ def operational_state_bounds(
     config: HubConfiguration,
 ) -> dict[str, tuple[float, float]]:
     """Existing MPC reserve policy plus the common hard temperature limits."""
-    del config
+    capabilities = config.capabilities
     return {
         "soc_battery_kwh": (
-            BAT_SOC_MIN * BAT_CAPACITY_KWH,
-            BAT_SOC_MAX * BAT_CAPACITY_KWH,
+            (
+                BAT_SOC_MIN * BAT_CAPACITY_KWH,
+                BAT_SOC_MAX * BAT_CAPACITY_KWH,
+            )
+            if capabilities.battery
+            else (0.0, 0.0)
         ),
         "soc_hydrogen_kg": (
-            H2_SOC_MIN * H2_CAPACITY_KG,
-            H2_SOC_MAX * H2_CAPACITY_KG,
+            (H2_SOC_MIN * H2_CAPACITY_KG, H2_SOC_MAX * H2_CAPACITY_KG)
+            if capabilities.hydrogen
+            else (0.0, 0.0)
         ),
         "soc_thermal_kwh": (
-            TES_SOC_MIN * TES_CAPACITY_KWH,
-            TES_SOC_MAX * TES_CAPACITY_KWH,
+            (TES_SOC_MIN * TES_CAPACITY_KWH, TES_SOC_MAX * TES_CAPACITY_KWH)
+            if capabilities.thermal_store
+            else (0.0, 0.0)
         ),
         "indoor_temperature_c": (T_HARD_MIN_C, T_HARD_MAX_C),
     }
@@ -353,30 +363,50 @@ def operational_state_bounds(
 
 def control_bounds(config: HubConfiguration) -> dict[str, tuple[float, float]]:
     """Physical bounds for each stable HubControl field."""
-    del config
+    capabilities = config.capabilities
     return {
-        "battery_charge_kw": (0.0, BAT_P_MAX_KW),
-        "battery_discharge_kw": (0.0, BAT_P_MAX_KW),
-        "electrolyser_kw": (0.0, ELZ_P_MAX_KW),
-        "fuel_cell_kw": (0.0, FC_P_MAX_KW),
+        "battery_charge_kw": (
+            (0.0, BAT_P_MAX_KW) if capabilities.battery else (0.0, 0.0)
+        ),
+        "battery_discharge_kw": (
+            (0.0, BAT_P_MAX_KW) if capabilities.battery else (0.0, 0.0)
+        ),
+        "electrolyser_kw": (
+            (0.0, ELZ_P_MAX_KW) if capabilities.hydrogen else (0.0, 0.0)
+        ),
+        "fuel_cell_kw": (
+            (0.0, FC_P_MAX_KW) if capabilities.hydrogen else (0.0, 0.0)
+        ),
         "heat_pump_kw": (0.0, HP_P_MAX_KW),
         "electric_boiler_kw": (0.0, EBOILER_P_MAX_KW),
-        "thermal_charge_kw": (0.0, TES_P_MAX_KW),
-        "thermal_discharge_kw": (0.0, TES_P_MAX_KW),
+        "thermal_charge_kw": (
+            (0.0, TES_P_MAX_KW)
+            if capabilities.thermal_store
+            else (0.0, 0.0)
+        ),
+        "thermal_discharge_kw": (
+            (0.0, TES_P_MAX_KW)
+            if capabilities.thermal_store
+            else (0.0, 0.0)
+        ),
         "ventilation_fraction": (0.0, 1.0),
         # P_grid is NOT a control: it is the derived slack bus (see hub_dynamics).
     }
 
 
-def state_bounds() -> dict[str, tuple[float, float]]:
+def state_bounds(
+    config: HubConfiguration = HubConfiguration(),
+) -> dict[str, tuple[float, float]]:
     """Legacy model-name view of MPC operational state bounds."""
-    stable = operational_state_bounds(HubConfiguration())
+    stable = operational_state_bounds(config)
     return {STATE_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
 
 
-def input_bounds() -> dict[str, tuple[float, float]]:
+def input_bounds(
+    config: HubConfiguration = HubConfiguration(),
+) -> dict[str, tuple[float, float]]:
     """Legacy model-name view of physical control bounds."""
-    stable = control_bounds(HubConfiguration())
+    stable = control_bounds(config)
     return {CONTROL_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
 
 
@@ -410,83 +440,78 @@ def greenhouse_temperature_next(T_in, Q_air, vent, T_out):
 # ---------------------------------------------------------------------------
 # Discrete-time state update (Euler, Δt = 1 h)  — the "plant"
 # ---------------------------------------------------------------------------
-def hub_dynamics(x: dict, u: dict, p: dict) -> dict:
+def hub_dynamics(
+    x: Mapping[str, object],
+    u: Mapping[str, object],
+    p: Mapping[str, object],
+    config: HubConfiguration = HubConfiguration(),
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Temporary dictionary compatibility wrapper over :func:`advance_hub`.
+
+    Exact realized maxima and legacy presentation metrics intentionally live here,
+    outside the shared expression layer consumed by CasADi.
     """
-    One-step discrete-time state transition for the greenhouse energy hub.
+    state = HubState(
+        soc_battery_kwh=x["SOC_bat"],
+        soc_hydrogen_kg=x["SOC_h2"],
+        soc_thermal_kwh=x["SOC_tes"],
+        indoor_temperature_c=x["T_in"],
+    )
+    control = HubControl(
+        battery_charge_kw=u["P_bat_ch"],
+        battery_discharge_kw=u["P_bat_dis"],
+        electrolyser_kw=u["P_elz"],
+        fuel_cell_kw=u["P_fc"],
+        heat_pump_kw=u["P_hp"],
+        electric_boiler_kw=u["P_eboiler"],
+        thermal_charge_kw=u["Q_tes_ch"],
+        thermal_discharge_kw=u["Q_tes_dis"],
+        ventilation_fraction=u["vent"],
+    )
+    exogenous = ExogenousInputs(
+        pv_kw=p["P_pv"],
+        electric_load_kw=p["P_load"],
+        price_eur_per_kwh=p.get("price", 0.0),
+        outdoor_temperature_c=p["T_out"],
+        irradiance_w_per_m2=p.get("G_Wm2", 0.0),
+    )
+    step = advance_hub(state, control, exogenous, config)
 
-    Parameters
-    ----------
-    x : dict — {SOC_bat [kWh], SOC_h2 [kg], SOC_tes [kWh], T_in [degC]}
-    u : dict — control inputs (see module docstring)
-    p : dict — {P_pv [kW], P_load [kW], price [EUR/kWh], T_out [degC], G_Wm2 [W/m2]}
+    heat_pump_heat = HP_COP * control.heat_pump_kw
+    electric_boiler_heat = ETA_EBOILER * control.electric_boiler_kw
+    fuel_cell_heat = (
+        step.flows.generated_heat_kw - heat_pump_heat - electric_boiler_heat
+    )
+    grid_kw = step.flows.grid_kw
+    reached_temperature = step.successor.indoor_temperature_c
+    thermal_charge_excess = max(0.0, step.flows.thermal_charge_margin_kw)
 
-    Returns
-    -------
-    x_next : dict — states at next timestep
-    metrics : dict — derived diagnostics (residuals, costs, heat/H2 flows)
-    """
-    SOC_bat, SOC_h2, SOC_tes, T_in = x["SOC_bat"], x["SOC_h2"], x["SOC_tes"], x["T_in"]
-
-    P_bat_ch, P_bat_dis = u["P_bat_ch"], u["P_bat_dis"]
-    P_elz, P_fc = u["P_elz"], u["P_fc"]
-    P_hp, P_eboiler = u["P_hp"], u["P_eboiler"]
-    Q_tes_ch, Q_tes_dis = u["Q_tes_ch"], u["Q_tes_dis"]
-    vent = u["vent"]
-
-    P_pv, P_load = p["P_pv"], p["P_load"]
-    T_out = p["T_out"]
-    G_Wm2 = p.get("G_Wm2", 0.0)
-
-    # --- Conversions ---
-    Q_hp = HP_COP * P_hp                          # heat pump thermal output [kW]
-    Q_eboiler = ETA_EBOILER * P_eboiler           # e-boiler thermal output [kW]
-    _, m_h2_fc, Q_fc_heat = fuel_cell_outputs(P_fc)
-    m_h2_prod = ETA_ELZ * P_elz / E_H2_LHV_KWH_KG  # H2 produced [kg/h]
-
-    Q_gen = Q_hp + Q_eboiler + Q_fc_heat          # total generated heat [kW]
-    Q_solar = SOLAR_GAIN_FRAC * G_Wm2 * FLOOR_AREA_M2 / 1000.0  # solar gain [kW]
-    Q_air = Q_gen - Q_tes_ch + Q_tes_dis + Q_solar             # net heat to air [kW]
-
-    # --- Grid is the slack bus: net import determined by the electricity balance ---
-    #   P_grid + P_pv + P_bat_dis + P_fc = P_load + P_bat_ch + P_elz + P_hp + P_eboiler
-    # so the balance holds exactly by construction (no equality constraint needed).
-    P_grid = (P_load + P_bat_ch + P_elz + P_hp + P_eboiler
-              - P_pv - P_bat_dis - P_fc)
-
-    # --- State updates ---
-    SOC_bat_next = (SOC_bat
-                    + ETA_BAT_CH * P_bat_ch * DT_H
-                    - (P_bat_dis / ETA_BAT_DIS) * DT_H)
-    SOC_h2_next = SOC_h2 + (m_h2_prod - m_h2_fc) * DT_H
-    SOC_tes_next = (ETA_TES_STANDING * SOC_tes
-                    + Q_tes_ch * DT_H
-                    - Q_tes_dis * DT_H)
-    T_in_next = greenhouse_temperature_next(T_in, Q_air, vent, T_out)
-
-    x_next = {
-        "SOC_bat": SOC_bat_next,
-        "SOC_h2":  SOC_h2_next,
-        "SOC_tes": SOC_tes_next,
-        "T_in":    T_in_next,
-    }
-
-    metrics = {
-        "P_grid_kW": P_grid,
-        "elec_residual_kW": 0.0,   # balance is exact by construction (slack bus)
-        "tes_charge_excess_kW": max(0.0, Q_tes_ch - Q_gen),  # >0 => infeasible TES charge
-        "Q_hp_kW": Q_hp,
-        "Q_eboiler_kW": Q_eboiler,
-        "Q_fc_heat_kW": Q_fc_heat,
-        "Q_air_kW": Q_air,
-        "m_h2_prod_kg_h": m_h2_prod,
-        "m_h2_fc_kg_h": m_h2_fc,
-        # import pays wholesale + transport/levy; export earns wholesale only
-        "grid_cost_EUR": (P_grid * p.get("price", 0.0)
-                          + GRID_IMPORT_FEE_EUR_KWH * max(0.0, P_grid)) * DT_H,
-        # violation of the temperature REACHED during the hour (the controlled result)
-        "T_violation_C": max(0.0, T_in_next - T_MAX_C) + max(0.0, T_MIN_C - T_in_next),
-    }
-    return x_next, metrics
+    return (
+        {
+            "SOC_bat": step.successor.soc_battery_kwh,
+            "SOC_h2": step.successor.soc_hydrogen_kg,
+            "SOC_tes": step.successor.soc_thermal_kwh,
+            "T_in": step.successor.indoor_temperature_c,
+        },
+        {
+            "P_grid_kW": grid_kw,
+            "elec_residual_kW": 0.0,
+            "tes_charge_excess_kW": thermal_charge_excess,
+            "Q_hp_kW": heat_pump_heat,
+            "Q_eboiler_kW": electric_boiler_heat,
+            "Q_fc_heat_kW": fuel_cell_heat,
+            "Q_air_kW": step.flows.heat_to_air_kw,
+            "m_h2_prod_kg_h": step.flows.hydrogen_production_kg_per_h,
+            "m_h2_fc_kg_h": step.flows.hydrogen_consumption_kg_per_h,
+            "grid_cost_EUR": (
+                grid_kw * exogenous.price_eur_per_kwh
+                + GRID_IMPORT_FEE_EUR_KWH * max(0.0, grid_kw)
+            )
+            * DT_H,
+            "T_violation_C": max(0.0, reached_temperature - T_MAX_C)
+            + max(0.0, T_MIN_C - reached_temperature),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -518,29 +543,90 @@ def hub_step_expressions(
     exogenous: ExogenousInputs,
     config: HubConfiguration = HubConfiguration(),
 ) -> HubStep:
-    """Evaluate the existing plant equations behind stable domain types.
-
-    The do-mpc symbolic model remains untouched until the shared-expression task.
-    """
-    del config
-    successor_values, metrics = hub_dynamics(state, control, exogenous)
-    generated_heat = (
-        metrics["Q_hp_kW"] + metrics["Q_eboiler_kW"] + metrics["Q_fc_heat_kW"]
+    """Return one physical step using float- and CasADi-compatible arithmetic."""
+    capabilities = config.capabilities
+    battery_charge = (
+        control.battery_charge_kw if capabilities.battery else 0.0
     )
+    battery_discharge = (
+        control.battery_discharge_kw if capabilities.battery else 0.0
+    )
+    electrolyser = control.electrolyser_kw if capabilities.hydrogen else 0.0
+    fuel_cell = control.fuel_cell_kw if capabilities.hydrogen else 0.0
+    thermal_charge = (
+        control.thermal_charge_kw if capabilities.thermal_store else 0.0
+    )
+    thermal_discharge = (
+        control.thermal_discharge_kw if capabilities.thermal_store else 0.0
+    )
+
+    heat_pump_heat = HP_COP * control.heat_pump_kw
+    electric_boiler_heat = ETA_EBOILER * control.electric_boiler_kw
+    hydrogen_consumption = fuel_cell / ETA_FC_E / E_H2_LHV_KWH_KG
+    fuel_cell_heat = ETA_FC_H * fuel_cell / ETA_FC_E
+    hydrogen_production = ETA_ELZ * electrolyser / E_H2_LHV_KWH_KG
+    generated_heat = heat_pump_heat + electric_boiler_heat + fuel_cell_heat
+    solar_heat = (
+        SOLAR_GAIN_FRAC
+        * exogenous.irradiance_w_per_m2
+        * FLOOR_AREA_M2
+        / 1000.0
+    )
+    heat_to_air = (
+        generated_heat - thermal_charge + thermal_discharge + solar_heat
+    )
+    grid_kw = (
+        exogenous.electric_load_kw
+        + battery_charge
+        + electrolyser
+        + control.heat_pump_kw
+        + control.electric_boiler_kw
+        - exogenous.pv_kw
+        - battery_discharge
+        - fuel_cell
+    )
+
+    soc_battery_next = (
+        state.soc_battery_kwh
+        + ETA_BAT_CH * battery_charge * DT_H
+        - battery_discharge / ETA_BAT_DIS * DT_H
+        if capabilities.battery
+        else 0.0
+    )
+    soc_hydrogen_next = (
+        state.soc_hydrogen_kg
+        + (hydrogen_production - hydrogen_consumption) * DT_H
+        if capabilities.hydrogen
+        else 0.0
+    )
+    soc_thermal_next = (
+        ETA_TES_STANDING * state.soc_thermal_kwh
+        + thermal_charge * DT_H
+        - thermal_discharge * DT_H
+        if capabilities.thermal_store
+        else 0.0
+    )
+    indoor_temperature_next = greenhouse_temperature_next(
+        state.indoor_temperature_c,
+        heat_to_air,
+        control.ventilation_fraction,
+        exogenous.outdoor_temperature_c,
+    )
+
     return HubStep(
         successor=HubState(
-            soc_battery_kwh=successor_values["SOC_bat"],
-            soc_hydrogen_kg=successor_values["SOC_h2"],
-            soc_thermal_kwh=successor_values["SOC_tes"],
-            indoor_temperature_c=successor_values["T_in"],
+            soc_battery_kwh=soc_battery_next,
+            soc_hydrogen_kg=soc_hydrogen_next,
+            soc_thermal_kwh=soc_thermal_next,
+            indoor_temperature_c=indoor_temperature_next,
         ),
         flows=HubFlows(
-            grid_kw=metrics["P_grid_kW"],
+            grid_kw=grid_kw,
             generated_heat_kw=generated_heat,
-            heat_to_air_kw=metrics["Q_air_kW"],
-            thermal_charge_margin_kw=metrics["tes_charge_excess_kW"],
-            hydrogen_production_kg_per_h=metrics["m_h2_prod_kg_h"],
-            hydrogen_consumption_kg_per_h=metrics["m_h2_fc_kg_h"],
+            heat_to_air_kw=heat_to_air,
+            thermal_charge_margin_kw=thermal_charge - generated_heat,
+            hydrogen_production_kg_per_h=hydrogen_production,
+            hydrogen_consumption_kg_per_h=hydrogen_consumption,
         ),
     )
 
@@ -771,11 +857,17 @@ def validate_flows(
 # ---------------------------------------------------------------------------
 def initial_state(config: HubConfiguration = HubConfiguration()) -> HubState:
     """Physically reasonable initial hub state."""
-    del config
+    capabilities = config.capabilities
     return HubState(
-        soc_battery_kwh=0.50 * BAT_CAPACITY_KWH,  # 500 kWh (50%)
-        soc_hydrogen_kg=0.30 * H2_CAPACITY_KG,  # 60 kg (30%)
-        soc_thermal_kwh=0.40 * TES_CAPACITY_KWH,  # 1600 kWh (40%)
+        soc_battery_kwh=(
+            0.50 * BAT_CAPACITY_KWH if capabilities.battery else 0.0
+        ),
+        soc_hydrogen_kg=(
+            0.30 * H2_CAPACITY_KG if capabilities.hydrogen else 0.0
+        ),
+        soc_thermal_kwh=(
+            0.40 * TES_CAPACITY_KWH if capabilities.thermal_store else 0.0
+        ),
         indoor_temperature_c=T_SETPOINT_C,  # at setpoint
     )
 

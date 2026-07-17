@@ -687,6 +687,29 @@ def test_mpc_enables_operational_terminal_bounds():
         assert float(mpc.terminal_bounds["upper", model_name]) == pytest.approx(upper)
 
 
+@pytest.mark.parametrize("capability", ["battery", "hydrogen", "thermal_store"])
+def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
+    from control.mpc_controller import MpcConfiguration, build_mpc
+    from models.hub_model import (
+        INPUT_SCALE,
+        STATE_SCALE,
+        AssetCapabilities,
+        HubConfiguration,
+    )
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+    mpc, _ = build_mpc(config, MpcConfiguration(horizon_steps=1))
+
+    assert all(value > 0.0 for value in STATE_SCALE.values())
+    assert all(value > 0.0 for value in INPUT_SCALE.values())
+    for model_name, nominal_scale in STATE_SCALE.items():
+        assert float(mpc.scaling["_x", model_name]) == nominal_scale
+    for model_name, nominal_scale in INPUT_SCALE.items():
+        assert float(mpc.scaling["_u", model_name]) == nominal_scale
+
+
 def test_load_data_separates_operating_window_and_rejects_missing_coverage():
     from control.rolling_horizon import (
         CoveredFrame,
@@ -810,20 +833,69 @@ def test_cli_does_not_serialize_invalid_run(monkeypatch, tmp_path, hourly_frame)
     assert csv_writes == []
 
 
-@pytest.mark.xfail(strict=True, reason="PF-02: disabled assets retain non-zero state and capacity")
+def test_cli_constructs_one_asset_capability_configuration(
+    monkeypatch, tmp_path, hourly_frame
+):
+    from types import SimpleNamespace
+
+    import control.rolling_horizon as rolling_horizon
+
+    observed_configurations = []
+
+    def capture_run(_data, *, mode, hub_config, **_kwargs):
+        observed_configurations.append((mode, hub_config))
+        return SimpleNamespace(
+            failed_step=0,
+            failure_code="test_stop",
+            message="configuration captured",
+        )
+
+    monkeypatch.setattr(
+        rolling_horizon, "load_data", lambda **_kwargs: hourly_frame.iloc[:1]
+    )
+    monkeypatch.setattr(rolling_horizon, "run_simulation", capture_run)
+    monkeypatch.setattr(rolling_horizon, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        rolling_horizon.sys,
+        "argv",
+        [
+            "rolling_horizon.py",
+            "--days",
+            "1",
+            "--mode",
+            "baseline",
+            "--disable-h2",
+            "--disable-tes",
+        ],
+    )
+
+    rolling_horizon.main()
+
+    assert len(observed_configurations) == 1
+    mode, config = observed_configurations[0]
+    assert mode == "baseline"
+    assert config.capabilities.battery is True
+    assert config.capabilities.hydrogen is False
+    assert config.capabilities.thermal_store is False
+
+
 @pytest.mark.parametrize(
     ("capability", "state_field", "control_fields"),
     [
+        ("battery", "soc_battery_kwh", ("battery_charge_kw", "battery_discharge_kw")),
         ("hydrogen", "soc_hydrogen_kg", ("electrolyser_kw", "fuel_cell_kw")),
         ("thermal_store", "soc_thermal_kwh", ("thermal_charge_kw", "thermal_discharge_kw")),
     ],
 )
-def test_disabled_asset_is_inert_zero_capacity(capability, state_field, control_fields):
+def test_disabled_asset_configuration_is_exact_zero_capacity(
+    capability, state_field, control_fields
+):
     from models.hub_model import (
         AssetCapabilities,
         HubConfiguration,
         control_bounds,
         initial_state,
+        operational_state_bounds,
         physical_state_bounds,
     )
 
@@ -833,8 +905,156 @@ def test_disabled_asset_is_inert_zero_capacity(capability, state_field, control_
 
     assert getattr(state, state_field) == 0.0
     assert physical_state_bounds(config)[state_field] == (0.0, 0.0)
+    assert operational_state_bounds(config)[state_field] == (0.0, 0.0)
     for field in control_fields:
         assert control_bounds(config)[field] == (0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("capability", "state_field", "control_fields", "disabled_commands"),
+    [
+        (
+            "battery",
+            "soc_battery_kwh",
+            ("battery_charge_kw", "battery_discharge_kw"),
+            {"battery_charge_kw": 100.0, "battery_discharge_kw": 50.0},
+        ),
+        (
+            "hydrogen",
+            "soc_hydrogen_kg",
+            ("electrolyser_kw", "fuel_cell_kw"),
+            {"electrolyser_kw": 100.0, "fuel_cell_kw": 40.0},
+        ),
+        (
+            "thermal_store",
+            "soc_thermal_kwh",
+            ("thermal_charge_kw", "thermal_discharge_kw"),
+            {"thermal_charge_kw": 100.0, "thermal_discharge_kw": 50.0},
+        ),
+    ],
+)
+def test_disabled_asset_dynamics_flows_and_validation_are_inert(
+    capability, state_field, control_fields, disabled_commands
+):
+    from models.hub_model import (
+        AssetCapabilities,
+        ExogenousInputs,
+        HubConfiguration,
+        HubControl,
+        HubState,
+        advance_hub,
+        initial_state,
+        validate_control,
+        validate_successor,
+    )
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+    configured_start = initial_state(config)
+    invalid_state = HubState(
+        **{**configured_start.__dict__, state_field: 123.0}
+    )
+    control = HubControl(
+        **{**_zero_control().__dict__, **disabled_commands, "heat_pump_kw": 10.0}
+    )
+    exogenous = ExogenousInputs(
+        pv_kw=0.0,
+        electric_load_kw=100.0,
+        price_eur_per_kwh=0.10,
+        outdoor_temperature_c=5.0,
+        irradiance_w_per_m2=0.0,
+    )
+    step = advance_hub(invalid_state, control, exogenous, config)
+    zeroed_step = advance_hub(
+        configured_start,
+        HubControl(
+            **{
+                **control.__dict__,
+                **{field_name: 0.0 for field_name in control_fields},
+            }
+        ),
+        exogenous,
+        config,
+    )
+
+    assert getattr(step.successor, state_field) == 0.0
+    assert step.flows == zeroed_step.flows
+    if capability == "hydrogen":
+        assert step.flows.hydrogen_production_kg_per_h == 0.0
+        assert step.flows.hydrogen_consumption_kg_per_h == 0.0
+    assert {issue.field for issue in validate_control(control, config)} >= set(
+        control_fields
+    )
+    assert [issue.field for issue in validate_successor(
+        invalid_state, config, require_operational_storage=False
+    )] == [state_field]
+
+
+@pytest.mark.parametrize(
+    ("capability", "inventories"),
+    [
+        ("battery", (123.0, 0.0, 0.0)),
+        ("hydrogen", (0.0, 123.0, 0.0)),
+        ("thermal_store", (0.0, 0.0, 123.0)),
+    ],
+)
+def test_disabled_asset_recoverable_inventory_contribution_is_zero(
+    capability, inventories
+):
+    from accounting import stored_equiv_kwh
+    from models.hub_model import AssetCapabilities, HubConfiguration
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+
+    assert stored_equiv_kwh(*inventories, config=config) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("capability", "disabled_state", "disabled_controls", "disabled_flows"),
+    [
+        (
+            "hydrogen",
+            "soc_hydrogen_kg",
+            ("electrolyser_kw", "fuel_cell_kw"),
+            ("hydrogen_production_kg_per_h", "hydrogen_consumption_kg_per_h"),
+        ),
+        (
+            "thermal_store",
+            "soc_thermal_kwh",
+            ("thermal_charge_kw", "thermal_discharge_kw"),
+            (),
+        ),
+    ],
+)
+def test_two_day_winter_mpc_keeps_disabled_assets_exactly_zero(
+    capability, disabled_state, disabled_controls, disabled_flows
+):
+    from control.rolling_horizon import ValidRun, load_data, run_simulation
+    from models.hub_model import AssetCapabilities, HubConfiguration
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+    outcome = run_simulation(
+        load_data(start_month=1, n_days=2),
+        mode="mpc",
+        hub_config=config,
+    )
+
+    assert isinstance(outcome, ValidRun)
+    assert outcome.hub_configuration is config
+    assert getattr(outcome.initial_state, disabled_state) == 0.0
+    assert getattr(outcome.terminal_state, disabled_state) == 0.0
+    for record in outcome.records:
+        assert getattr(record.start_state, disabled_state) == 0.0
+        assert getattr(record.reached_state, disabled_state) == 0.0
+        for field_name in disabled_controls:
+            assert getattr(record.control, field_name) == 0.0
+        for field_name in disabled_flows:
+            assert getattr(record.flows, field_name) == 0.0
 
 
 def _first_mpc_control(prices: np.ndarray) -> np.ndarray:

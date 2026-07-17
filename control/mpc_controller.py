@@ -53,7 +53,7 @@ from types import MappingProxyType
 
 import numpy as np
 import do_mpc
-from casadi import sqrt
+from casadi import DM, sqrt
 
 from control.rolling_horizon import (
     ControlDecision,
@@ -62,15 +62,15 @@ from control.rolling_horizon import (
     JSONValue,
 )
 from models.hub_model import (
-    HubConfiguration, HubState, hub_control_from_array, hub_state_array,
-    BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
-    ETA_ELZ, E_H2_LHV_KWH_KG,
-    FC_P_MAX_KW, ETA_FC_E, ETA_FC_H,
-    HP_COP, ETA_EBOILER,
-    TES_P_MAX_KW, ETA_TES_STANDING,
+    ExogenousInputs, HubConfiguration, HubControl, HubState,
+    hub_control_from_array, hub_state_array, hub_step_expressions,
+    BAT_P_MAX_KW, ETA_BAT_DIS,
+    E_H2_LHV_KWH_KG,
+    FC_P_MAX_KW, ETA_FC_E,
+    HP_COP,
+    TES_P_MAX_KW,
     GRID_P_MAX_KW, GRID_IMPORT_FEE_EUR_KWH,
-    C_AIR_KWH_K, U_EFF_KW_K, K_VENT_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
-    Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, T_SETPOINT_C,
+    T_MIN_C, T_MAX_C, T_SETPOINT_C,
     STATE_MODEL_NAMES, CONTROL_MODEL_NAMES,
     operational_state_bounds, control_bounds,
     BALANCE_STATE_TOLERANCE, STATE_SCALE, INPUT_SCALE,
@@ -335,46 +335,45 @@ def build_mpc(
     )
     terminal_heat_value = model.set_variable("_tvp", "terminal_heat_value")
 
-    # --- Conversions ---
-    Q_hp      = HP_COP * P_hp
-    Q_eboiler = ETA_EBOILER * P_eboiler
-    h2_chem   = P_fc / ETA_FC_E
-    m_h2_fc   = h2_chem / E_H2_LHV_KWH_KG
-    Q_fc_heat = ETA_FC_H * h2_chem
-    m_h2_prod = ETA_ELZ * P_elz / E_H2_LHV_KWH_KG
-
-    Q_gen   = Q_hp + Q_eboiler + Q_fc_heat
-    Q_solar = SOLAR_GAIN_FRAC * G_Wm2 * FLOOR_AREA_M2 / 1000.0
-    Q_air   = Q_gen - Q_tes_ch + Q_tes_dis + Q_solar
-
-    # --- Dynamics ---
-    SOC_bat_next = (SOC_bat
-                    + ETA_BAT_CH * P_bat_ch * DT_H
-                    - (P_bat_dis / ETA_BAT_DIS) * DT_H)
-    SOC_h2_next = SOC_h2 + (m_h2_prod - m_h2_fc) * DT_H
-    SOC_tes_next = (ETA_TES_STANDING * SOC_tes
-                    + Q_tes_ch * DT_H - Q_tes_dis * DT_H)
-
-    # Implicit-Euler greenhouse temperature (smooth in vent for IPOPT)
-    C_over_dt = C_AIR_KWH_K / DT_H
-    Geff = U_EFF_KW_K + K_VENT_KW_K * vent
-    T_in_next = (C_over_dt * T_in + Q_air + Geff * T_out - Q_CROP_LATENT_KW) / (C_over_dt + Geff)
-
-    model.set_rhs("SOC_bat", SOC_bat_next)
-    model.set_rhs("SOC_h2",  SOC_h2_next)
-    model.set_rhs("SOC_tes", SOC_tes_next)
-    model.set_rhs("T_in",    T_in_next)
-
-    # Grid is the slack bus: net import is fully determined by the electricity
-    # balance, so it is an EXPRESSION (not a free input). This makes the balance
-    # hold exactly by construction and avoids the degenerate squared-equality
-    # constraint (zero gradient at feasibility) used in the original formulation.
-    P_grid = (P_load + P_bat_ch + P_elz + P_hp + P_eboiler
-              - P_pv - P_bat_dis - P_fc)
-    tes_charge_feas = Q_tes_ch - Q_gen   # <= 0 : cannot charge TES from nothing
-    model.set_expression("P_grid", P_grid)
-    model.set_expression("tes_charge_feas", tes_charge_feas)
-    model.set_expression("Q_gen", Q_gen)
+    # Numerical simulation and this CasADi model bind the same physical owner.
+    shared_step = hub_step_expressions(
+        HubState(
+            soc_battery_kwh=SOC_bat,
+            soc_hydrogen_kg=SOC_h2,
+            soc_thermal_kwh=SOC_tes,
+            indoor_temperature_c=T_in,
+        ),
+        HubControl(
+            battery_charge_kw=P_bat_ch,
+            battery_discharge_kw=P_bat_dis,
+            electrolyser_kw=P_elz,
+            fuel_cell_kw=P_fc,
+            heat_pump_kw=P_hp,
+            electric_boiler_kw=P_eboiler,
+            thermal_charge_kw=Q_tes_ch,
+            thermal_discharge_kw=Q_tes_dis,
+            ventilation_fraction=vent,
+        ),
+        ExogenousInputs(
+            pv_kw=P_pv,
+            electric_load_kw=P_load,
+            price_eur_per_kwh=price,
+            outdoor_temperature_c=T_out,
+            irradiance_w_per_m2=G_Wm2,
+        ),
+        hub_config,
+    )
+    for field_name, model_name in STATE_MODEL_NAMES.items():
+        expression = getattr(shared_step.successor, field_name)
+        model.set_rhs(
+            model_name,
+            DM(expression) if isinstance(expression, (int, float)) else expression,
+        )
+    model.set_expression("P_grid", shared_step.flows.grid_kw)
+    model.set_expression(
+        "tes_charge_feas", shared_step.flows.thermal_charge_margin_kw
+    )
+    model.set_expression("Q_gen", shared_step.flows.generated_heat_kw)
 
     model.setup()
 
@@ -421,8 +420,8 @@ def build_mpc(
     # import_kw is a smooth max(0, P_grid) = 0.5*(P + sqrt(P^2 + eps^2)) so the objective
     # stays C-infinity for IPOPT. eps = 1 kW; this charges a tiny phantom import (~0.5 kW
     # at P_grid=0, i.e. ~0.0125 EUR/h of surcharge) that biases the SOLVER objective only.
-    # The realised/reported grid cost in hub_dynamics uses the EXACT max(0, P_grid), so
-    # published savings are unaffected; tests/test_hub.py bounds this approximation error.
+    # The realised/reported grid cost uses the EXACT max(0, P_grid), so published
+    # savings are unaffected; tests/test_hub.py bounds this approximation error.
     IMPORT_SMOOTH_EPS2 = 1.0
     P_grid_expr = model.aux["P_grid"]
     import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + IMPORT_SMOOTH_EPS2))
@@ -447,11 +446,15 @@ def build_mpc(
     # valued at the horizon-average price. TES heat only displaces FUTURE HEATING
     # electricity, so it is valued at the average price during heating hours / COP —
     # this is ~0 in summer (no heating need), which prevents pointless heat hoarding.
-    stored_value = (
-        terminal_electric_value * ETA_BAT_DIS * SOC_bat
-        + terminal_electric_value * ETA_FC_E * E_H2_LHV_KWH_KG * SOC_h2
-        + terminal_heat_value * SOC_tes
-    )
+    stored_value = DM(0.0)
+    if hub_config.capabilities.battery:
+        stored_value += terminal_electric_value * ETA_BAT_DIS * SOC_bat
+    if hub_config.capabilities.hydrogen:
+        stored_value += (
+            terminal_electric_value * ETA_FC_E * E_H2_LHV_KWH_KG * SOC_h2
+        )
+    if hub_config.capabilities.thermal_store:
+        stored_value += terminal_heat_value * SOC_tes
     mterm = -config.terminal_weight * stored_value
 
     mpc.set_objective(lterm=lterm, mterm=mterm)
@@ -504,14 +507,6 @@ def build_mpc(
         model_name = CONTROL_MODEL_NAMES[field_name]
         mpc.bounds["lower", "_u", model_name] = lower
         mpc.bounds["upper", "_u", model_name] = upper
-
-    # Temporary capability pins; Task 4 moves these into shared configured bounds.
-    if not hub_config.capabilities.hydrogen:
-        mpc.bounds["upper", "_u", "P_elz"] = 0.0
-        mpc.bounds["upper", "_u", "P_fc"] = 0.0
-    if not hub_config.capabilities.thermal_store:
-        mpc.bounds["upper", "_u", "Q_tes_ch"] = 0.0
-        mpc.bounds["upper", "_u", "Q_tes_dis"] = 0.0
 
     # ------------------------------------------------------------------
     # 6. Time-varying parameters (causal N+1 forecast view)

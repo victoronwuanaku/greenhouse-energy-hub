@@ -8,7 +8,7 @@ Workflow
 3. At each timestep k:
    a. (MPC) solve the N-step optimisation with perfect-foresight forecasts,
       apply the first control action; (baseline) apply the rule-based action.
-   b. Advance the plant via hub_dynamics().
+   b. Advance the plant through the shared numerical hub adapter.
    c. Record states, controls, costs and diagnostics.
 4. Run the identical loop for both controllers and compare total grid cost.
 
@@ -349,10 +349,14 @@ def load_data(
 # ---------------------------------------------------------------------------
 # Baseline controller (rule-based, no look-ahead)
 # ---------------------------------------------------------------------------
-def baseline_control(x: dict, p: dict) -> dict:
+def baseline_control(
+    x: Mapping[str, object],
+    p: Mapping[str, object],
+    hub_config: HubConfiguration = HubConfiguration(),
+) -> dict[str, object]:
     """Naive reactive dispatch: hold the lower comfort bound (BASELINE_TARGET_C)
     with HP/e-boiler/TES, plus a simple PV-charge / high-price-discharge battery rule."""
-    sb = state_bounds()
+    sb = state_bounds(hub_config)
     T_in, T_out, G = x["T_in"], p["T_out"], p["G_Wm2"]
     P_pv, P_load, price = p["P_pv"], p["P_load"], p["price"]
 
@@ -389,9 +393,9 @@ def baseline_control(x: dict, p: dict) -> dict:
     headroom = max(0.0, sb["SOC_bat"][1] - x["SOC_bat"]) / (ETA_BAT_CH * DT_H)
     available = max(0.0, x["SOC_bat"] - sb["SOC_bat"][0]) * ETA_BAT_DIS / DT_H
     pv_surplus = P_pv - P_load - P_hp - P_eboiler
-    if pv_surplus > 0:
+    if hub_config.capabilities.battery and pv_surplus > 0:
         P_bat_ch = min(BAT_P_MAX_KW, pv_surplus, headroom)
-    elif price > 0.12:
+    elif hub_config.capabilities.battery and price > 0.12:
         P_bat_dis = min(BAT_P_MAX_KW, available)
 
     return {
@@ -419,6 +423,11 @@ class BaselineControllerAdapter:
     forecast_horizon_steps = 0
     requires_operational_storage_bounds = False
 
+    def __init__(
+        self, hub_config: HubConfiguration = HubConfiguration()
+    ) -> None:
+        self._hub_config = hub_config
+
     def decide(
         self,
         state: HubState,
@@ -434,6 +443,7 @@ class BaselineControllerAdapter:
                 "T_out": point.outdoor_temperature_c,
                 "G_Wm2": point.irradiance_w_per_m2,
             },
+            self._hub_config,
         )
         stable_values = {
             field_name: legacy_control[model_name]
@@ -1111,7 +1121,10 @@ def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
 
 
 def run_simulation(
-    data: pd.DataFrame | CoveredFrame, mode: str = "mpc", **mpc_kwargs
+    data: pd.DataFrame | CoveredFrame,
+    mode: str = "mpc",
+    hub_config: HubConfiguration = HubConfiguration(),
+    **mpc_kwargs: object,
 ) -> ValidRun | InvalidRun:
     """Compatibility wrapper from a legacy frame to the stable Run outcome union."""
     if mode not in ("mpc", "baseline"):
@@ -1124,14 +1137,11 @@ def run_simulation(
         frame = data
         operating_step_count = len(frame)
 
-    hub_config = HubConfiguration(
-        capabilities=AssetCapabilities(
-            hydrogen=not bool(mpc_kwargs.get("disable_h2", False)),
-            thermal_store=not bool(mpc_kwargs.get("disable_tes", False)),
-        )
-    )
     if mode == "baseline":
-        controller: ControllerAdapter = BaselineControllerAdapter()
+        if mpc_kwargs:
+            unexpected = ", ".join(sorted(mpc_kwargs))
+            raise TypeError(f"unexpected Baseline options: {unexpected}")
+        controller: ControllerAdapter = BaselineControllerAdapter(hub_config)
         scenario = _legacy_scenario_from_frame(
             frame,
             controller.forecast_horizon_steps,
@@ -1152,6 +1162,13 @@ def run_simulation(
         f"{', '.join(key for key, value in mpc_kwargs.items() if value) or 'full'})..."
     )
     config_field_names = {field.name for field in fields(MpcConfiguration)}
+    unexpected = set(mpc_kwargs) - config_field_names - {"n_horizon"}
+    if unexpected:
+        names = ", ".join(sorted(unexpected))
+        raise TypeError(
+            f"unexpected MPC options: {names}; pass asset capabilities via "
+            "hub_config"
+        )
     config_values = {
         key: value
         for key, value in mpc_kwargs.items()
@@ -1169,11 +1186,7 @@ def run_simulation(
         mpc=mpc,
         forecast_horizon_steps=horizon_steps,
         configuration=asdict(mpc_config),
-        capability_policy={
-            "battery": True,
-            "hydrogen": not bool(mpc_kwargs.get("disable_h2", False)),
-            "thermal_store": not bool(mpc_kwargs.get("disable_tes", False)),
-        },
+        capability_policy=asdict(hub_config.capabilities),
     )
     scenario = _legacy_scenario_from_frame(
         frame,
@@ -1215,7 +1228,16 @@ def main():
     parser.add_argument("--start-month", type=int, default=6)
     parser.add_argument("--mode", type=str, default="both",
                         choices=["mpc", "baseline", "both"])
+    parser.add_argument("--disable-h2", action="store_true")
+    parser.add_argument("--disable-tes", action="store_true")
     args = parser.parse_args()
+
+    hub_config = HubConfiguration(
+        capabilities=AssetCapabilities(
+            hydrogen=not args.disable_h2,
+            thermal_store=not args.disable_tes,
+        )
+    )
 
     RESULTS_DIR.mkdir(exist_ok=True)
     scen_dir = RESULTS_DIR / "scenarios"
@@ -1234,7 +1256,7 @@ def main():
         if args.mode not in (mode, "both"):
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
-        outcome = run_simulation(df, mode=mode)
+        outcome = run_simulation(df, mode=mode, hub_config=hub_config)
         if not isinstance(outcome, ValidRun):
             print(
                 f"  INVALID RUN at step {outcome.failed_step}: "
@@ -1247,13 +1269,19 @@ def main():
         res.to_csv(scen_dir / f"{tag}_{mode}.csv")               # scenario archive
 
     if "baseline" in results and "mpc" in results:
-        x0 = initial_state()
-        init_eq = stored_equiv_kwh(x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"])
+        x0 = initial_state(hub_config)
+        init_eq = stored_equiv_kwh(
+            x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"], hub_config
+        )
         settle = results["mpc"]["price_EUR_kWh"].mean()
         base, mpc_c = (results["baseline"]["grid_cost_EUR"].sum(),
                        results["mpc"]["grid_cost_EUR"].sum())
-        base_adj = inventory_adjusted_cost(results["baseline"], init_eq, settle)
-        mpc_adj = inventory_adjusted_cost(results["mpc"], init_eq, settle)
+        base_adj = inventory_adjusted_cost(
+            results["baseline"], init_eq, settle, hub_config
+        )
+        mpc_adj = inventory_adjusted_cost(
+            results["mpc"], init_eq, settle, hub_config
+        )
         bv, mv = (results["baseline"]["T_violation_C"].sum(),
                   results["mpc"]["T_violation_C"].sum())
 
