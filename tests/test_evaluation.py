@@ -1377,7 +1377,9 @@ def test_bundle_verification_rejects_unknown_nested_identity_fields(
         verify_run_bundle(mutated, repository_root=repository)
 
 
-def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_path):
+def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime_identity(
+    tmp_path,
+):
     from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
@@ -1387,8 +1389,35 @@ def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_p
     manifest_path.write_bytes(canonical_json_bytes(manifest))
     mutated = _rehash_bundle(bundle.path)
 
-    with pytest.raises(ValueError, match="runtime"):
+    with pytest.raises(ValueError, match="runtime|Specification"):
         verify_run_bundle(mutated, repository_root=repository)
+
+
+def test_bundle_verification_is_runtime_portable_unless_strict_match_is_requested(
+    tmp_path,
+    monkeypatch,
+):
+    import greenhouse_energy_hub.evaluation as evaluation
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    different_runtime = dict(evaluation._actual_runtime_manifest())
+    different_runtime["python"] = "99.99.99"
+    different_runtime["platform"] = "different-verifier-platform"
+    monkeypatch.setattr(
+        evaluation,
+        "_actual_runtime_manifest",
+        lambda: different_runtime,
+    )
+
+    portable = verify_run_bundle(bundle.path, repository_root=repository)
+    assert portable.identifier == bundle.identifier
+    with pytest.raises(ValueError, match="strict runtime compatibility"):
+        verify_run_bundle(
+            bundle.path,
+            repository_root=repository,
+            require_runtime_match=True,
+        )
 
 
 def test_create_run_bundle_requires_explicit_repository_authority(tmp_path):

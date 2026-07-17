@@ -1735,8 +1735,6 @@ def _validate_identity_graph(
     )
     if any(not isinstance(value, str) or not value for value in runtime.values()):
         raise ValueError("Run Bundle runtime manifest is incomplete")
-    if runtime != _actual_runtime_manifest():
-        raise ValueError("Run Bundle runtime does not match the actual runtime")
 
     input_hashes = _require_exact_keys(
         manifest["input_hashes"],
@@ -1845,6 +1843,7 @@ def _verify_bundle_directory(
     *,
     enforce_path_identifier: bool,
     repository_root: str | Path,
+    require_runtime_match: bool = False,
 ) -> RunBundle:
     from greenhouse_energy_hub.simulation import (
         DecisionDiagnostics,
@@ -1936,6 +1935,11 @@ def _verify_bundle_directory(
         manifest,
         repository_root,
     )
+    if require_runtime_match and manifest["runtime"] != _actual_runtime_manifest():
+        raise ValueError(
+            "Run Bundle fails strict runtime compatibility: recorded runtime does "
+            "not match the current verifier"
+        )
     controller_horizon_steps = _controller_horizon_steps(controller)
     if controller_horizon_steps > scenario.forecast_horizon_capacity_steps:
         raise ValueError("Run Bundle controller horizon exceeds Scenario coverage")
@@ -2239,13 +2243,15 @@ def verify_run_bundle(
     expected_identifier: str | None = None,
     *,
     repository_root: str | Path,
+    require_runtime_match: bool = False,
 ) -> RunBundle:
-    """Verify an authoritative full-ID Run Bundle and return immutable metadata."""
+    """Verify an authoritative bundle, optionally requiring runtime compatibility."""
     return _verify_bundle_directory(
         Path(bundle_path),
         expected_identifier,
         enforce_path_identifier=True,
         repository_root=repository_root,
+        require_runtime_match=require_runtime_match,
     )
 
 
