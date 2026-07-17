@@ -3181,11 +3181,15 @@ def _load_verified_publication_candidates(
 def build_publication_manifest(
     candidate_index: str | Path,
     *,
+    manifest_path: str | Path | None = None,
     runs_root: str | Path,
     repository_root: str | Path,
 ) -> dict[str, object]:
     """Build a recipe only after every candidate verifies as a Run Bundle."""
-    candidates = _read_publication_candidate_index(candidate_index)
+    candidates = read_publication_candidates(
+        candidate_index,
+        manifest_path=manifest_path,
+    )
     bundles = _load_verified_publication_candidates(
         candidates,
         runs_root=runs_root,
@@ -3470,7 +3474,12 @@ def regenerate_publication_artifacts(
     readme_path: str | Path,
 ) -> dict[str, object]:
     """Write a verified recipe, figures, and marker-limited README evidence."""
-    manifest = build_publication_manifest(candidate_index, runs_root=runs_root, repository_root=repository_root)
+    manifest = build_publication_manifest(
+        candidate_index,
+        manifest_path=manifest_path,
+        runs_root=runs_root,
+        repository_root=repository_root,
+    )
     Path(manifest_path).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     evidence = load_verified_publication_evidence(manifest, runs_root=runs_root, repository_root=repository_root)
     render_publication_figures(evidence.bundles, figures_root=figures_root)

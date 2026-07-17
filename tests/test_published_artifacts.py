@@ -4,7 +4,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -185,6 +187,105 @@ def test_candidates_fall_back_to_the_committed_manifest_when_index_is_missing(tm
     )
 
     assert candidates == _generated_publication_candidates()
+
+
+def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_path):
+    from greenhouse_energy_hub.evaluation import (
+        load_verified_publication_evidence,
+        read_publication_manifest,
+        regenerate_publication_artifacts,
+    )
+
+    missing_candidates = tmp_path / "diagnostics" / "publication-candidates.json"
+    manifest_path = tmp_path / "publication_manifest.json"
+    readme_path = tmp_path / "README.md"
+    figures_root = tmp_path / "figures"
+    shutil.copy2(ROOT / "results" / "publication_manifest.json", manifest_path)
+    shutil.copy2(ROOT / "README.md", readme_path)
+    repository_outputs = [
+        ROOT / "README.md",
+        ROOT / "results" / "publication_manifest.json",
+        *sorted((ROOT / "results" / "figures").glob("*.png")),
+    ]
+    before = {path: path.read_bytes() for path in repository_outputs}
+
+    regenerated = regenerate_publication_artifacts(
+        candidate_index=missing_candidates,
+        manifest_path=manifest_path,
+        repository_root=ROOT,
+        runs_root=RUNS,
+        figures_root=figures_root,
+        readme_path=readme_path,
+    )
+    committed = read_publication_manifest(
+        ROOT / "results" / "publication_manifest.json"
+    )
+    evidence = load_verified_publication_evidence(
+        regenerated,
+        runs_root=RUNS,
+        repository_root=ROOT,
+    )
+
+    assert not missing_candidates.exists()
+    assert regenerated == committed == read_publication_manifest(manifest_path)
+    assert set(evidence.candidates) == EXPECTED_PUBLICATION_CANDIDATE_KEYS
+    assert {path.name for path in figures_root.glob("*.png")} == {
+        f"fig{number}_{name}.png"
+        for number, name in (
+            (1, "cumulative_cost"),
+            (2, "grid_vs_price"),
+            (3, "soc_trajectories"),
+            (4, "temperature"),
+            (5, "heat_shifting"),
+            (6, "ablation"),
+        )
+    }
+    assert {path: path.read_bytes() for path in repository_outputs} == before
+
+
+def test_publisher_cli_accepts_manifest_alone_from_installed_checkout(tmp_path):
+    checkout = tmp_path / "installed-checkout"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--shared", str(ROOT), str(checkout)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    # Exercise the working implementation while retaining the clone's clean committed
+    # data, bundles, Git objects, and absent ignored diagnostics index.
+    shutil.copy2(
+        ROOT / "experiments" / "publish_results.py",
+        checkout / "experiments" / "publish_results.py",
+    )
+    candidate_index = checkout / "results" / "diagnostics" / "publication-candidates.json"
+    assert not candidate_index.exists()
+    outside = tmp_path / "outside-repository"
+    outside.mkdir()
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.update(
+        {
+            "MPLCONFIGDIR": str(tmp_path / "mpl-cache"),
+            "XDG_CACHE_HOME": str(tmp_path / "xdg-cache"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(checkout / "experiments" / "publish_results.py"),
+            "--manifest",
+            str(checkout / "results" / "publication_manifest.json"),
+        ],
+        cwd=outside,
+        env=environment,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "8 verified pinned Run Bundles" in completed.stdout
 
 
 def _write_handcrafted_bundle(

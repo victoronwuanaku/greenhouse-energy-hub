@@ -19,7 +19,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Regenerate publication artifacts from verified pinned Run Bundles."
     )
-    parser.add_argument("--candidates", type=Path, required=True)
+    parser.add_argument(
+        "--candidates",
+        type=Path,
+        default=ROOT / "results" / "diagnostics" / "publication-candidates.json",
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     return parser
 
