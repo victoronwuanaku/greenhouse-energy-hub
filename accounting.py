@@ -9,9 +9,12 @@ not an accounting input.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import ctypes
+import ctypes.util
 import csv
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, fields, replace
+from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 from importlib import metadata as importlib_metadata
 import io
@@ -28,15 +31,26 @@ from typing import TYPE_CHECKING, TypeAlias
 import uuid
 
 from models.hub_model import (
+    BALANCE_STATE_TOLERANCE,
     E_H2_LHV_KWH_KG,
     ETA_BAT_DIS,
     ETA_FC_E,
     HP_COP,
     T_MAX_C,
     T_MIN_C,
+    AssetCapabilities,
+    ExogenousInputs,
     HubConfiguration,
+    HubControl,
+    HubFlows,
     HubState,
+    advance_hub,
+    initial_state,
+    validate_control,
+    validate_flows,
+    validate_successor,
 )
+from scenarios import Scenario, ScenarioPoint, SourceProvenance
 
 if TYPE_CHECKING:
     from control.rolling_horizon import (
@@ -50,6 +64,8 @@ PROVISIONAL_COEFFICIENT_STATUS = "provisional"
 SETTLEMENT_RULE = "arithmetic-mean-operating-wholesale-price"
 RUN_SPECIFICATION_SCHEMA_VERSION = "run-specification-v1"
 RUN_BUNDLE_SCHEMA_VERSION = "run-bundle-v1"
+EVALUATION_REPORT_SCHEMA_VERSION = "evaluation-report-v1"
+RUN_VALIDATION_SCHEMA_VERSION = "run-validation-v1"
 CANONICALIZATION_VERSION = "canonical-json-v1"
 HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 RUN_BUNDLE_MEMBERS = (
@@ -604,38 +620,32 @@ def _actual_runtime_manifest() -> dict[str, JSONValue]:
     }
 
 
-def _normalized_runtime(
-    runtime: Mapping[str, object] | None,
-) -> dict[str, JSONValue]:
-    actual = _actual_runtime_manifest()
-    if runtime is None:
-        return actual
-    normalized = _to_json_primitives(runtime, "runtime")
-    if not isinstance(normalized, dict):
-        raise TypeError("runtime must be a JSON object")
-    if set(normalized) != set(actual):
-        raise ValueError(
-            "runtime must contain python, platform, do_mpc, casadi, numpy, and pandas"
-        )
-    if any(not isinstance(value, str) or not value for value in normalized.values()):
-        raise ValueError("runtime versions must be nonempty strings")
-    return normalized
-
-
 def _repository_relative_path(path: str | Path, repository_root: Path) -> str:
+    """Return the lexical Git selector and reject every symlink in its path."""
+    resolved_root = repository_root.resolve(strict=True)
     candidate = Path(path)
-    resolved_root = repository_root.resolve()
-    resolved = (
-        candidate.resolve()
-        if candidate.is_absolute()
-        else (resolved_root / candidate).resolve()
+    lexical = Path(
+        os.path.abspath(
+            os.fspath(candidate if candidate.is_absolute() else resolved_root / candidate)
+        )
     )
     try:
-        relative = resolved.relative_to(resolved_root)
+        relative = lexical.relative_to(resolved_root)
     except ValueError as exc:
         raise ValueError("executable paths must remain inside repository_root") from exc
     if not relative.parts:
         raise ValueError("executable path must identify a file")
+    current = resolved_root
+    for part in relative.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise ValueError(
+                    f"executable path contains a symlink component: {relative.as_posix()}"
+                )
+            current.lstat()
+        except FileNotFoundError:
+            break
     return relative.as_posix()
 
 
@@ -702,6 +712,52 @@ def collect_code_provenance(
         "dirty_executable_paths": dirty,
         "untracked_executable_paths": untracked,
     }
+
+
+@dataclass(frozen=True)
+class _PublicationContext:
+    executable_paths: tuple[str, ...]
+    repository_root: Path
+    code_provenance: Mapping[str, JSONValue]
+    runtime: Mapping[str, JSONValue]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "executable_paths", tuple(self.executable_paths))
+        object.__setattr__(self, "repository_root", Path(self.repository_root).resolve())
+        object.__setattr__(
+            self,
+            "code_provenance",
+            _freeze_json_mapping(
+                _to_json_primitives(self.code_provenance, "code_provenance")
+            ),
+        )
+        object.__setattr__(
+            self,
+            "runtime",
+            _freeze_json_mapping(_to_json_primitives(self.runtime, "runtime")),
+        )
+
+
+def _capture_publication_context(
+    executable_paths: tuple[str | Path, ...],
+    *,
+    repository_root: str | Path = Path(__file__).resolve().parent,
+) -> _PublicationContext:
+    """Capture immutable identity inputs before a potentially long execution."""
+    root = Path(repository_root).resolve()
+    code_provenance = collect_code_provenance(
+        executable_paths,
+        repository_root=root,
+    )
+    normalized_paths = tuple(
+        sorted(code_provenance["executable_path_hashes"])
+    )
+    return _PublicationContext(
+        executable_paths=normalized_paths,
+        repository_root=root,
+        code_provenance=code_provenance,
+        runtime=_actual_runtime_manifest(),
+    )
 
 
 def _scenario_content(scenario: object) -> dict[str, JSONValue]:
@@ -849,7 +905,7 @@ def build_run_specification(
     *,
     executable_paths: tuple[str | Path, ...],
     repository_root: str | Path = Path(__file__).resolve().parent,
-    runtime: Mapping[str, object] | None = None,
+    _publication_context: _PublicationContext | None = None,
 ) -> RunSpecification:
     """Build the exact requested-input identity, independent of output bytes."""
     if not isinstance(policy, EvaluationPolicy):
@@ -857,10 +913,21 @@ def build_run_specification(
     _validate_publication_run_evidence(run)
     scenario = _scenario_content(run.scenario)
     input_hashes = _scenario_input_hashes(scenario)
-    code_provenance = collect_code_provenance(
+    root = Path(repository_root).resolve()
+    context = _publication_context or _capture_publication_context(
         executable_paths,
-        repository_root=repository_root,
+        repository_root=root,
     )
+    if context.repository_root != root:
+        raise ValueError("publication context repository_root does not match")
+    requested_paths = tuple(
+        sorted(_repository_relative_path(path, root) for path in executable_paths)
+    )
+    if requested_paths != context.executable_paths:
+        raise ValueError("publication context executable paths do not match")
+    code_provenance = _to_json_primitives(context.code_provenance)
+    runtime = _to_json_primitives(context.runtime)
+    assert isinstance(code_provenance, dict) and isinstance(runtime, dict)
     controller = _to_json_primitives(
         {
             "name": run.controller_name,
@@ -885,7 +952,7 @@ def build_run_specification(
         "hub_configuration": hub_configuration,
         "evaluation_policy": evaluation_policy,
         "code_provenance": code_provenance,
-        "runtime": _normalized_runtime(runtime),
+        "runtime": runtime,
         "input_hashes": input_hashes,
     }
     identifier = run_specification_identifier(content)
@@ -1061,6 +1128,7 @@ def _diagnostic_row(operating_step: int, diagnostics: object) -> dict[str, objec
 
 def _summary_content(report: EvaluationReport) -> dict[str, JSONValue]:
     return {
+        "schema_version": EVALUATION_REPORT_SCHEMA_VERSION,
         "policy": report.policy.to_serializable_metadata(),
         "nominal": asdict(report.nominal),
         "wear_sensitivities": {
@@ -1071,6 +1139,28 @@ def _summary_content(report: EvaluationReport) -> dict[str, JSONValue]:
     }
 
 
+def _numeric_dataclass_matches(
+    observed: object,
+    expected: object,
+    expected_type: type,
+    *,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> bool:
+    if not isinstance(observed, expected_type) or not isinstance(expected, expected_type):
+        return False
+    for item in fields(expected_type):
+        try:
+            left = float(getattr(observed, item.name))
+            right = float(getattr(expected, item.name))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(left) or not math.isfinite(right):
+            return False
+        if abs(left - right) > tolerance:
+            return False
+    return True
+
+
 def _validation_content(run: object) -> dict[str, JSONValue]:
     steps = []
     for record, diagnostics in zip(
@@ -1078,25 +1168,85 @@ def _validation_content(run: object) -> dict[str, JSONValue]:
         run.controller_diagnostics,
         strict=True,
     ):
+        control_valid = not validate_control(record.control, run.hub_configuration)
+        flows_valid = not validate_flows(record.flows)
+        successor_valid = not validate_successor(
+            record.reached_state,
+            run.hub_configuration,
+            run.controller_name == "mpc",
+        )
+        recomputed = advance_hub(
+            record.start_state,
+            record.control,
+            record.exogenous,
+            run.hub_configuration,
+        )
+        physics_valid = (
+            _numeric_dataclass_matches(
+                record.reached_state,
+                recomputed.successor,
+                HubState,
+            )
+            and _numeric_dataclass_matches(
+                record.flows,
+                recomputed.flows,
+                HubFlows,
+            )
+        )
         steps.append(
             {
                 "operating_step": record.operating_step,
                 "decision_status": diagnostics.decision_status,
                 "solver_success": diagnostics.solver_success,
                 "solver_return_status": diagnostics.solver_return_status,
-                "control_valid": True,
-                "flows_valid": True,
-                "successor_valid": True,
-                "physical_invariants_valid": True,
+                "control_valid": control_valid,
+                "flows_valid": flows_valid,
+                "successor_valid": successor_valid,
+                "physical_invariants_valid": (
+                    control_valid and flows_valid and successor_valid and physics_valid
+                ),
             }
         )
     return {
+        "schema_version": RUN_VALIDATION_SCHEMA_VERSION,
         "complete": True,
         "valid": True,
         "checked_operating_steps": run.validation.checked_operating_steps,
         "issues": [],
         "steps": steps,
     }
+
+
+def _validate_record_sequence(run: object) -> None:
+    expected_initial = initial_state(run.hub_configuration)
+    if not _numeric_dataclass_matches(run.initial_state, expected_initial, HubState):
+        raise ValueError("ValidRun initial state does not match HubConfiguration")
+    expected_start = run.initial_state
+    for operating_step, record in enumerate(run.records):
+        point = run.scenario.points[operating_step]
+        if record.operating_step != operating_step:
+            raise ValueError("Operating Records must be in exact step order")
+        if record.timestamp_utc != point.timestamp_utc:
+            raise ValueError("Operating Record timestamp does not match Scenario")
+        if not _numeric_dataclass_matches(record.start_state, expected_start, HubState):
+            raise ValueError("Operating Record state continuity is invalid")
+        expected_exogenous = ExogenousInputs(
+            pv_kw=point.pv_kw,
+            electric_load_kw=point.electric_load_kw,
+            price_eur_per_kwh=point.price_eur_per_kwh,
+            outdoor_temperature_c=point.outdoor_temperature_c,
+            irradiance_w_per_m2=point.irradiance_w_per_m2,
+        )
+        if not _numeric_dataclass_matches(
+            record.exogenous,
+            expected_exogenous,
+            ExogenousInputs,
+            tolerance=0.0,
+        ):
+            raise ValueError("Operating Record exogenous inputs do not match Scenario")
+        expected_start = record.reached_state
+    if not _numeric_dataclass_matches(run.terminal_state, expected_start, HubState):
+        raise ValueError("ValidRun terminal state breaks record continuity")
 
 
 def serialize_valid_run(
@@ -1114,10 +1264,7 @@ def serialize_valid_run(
     expected_report = evaluate_run(run, report.policy)
     if report != expected_report:
         raise ValueError("EvaluationReport does not match the ValidRun records")
-    if tuple(record.operating_step for record in run.records) != tuple(
-        range(run.scenario.operating_step_count)
-    ):
-        raise ValueError("Operating Records must be in exact step order")
+    _validate_record_sequence(run)
     trajectory_rows = [_trajectory_row(record) for record in run.records]
     diagnostic_rows = [
         _diagnostic_row(index, diagnostics)
@@ -1126,6 +1273,11 @@ def serialize_valid_run(
     summary = _to_json_primitives(_summary_content(report), "summary")
     validation = _to_json_primitives(_validation_content(run), "validation")
     assert isinstance(summary, dict) and isinstance(validation, dict)
+    if any(
+        step["physical_invariants_valid"] is not True
+        for step in validation["steps"]
+    ):
+        raise ValueError("ValidRun records fail derived physical validation")
     return {
         "trajectory.csv": _csv_bytes(TRAJECTORY_COLUMNS, trajectory_rows),
         "controller_diagnostics.csv": _csv_bytes(
@@ -1214,12 +1366,356 @@ def _verify_operating_steps(
             )
 
 
+def _require_exact_keys(
+    value: object,
+    expected: set[str],
+    description: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"Run Bundle {description} schema is incomplete or unknown")
+    return value
+
+
+def _parse_utc_z_text(value: object, field_name: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"Run Bundle {field_name} must be a UTC Z timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"Run Bundle {field_name} timestamp is invalid") from exc
+    if _utc_z(parsed, field_name) != value:
+        raise ValueError(f"Run Bundle {field_name} timestamp is not canonical UTC Z")
+    return parsed
+
+
+def _parse_csv_float(value: object, field_name: str) -> float:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Run Bundle {field_name} must be numeric")
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"Run Bundle {field_name} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"Run Bundle {field_name} must be finite")
+    return parsed
+
+
+def _parse_csv_int(value: object, field_name: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise ValueError(f"Run Bundle {field_name} must be a canonical nonnegative int")
+    return int(value)
+
+
+def _parse_optional_csv_float(value: object, field_name: str) -> float | None:
+    return None if value == "" else _parse_csv_float(value, field_name)
+
+
+def _parse_optional_csv_int(value: object, field_name: str) -> int | None:
+    return None if value == "" else _parse_csv_int(value, field_name)
+
+
+def _parse_optional_csv_bool(value: object, field_name: str) -> bool | None:
+    if value == "":
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"Run Bundle {field_name} must be true, false, or empty")
+
+
+def _parse_optional_csv_timestamp(value: object, field_name: str) -> datetime | None:
+    return None if value == "" else _parse_utc_z_text(value, field_name)
+
+
+def _scenario_from_manifest(value: object) -> Scenario:
+    content = _require_exact_keys(
+        value,
+        {
+            "name",
+            "operating_start_utc",
+            "operating_end_utc",
+            "forecast_end_utc",
+            "forecast_horizon_capacity_steps",
+            "step_duration_seconds",
+            "operating_step_count",
+            "points",
+            "provenance",
+        },
+        "scenario",
+    )
+    points_value = content["points"]
+    provenance_value = content["provenance"]
+    if not isinstance(points_value, list) or not isinstance(provenance_value, list):
+        raise ValueError("Run Bundle scenario points/provenance schema is invalid")
+    points = []
+    for index, item in enumerate(points_value):
+        point = _require_exact_keys(
+            item,
+            {
+                "timestamp_utc",
+                "price_eur_per_kwh",
+                "pv_kw",
+                "electric_load_kw",
+                "outdoor_temperature_c",
+                "irradiance_w_per_m2",
+            },
+            f"scenario.points[{index}]",
+        )
+        points.append(
+            ScenarioPoint(
+                timestamp_utc=_parse_utc_z_text(
+                    point["timestamp_utc"],
+                    f"scenario.points[{index}].timestamp_utc",
+                ),
+                price_eur_per_kwh=point["price_eur_per_kwh"],
+                pv_kw=point["pv_kw"],
+                electric_load_kw=point["electric_load_kw"],
+                outdoor_temperature_c=point["outdoor_temperature_c"],
+                irradiance_w_per_m2=point["irradiance_w_per_m2"],
+            )
+        )
+    provenance = []
+    for index, item in enumerate(provenance_value):
+        source = _require_exact_keys(
+            item,
+            {
+                "source_name",
+                "source_path",
+                "sha256",
+                "acquisition_parameters",
+                "original_timezone",
+                "units",
+                "transformations",
+            },
+            f"scenario.provenance[{index}]",
+        )
+        acquisition = source["acquisition_parameters"]
+        units = source["units"]
+        transformations = source["transformations"]
+        if (
+            not isinstance(acquisition, dict)
+            or not isinstance(units, dict)
+            or not isinstance(transformations, list)
+        ):
+            raise ValueError("Run Bundle scenario provenance schema is invalid")
+        provenance.append(
+            SourceProvenance(
+                source_name=source["source_name"],
+                source_path=source["source_path"],
+                sha256=source["sha256"],
+                acquisition_parameters=acquisition,
+                original_timezone=source["original_timezone"],
+                units=units,
+                transformations=tuple(transformations),
+            )
+        )
+    duration = content["step_duration_seconds"]
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        raise ValueError("Run Bundle scenario step duration must be numeric")
+    scenario = Scenario(
+        name=content["name"],
+        operating_start=_parse_utc_z_text(
+            content["operating_start_utc"], "scenario.operating_start_utc"
+        ),
+        operating_end=_parse_utc_z_text(
+            content["operating_end_utc"], "scenario.operating_end_utc"
+        ),
+        forecast_end=_parse_utc_z_text(
+            content["forecast_end_utc"], "scenario.forecast_end_utc"
+        ),
+        forecast_horizon_capacity_steps=content["forecast_horizon_capacity_steps"],
+        step_duration=timedelta(seconds=float(duration)),
+        operating_step_count=content["operating_step_count"],
+        points=tuple(points),
+        provenance=tuple(provenance),
+    )
+    if _scenario_content(scenario) != content:
+        raise ValueError("Run Bundle scenario is not in its exact canonical schema")
+    return scenario
+
+
+def _hub_configuration_from_manifest(value: object) -> HubConfiguration:
+    content = _require_exact_keys(
+        value,
+        {"battery", "hydrogen", "thermal_store"},
+        "asset_capabilities",
+    )
+    if any(type(content[key]) is not bool for key in content):
+        raise ValueError("Run Bundle Asset capabilities must be exact booleans")
+    return HubConfiguration(capabilities=AssetCapabilities(**content))
+
+
+def _policy_from_manifest(value: object) -> EvaluationPolicy:
+    content = _require_exact_keys(
+        value,
+        {
+            "name",
+            "version",
+            "grid_import_fee_eur_per_kwh",
+            "wear",
+            "sensitivity_multipliers",
+            "settlement_rule",
+            "comfort_valuation",
+        },
+        "evaluation_policy",
+    )
+    wear = _require_exact_keys(
+        content["wear"],
+        {
+            "battery_eur_per_kwh",
+            "thermal_store_eur_per_kwh",
+            "electrolyser_eur_per_kwh",
+            "fuel_cell_eur_per_kwh",
+            "coefficient_status",
+        },
+        "evaluation_policy.wear",
+    )
+    if wear["coefficient_status"] != PROVISIONAL_COEFFICIENT_STATUS:
+        raise ValueError("Run Bundle evaluation coefficient status is unsupported")
+    if content["settlement_rule"] != SETTLEMENT_RULE or content["comfort_valuation"] is not None:
+        raise ValueError("Run Bundle Evaluation Policy semantics are unsupported")
+    multipliers = content["sensitivity_multipliers"]
+    if not isinstance(multipliers, list):
+        raise ValueError("Run Bundle Evaluation Policy sensitivities must be a list")
+    policy = EvaluationPolicy(
+        name=content["name"],
+        version=content["version"],
+        grid_import_fee_eur_per_kwh=content["grid_import_fee_eur_per_kwh"],
+        wear=WearCoefficients(
+            battery_eur_per_kwh=wear["battery_eur_per_kwh"],
+            thermal_store_eur_per_kwh=wear["thermal_store_eur_per_kwh"],
+            electrolyser_eur_per_kwh=wear["electrolyser_eur_per_kwh"],
+            fuel_cell_eur_per_kwh=wear["fuel_cell_eur_per_kwh"],
+        ),
+        sensitivity_multipliers=tuple(multipliers),
+    )
+    if policy.to_serializable_metadata() != content:
+        raise ValueError("Run Bundle Evaluation Policy is not canonical")
+    return policy
+
+
+def _validate_identity_graph(manifest: dict[str, JSONValue]) -> tuple[
+    Scenario,
+    HubConfiguration,
+    EvaluationPolicy,
+    dict[str, object],
+]:
+    scenario = _scenario_from_manifest(manifest["scenario"])
+    controller = _require_exact_keys(
+        manifest["controller"],
+        {"name", "configuration", "capability_policy"},
+        "controller",
+    )
+    if (
+        not isinstance(controller["name"], str)
+        or not controller["name"]
+        or not isinstance(controller["configuration"], dict)
+        or not isinstance(controller["capability_policy"], dict)
+    ):
+        raise ValueError("Run Bundle controller schema is invalid")
+    _to_json_primitives(controller["configuration"], "controller.configuration")
+    _to_json_primitives(controller["capability_policy"], "controller.capability_policy")
+    hub_configuration = _hub_configuration_from_manifest(
+        manifest["asset_capabilities"]
+    )
+    policy = _policy_from_manifest(manifest["evaluation_policy"])
+
+    code = _require_exact_keys(
+        manifest["code_provenance"],
+        {
+            "git_revision",
+            "executable_source_tree_sha256",
+            "executable_path_hashes",
+            "committed_executable_path_hashes",
+            "publication_eligible",
+            "dirty_executable_paths",
+            "untracked_executable_paths",
+        },
+        "code_provenance",
+    )
+    if (
+        code["publication_eligible"] is not True
+        or code["dirty_executable_paths"] != []
+        or code["untracked_executable_paths"] != []
+    ):
+        raise ValueError("Run Bundle executable source is not publication-eligible")
+    revision = code["git_revision"]
+    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValueError("Run Bundle Git revision must be a full object ID")
+    executable_hashes = _require_hash_mapping(
+        code["executable_path_hashes"], "executable_path_hashes"
+    )
+    committed_hashes = _require_hash_mapping(
+        code["committed_executable_path_hashes"],
+        "committed_executable_path_hashes",
+    )
+    if executable_hashes != committed_hashes:
+        raise ValueError("Run Bundle executable bytes differ from committed bytes")
+    for path in executable_hashes:
+        selector = Path(path)
+        if selector.is_absolute() or ".." in selector.parts or selector.as_posix() != path:
+            raise ValueError("Run Bundle executable path selectors must be repository-relative")
+    aggregate = sha256_bytes(canonical_json_bytes(executable_hashes))
+    if code["executable_source_tree_sha256"] != aggregate:
+        raise ValueError("Run Bundle executable source aggregate digest is invalid")
+
+    runtime = _require_exact_keys(
+        manifest["runtime"],
+        {"python", "platform", "do_mpc", "casadi", "numpy", "pandas"},
+        "runtime",
+    )
+    if any(not isinstance(value, str) or not value for value in runtime.values()):
+        raise ValueError("Run Bundle runtime manifest is incomplete")
+    if runtime != _actual_runtime_manifest():
+        raise ValueError("Run Bundle runtime does not match the actual runtime")
+
+    input_hashes = _require_exact_keys(
+        manifest["input_hashes"],
+        {"scenario", "sources", "sidecars"},
+        "input_hashes",
+    )
+    _require_full_sha256(input_hashes["scenario"], "input_hashes.scenario")
+    _require_hash_mapping(input_hashes["sources"], "input_hashes.sources")
+    _require_hash_mapping(input_hashes["sidecars"], "input_hashes.sidecars")
+    expected_inputs = _scenario_input_hashes(_scenario_content(scenario))
+    if input_hashes != expected_inputs:
+        raise ValueError("Run Bundle scenario provenance/input hash graph is invalid")
+
+    specification_content: dict[str, JSONValue] = {
+        "schema_version": RUN_SPECIFICATION_SCHEMA_VERSION,
+        "canonicalization_version": CANONICALIZATION_VERSION,
+        "scenario": manifest["scenario"],
+        "controller": manifest["controller"],
+        "asset_capabilities": manifest["asset_capabilities"],
+        "hub_configuration": {
+            "capabilities": manifest["asset_capabilities"],
+        },
+        "evaluation_policy": manifest["evaluation_policy"],
+        "code_provenance": manifest["code_provenance"],
+        "runtime": manifest["runtime"],
+        "input_hashes": manifest["input_hashes"],
+    }
+    if run_specification_identifier(specification_content) != manifest[
+        "run_specification_identifier"
+    ]:
+        raise ValueError("Run Specification identifier does not match manifest content")
+    return scenario, hub_configuration, policy, controller
+
+
 def _verify_bundle_directory(
     bundle_path: Path,
     expected_identifier: str | None,
     *,
     enforce_path_identifier: bool,
 ) -> RunBundle:
+    from control.rolling_horizon import (
+        DecisionDiagnostics,
+        OperatingRecord,
+        ValidRun,
+        ValidationReport,
+    )
+
     if not bundle_path.is_dir() or bundle_path.is_symlink():
         raise ValueError("Run Bundle path must be a real directory")
     expected_names = {"manifest.json", *RUN_BUNDLE_MEMBERS}
@@ -1293,135 +1789,254 @@ def _verify_bundle_directory(
     computed_identifier = sha256_bytes(canonical_json_bytes(identity_manifest))
     if computed_identifier != bundle_identifier:
         raise ValueError("Run Bundle identifier does not match canonical manifest")
-
-    code_provenance = manifest["code_provenance"]
-    if not isinstance(code_provenance, dict):
-        raise ValueError("Run Bundle code_provenance must be an object")
-    if code_provenance.get("publication_eligible") is not True:
-        raise ValueError("Run Bundle executable source is not publication-eligible")
-    if code_provenance.get("dirty_executable_paths", []) != []:
-        raise ValueError("Run Bundle records dirty executable source")
-    if code_provenance.get("untracked_executable_paths", []) != []:
-        raise ValueError("Run Bundle records untracked executable source")
-    _require_full_sha256(
-        code_provenance.get("executable_source_tree_sha256"),
-        "executable source-tree digest",
+    input_hash_preflight = manifest["input_hashes"]
+    if isinstance(input_hash_preflight, dict):
+        _require_full_sha256(
+            input_hash_preflight.get("scenario"),
+            "input_hashes.scenario",
+        )
+    scenario, hub_configuration, policy, controller = _validate_identity_graph(
+        manifest
     )
-    executable_hashes = _require_hash_mapping(
-        code_provenance.get("executable_path_hashes"),
-        "executable_path_hashes",
-    )
-    committed_hashes = _require_hash_mapping(
-        code_provenance.get("committed_executable_path_hashes"),
-        "committed_executable_path_hashes",
-    )
-    if executable_hashes != committed_hashes:
-        raise ValueError("Run Bundle executable bytes differ from committed bytes")
-    revision = code_provenance.get("git_revision")
-    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-        raise ValueError("Run Bundle Git revision must be a full object ID")
-
-    runtime = manifest["runtime"]
-    if not isinstance(runtime, dict) or set(runtime) != {
-        "python",
-        "platform",
-        "do_mpc",
-        "casadi",
-        "numpy",
-        "pandas",
-    } or any(not isinstance(value, str) or not value for value in runtime.values()):
-        raise ValueError("Run Bundle runtime manifest is incomplete")
-
-    input_hashes = manifest["input_hashes"]
-    if not isinstance(input_hashes, dict) or set(input_hashes) != {
-        "scenario",
-        "sources",
-        "sidecars",
-    }:
-        raise ValueError("Run Bundle input_hashes manifest is incomplete")
-    _require_full_sha256(input_hashes["scenario"], "input_hashes.scenario")
-    _require_hash_mapping(input_hashes["sources"], "input_hashes.sources")
-    _require_hash_mapping(input_hashes["sidecars"], "input_hashes.sidecars")
 
     validation = _read_canonical_json(
         bundle_path / "validation.json",
         "validation",
     )
-    if validation.get("complete") is not True or validation.get("valid") is not True:
+    _require_exact_keys(
+        validation,
+        {
+            "schema_version",
+            "complete",
+            "valid",
+            "checked_operating_steps",
+            "issues",
+            "steps",
+        },
+        "validation",
+    )
+    if (
+        validation["schema_version"] != RUN_VALIDATION_SCHEMA_VERSION
+        or validation["complete"] is not True
+        or validation["valid"] is not True
+        or validation["issues"] != []
+    ):
         raise ValueError("Run Bundle validation evidence must be complete and valid")
-    checked = validation.get("checked_operating_steps")
-    steps = validation.get("steps")
+    checked = validation["checked_operating_steps"]
+    steps = validation["steps"]
     if (
         isinstance(checked, bool)
         or not isinstance(checked, int)
-        or checked <= 0
+        or checked != scenario.operating_step_count
         or not isinstance(steps, list)
         or len(steps) != checked
     ):
         raise ValueError("Run Bundle validation step evidence is incomplete")
-    for expected, step in enumerate(steps):
-        if not isinstance(step, dict) or step.get("operating_step") != expected:
-            raise ValueError("Run Bundle validation Operating Steps are not contiguous")
-        if step.get("physical_invariants_valid") is not True:
-            raise ValueError("Run Bundle physical invariant evidence is incomplete")
 
     trajectory_header, trajectory_rows = _csv_rows(
         bundle_path / "trajectory.csv",
         "trajectory.csv",
     )
-    if not {"operating_step", "timestamp_utc"}.issubset(trajectory_header):
-        raise ValueError("Run Bundle trajectory schema is incomplete")
+    if trajectory_header != list(TRAJECTORY_COLUMNS):
+        raise ValueError("Run Bundle trajectory.csv header/columns schema is not exact")
     _verify_operating_steps(trajectory_rows, checked, "trajectory.csv")
-    for row in trajectory_rows:
-        timestamp = row["timestamp_utc"]
-        if not timestamp.endswith("Z"):
-            raise ValueError("Run Bundle trajectory timestamps must be UTC Z")
-        try:
-            datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
-        except ValueError as exc:
-            raise ValueError("Run Bundle trajectory timestamp is invalid") from exc
-        for key, value in row.items():
-            if key in {"operating_step", "timestamp_utc"}:
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Run Bundle trajectory {key} must be numeric"
-                ) from exc
-            if not math.isfinite(numeric):
-                raise ValueError(f"Run Bundle trajectory {key} must be finite")
 
     diagnostics_header, diagnostic_rows = _csv_rows(
         bundle_path / "controller_diagnostics.csv",
         "controller_diagnostics.csv",
     )
-    required_diagnostics = {
-        "operating_step",
-        "decision_status",
-        "solver_success",
-        "solver_return_status",
-    }
-    if not required_diagnostics.issubset(diagnostics_header):
-        raise ValueError("Run Bundle controller diagnostics schema is incomplete")
+    if diagnostics_header != list(DIAGNOSTIC_COLUMNS):
+        raise ValueError(
+            "Run Bundle controller_diagnostics.csv header/columns schema is not exact"
+        )
     _verify_operating_steps(
         diagnostic_rows,
         checked,
         "controller_diagnostics.csv",
     )
-    controller = manifest["controller"]
-    if not isinstance(controller, dict) or not isinstance(controller.get("name"), str):
-        raise ValueError("Run Bundle controller manifest is invalid")
-    for row in diagnostic_rows:
-        if row["decision_status"] != "success":
-            raise ValueError("Run Bundle contains unsuccessful controller diagnostics")
-        if controller["name"] == "mpc":
-            if row["solver_success"].casefold() != "true":
-                raise ValueError("Run Bundle MPC diagnostics lack solver success")
-            if not row["solver_return_status"]:
-                raise ValueError("Run Bundle MPC diagnostics lack solver return status")
 
-    _read_canonical_json(bundle_path / "summary.json", "summary")
+    records = []
+    diagnostics_values = []
+    for operating_step, (trajectory, diagnostic) in enumerate(
+        zip(trajectory_rows, diagnostic_rows, strict=True)
+    ):
+        timestamp = _parse_utc_z_text(
+            trajectory["timestamp_utc"],
+            f"trajectory[{operating_step}].timestamp_utc",
+        )
+        numeric = {
+            key: _parse_csv_float(
+                trajectory[key],
+                f"trajectory[{operating_step}].{key}",
+            )
+            for key in TRAJECTORY_COLUMNS
+            if key not in {"operating_step", "timestamp_utc"}
+        }
+        record = OperatingRecord(
+            operating_step=operating_step,
+            timestamp_utc=timestamp,
+            start_state=HubState(
+                numeric["start_soc_battery_kwh"],
+                numeric["start_soc_hydrogen_kg"],
+                numeric["start_soc_thermal_kwh"],
+                numeric["start_indoor_temperature_c"],
+            ),
+            control=HubControl(
+                numeric["battery_charge_kw"],
+                numeric["battery_discharge_kw"],
+                numeric["electrolyser_kw"],
+                numeric["fuel_cell_kw"],
+                numeric["heat_pump_kw"],
+                numeric["electric_boiler_kw"],
+                numeric["thermal_charge_kw"],
+                numeric["thermal_discharge_kw"],
+                numeric["ventilation_fraction"],
+            ),
+            exogenous=ExogenousInputs(
+                numeric["pv_kw"],
+                numeric["electric_load_kw"],
+                numeric["price_eur_per_kwh"],
+                numeric["outdoor_temperature_c"],
+                numeric["irradiance_w_per_m2"],
+            ),
+            reached_state=HubState(
+                numeric["reached_soc_battery_kwh"],
+                numeric["reached_soc_hydrogen_kg"],
+                numeric["reached_soc_thermal_kwh"],
+                numeric["reached_indoor_temperature_c"],
+            ),
+            flows=HubFlows(
+                numeric["grid_kw"],
+                numeric["generated_heat_kw"],
+                numeric["heat_to_air_kw"],
+                numeric["thermal_charge_margin_kw"],
+                numeric["hydrogen_production_kg_per_h"],
+                numeric["hydrogen_consumption_kg_per_h"],
+            ),
+        )
+        diagnostics = DecisionDiagnostics(
+            adapter=diagnostic["adapter"],
+            decision_status=diagnostic["decision_status"],
+            solver_success=_parse_optional_csv_bool(
+                diagnostic["solver_success"],
+                f"diagnostics[{operating_step}].solver_success",
+            ),
+            solver_return_status=(
+                diagnostic["solver_return_status"] or None
+            ),
+            solver_iterations=_parse_optional_csv_int(
+                diagnostic["solver_iterations"],
+                f"diagnostics[{operating_step}].solver_iterations",
+            ),
+            solver_wall_seconds=_parse_optional_csv_float(
+                diagnostic["solver_wall_seconds"],
+                f"diagnostics[{operating_step}].solver_wall_seconds",
+            ),
+            forecast_start_utc=_parse_optional_csv_timestamp(
+                diagnostic["forecast_start_utc"],
+                f"diagnostics[{operating_step}].forecast_start_utc",
+            ),
+            forecast_end_utc=_parse_optional_csv_timestamp(
+                diagnostic["forecast_end_utc"],
+                f"diagnostics[{operating_step}].forecast_end_utc",
+            ),
+            terminal_electric_value_eur_per_kwh=_parse_optional_csv_float(
+                diagnostic["terminal_electric_value_eur_per_kwh"],
+                f"diagnostics[{operating_step}].terminal_electric_value",
+            ),
+            terminal_heat_value_eur_per_kwhth=_parse_optional_csv_float(
+                diagnostic["terminal_heat_value_eur_per_kwhth"],
+                f"diagnostics[{operating_step}].terminal_heat_value",
+            ),
+        )
+        if diagnostics.adapter != controller["name"]:
+            raise ValueError("Run Bundle diagnostics adapter/controller mismatch")
+        if diagnostics.decision_status != "success":
+            raise ValueError("Run Bundle contains unsuccessful controller status")
+        solver_fields = (
+            diagnostics.solver_success,
+            diagnostics.solver_return_status,
+            diagnostics.solver_iterations,
+            diagnostics.solver_wall_seconds,
+        )
+        if controller["name"] == "mpc":
+            if (
+                diagnostics.solver_success is not True
+                or not diagnostics.solver_return_status
+                or diagnostics.solver_iterations is None
+                or diagnostics.solver_wall_seconds is None
+            ):
+                raise ValueError("Run Bundle MPC diagnostics lack solver evidence")
+        elif controller["name"] == "baseline" and any(
+            item is not None for item in solver_fields
+        ):
+            raise ValueError("Run Bundle Baseline diagnostics claim solver evidence")
+        if diagnostics.forecast_start_utc != scenario.points[operating_step].timestamp_utc:
+            raise ValueError("Run Bundle diagnostics forecast start is inconsistent")
+        if (
+            diagnostics.forecast_end_utc is None
+            or diagnostics.forecast_end_utc < diagnostics.forecast_start_utc
+            or diagnostics.forecast_end_utc > scenario.forecast_end
+        ):
+            raise ValueError("Run Bundle diagnostics forecast window is inconsistent")
+        records.append(record)
+        diagnostics_values.append(diagnostics)
+
+    initial = records[0].start_state
+    terminal = records[-1].reached_state
+    reconstructed = ValidRun(
+        scenario=scenario,
+        controller_name=controller["name"],
+        controller_configuration=controller["configuration"],
+        capability_policy=controller["capability_policy"],
+        hub_configuration=hub_configuration,
+        initial_state=initial,
+        records=tuple(records),
+        controller_diagnostics=tuple(diagnostics_values),
+        terminal_state=terminal,
+        validation=ValidationReport(True, True, checked, ()),
+    )
+    _validate_publication_run_evidence(reconstructed)
+    _validate_record_sequence(reconstructed)
+    expected_validation = _validation_content(reconstructed)
+    if validation != expected_validation:
+        raise ValueError(
+            "Run Bundle validation/physics/control/flow evidence is not derived "
+            "from records"
+        )
+
+    for expected, (stored_step, diagnostics) in enumerate(
+        zip(steps, diagnostics_values, strict=True)
+    ):
+        exact_step = _require_exact_keys(
+            stored_step,
+            {
+                "operating_step",
+                "decision_status",
+                "solver_success",
+                "solver_return_status",
+                "control_valid",
+                "flows_valid",
+                "successor_valid",
+                "physical_invariants_valid",
+            },
+            f"validation.steps[{expected}]",
+        )
+        if (
+            exact_step["operating_step"] != expected
+            or exact_step["decision_status"] != diagnostics.decision_status
+            or exact_step["solver_success"] is not diagnostics.solver_success
+            or exact_step["solver_return_status"] != diagnostics.solver_return_status
+        ):
+            raise ValueError("Run Bundle validation/controller evidence is inconsistent")
+
+    summary = _read_canonical_json(bundle_path / "summary.json", "summary")
+    expected_summary = _to_json_primitives(
+        _summary_content(evaluate_run(reconstructed, policy)),
+        "summary",
+    )
+    if summary != expected_summary:
+        raise ValueError("Run Bundle summary does not match recomputed EvaluationReport")
     return RunBundle(
         identifier=bundle_identifier,
         specification_identifier=specification_identifier,
@@ -1463,9 +2078,112 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _atomic_noreplace_directory(source: str | Path, destination: str | Path) -> None:
+    """Atomically publish a directory only if no directory entry claims the name."""
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    library_name = ctypes.util.find_library("c")
+    if not library_name:
+        raise RuntimeError("atomic no-replace publication is unavailable: libc not found")
+    libc = ctypes.CDLL(library_name, use_errno=True)
+    system = platform_module.system()
+    if system == "Darwin" and hasattr(libc, "renamex_np"):
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)  # RENAME_EXCL
+    elif system == "Linux" and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 0x1)
+    else:
+        raise RuntimeError(
+            f"atomic no-replace directory rename is unavailable on {system}"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            os.fspath(destination),
+        )
+    if error_number in {errno.ENOSYS, errno.ENOTSUP, errno.EINVAL}:
+        raise RuntimeError(
+            "atomic no-replace directory rename is unavailable on this filesystem"
+        )
+    raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+
+
+def _remove_owned_temporary(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def _assert_fresh_publication_inputs(
+    specification: RunSpecification,
+    repository_root: str | Path | None,
+) -> None:
+    actual_runtime = _actual_runtime_manifest()
+    if _to_json_primitives(specification.runtime) != actual_runtime:
+        raise ValueError("Run Specification runtime does not match the actual runtime")
+    if repository_root is None:
+        return
+    recorded = _to_json_primitives(specification.code_provenance)
+    assert isinstance(recorded, dict)
+    path_hashes = recorded.get("executable_path_hashes")
+    if not isinstance(path_hashes, dict) or not path_hashes:
+        raise ValueError("Run Specification executable path map is incomplete")
+    current = collect_code_provenance(
+        tuple(sorted(path_hashes)),
+        repository_root=repository_root,
+    )
+    if current != recorded or current.get("publication_eligible") is not True:
+        raise ValueError(
+            "Run Specification executable source changed or became dirty after capture"
+        )
+
+
+def _verified_collision_winner(
+    destination: Path,
+    bundle_identifier: str,
+    all_bytes: Mapping[str, bytes],
+) -> RunBundle:
+    if destination.is_symlink() or not destination.is_dir():
+        raise BundleCollisionError(
+            f"Run Bundle destination is claimed by a non-bundle entry: {destination}"
+        )
+    try:
+        existing = verify_run_bundle(destination, bundle_identifier)
+    except (OSError, ValueError) as exc:
+        raise BundleCollisionError(
+            f"existing Run Bundle {bundle_identifier} failed verification"
+        ) from exc
+    if any(
+        (destination / name).read_bytes() != data
+        for name, data in all_bytes.items()
+    ):
+        raise BundleCollisionError(
+            f"Run Bundle identifier collision at {destination}"
+        )
+    return existing
+
+
 def _assert_specification_matches_run(
     run: object,
-    report: EvaluationReport,
+    policy: EvaluationPolicy,
     specification: RunSpecification,
 ) -> None:
     if run_specification_identifier(specification.canonical_content) != specification.identifier:
@@ -1482,7 +2200,7 @@ def _assert_specification_matches_run(
         asdict(run.hub_configuration.capabilities)
     )
     expected_hub = _to_json_primitives(asdict(run.hub_configuration))
-    expected_policy = _to_json_primitives(report.policy.to_serializable_metadata())
+    expected_policy = _to_json_primitives(policy.to_serializable_metadata())
     comparisons = {
         "scenario": expected_scenario,
         "controller": expected_controller,
@@ -1502,6 +2220,8 @@ def create_run_bundle(
     report: EvaluationReport,
     specification: RunSpecification,
     target_root: str | Path,
+    *,
+    repository_root: str | Path | None = None,
 ) -> RunBundle:
     """Persist one verified Valid Run through an owned atomic temporary directory."""
     from control.rolling_horizon import ValidRun
@@ -1517,7 +2237,8 @@ def create_run_bundle(
     provenance = specification.code_provenance
     if provenance.get("publication_eligible") is not True:
         raise ValueError("Run Specification records dirty executable source")
-    _assert_specification_matches_run(run, report, specification)
+    _assert_fresh_publication_inputs(specification, repository_root)
+    _assert_specification_matches_run(run, report.policy, specification)
     members = serialize_valid_run(run, report)
     member_hashes = {
         name: sha256_bytes(data) for name, data in members.items()
@@ -1566,46 +2287,27 @@ def create_run_bundle(
         )
         assert candidate.identifier == bundle_identifier
 
-        if destination.exists():
-            try:
-                existing = verify_run_bundle(destination, bundle_identifier)
-            except (OSError, ValueError) as exc:
-                raise BundleCollisionError(
-                    f"existing Run Bundle {bundle_identifier} failed verification"
-                ) from exc
-            if any(
-                (destination / name).read_bytes() != data
-                for name, data in all_bytes.items()
-            ):
-                raise BundleCollisionError(
-                    f"Run Bundle identifier collision at {destination}"
-                )
-            return existing
+        if os.path.lexists(destination):
+            return _verified_collision_winner(
+                destination,
+                bundle_identifier,
+                all_bytes,
+            )
 
         try:
-            os.replace(temporary, destination)
+            _atomic_noreplace_directory(temporary, destination)
         except OSError as exc:
-            if not destination.exists():
+            if not os.path.lexists(destination):
                 raise
-            try:
-                existing = verify_run_bundle(destination, bundle_identifier)
-            except (OSError, ValueError) as verification_error:
-                raise BundleCollisionError(
-                    f"concurrent Run Bundle {bundle_identifier} is inconsistent"
-                ) from verification_error
-            if any(
-                (destination / name).read_bytes() != data
-                for name, data in all_bytes.items()
-            ):
-                raise BundleCollisionError(
-                    f"concurrent Run Bundle {bundle_identifier} differs"
-                ) from exc
-            return existing
+            return _verified_collision_winner(
+                destination,
+                bundle_identifier,
+                all_bytes,
+            )
         _fsync_directory(root)
         return verify_run_bundle(destination, bundle_identifier)
     finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
+        _remove_owned_temporary(temporary)
 
 
 def load_run_bundle(target_root: str | Path, identifier: str) -> RunBundle:
@@ -1633,6 +2335,8 @@ def write_failure_diagnostics(
     run: InvalidRun,
     specification: RunSpecification,
     diagnostics_root: str | Path,
+    *,
+    policy: EvaluationPolicy,
 ) -> Path:
     """Persist InvalidRun evidence outside the authoritative Run Bundle namespace."""
     from control.rolling_horizon import InvalidRun
@@ -1641,17 +2345,20 @@ def write_failure_diagnostics(
         raise TypeError("write_failure_diagnostics accepts only InvalidRun")
     if not isinstance(specification, RunSpecification):
         raise TypeError("specification must be a RunSpecification")
-    if run_specification_identifier(specification.canonical_content) != specification.identifier:
-        raise ValueError("Run Specification identifier is internally inconsistent")
-    expected_scenario = _scenario_content(run.scenario)
-    if _to_json_primitives(specification.scenario) != expected_scenario:
-        raise ValueError("Run Specification scenario does not match InvalidRun")
+    if not isinstance(policy, EvaluationPolicy):
+        raise TypeError("policy must be an EvaluationPolicy")
+    _assert_specification_matches_run(run, policy, specification)
     root = Path(diagnostics_root)
     specification_root = root / specification.identifier
     specification_root.mkdir(parents=True, exist_ok=True)
-    attempt_timestamp = datetime.now(timezone.utc)
-    attempt = specification_root / attempt_timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
-    attempt.mkdir()
+    while True:
+        attempt_timestamp = datetime.now(timezone.utc)
+        attempt = specification_root / attempt_timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
+        try:
+            attempt.mkdir()
+            break
+        except FileExistsError:
+            continue
     try:
         failure = {
             "schema_version": "run-failure-diagnostics-v1",

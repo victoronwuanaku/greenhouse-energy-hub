@@ -69,6 +69,8 @@ from accounting import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationPolicy,
     RunBundle,
+    _PublicationContext,
+    _capture_publication_context,
     build_run_specification,
     create_run_bundle,
     evaluate_run,
@@ -1214,6 +1216,7 @@ def _persist_outcome(
     results_root: str | Path,
     executable_paths: tuple[str | Path, ...],
     repository_root: str | Path = ROOT,
+    publication_context: _PublicationContext | None = None,
 ) -> RunBundle | Path:
     """Route valid evidence to Runs and failed evidence to diagnostics."""
     specification = build_run_specification(
@@ -1221,6 +1224,7 @@ def _persist_outcome(
         evaluation_policy,
         executable_paths=executable_paths,
         repository_root=repository_root,
+        _publication_context=publication_context,
     )
     root = Path(results_root)
     if isinstance(outcome, ValidRun):
@@ -1230,11 +1234,13 @@ def _persist_outcome(
             report,
             specification,
             root / "runs",
+            repository_root=repository_root,
         )
     return write_failure_diagnostics(
         outcome,
         specification,
         root / "diagnostics",
+        policy=evaluation_policy,
     )
 
 
@@ -1295,12 +1301,6 @@ def main():
         if args.mode not in (mode, "both"):
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
-        outcome = run_simulation(
-            scenario,
-            mode=mode,
-            hub_config=hub_config,
-            evaluation_policy=DEFAULT_EVALUATION_POLICY,
-        )
         executable_paths: tuple[str | Path, ...] = (
             "accounting.py",
             "scenarios.py",
@@ -1309,6 +1309,16 @@ def main():
         )
         if mode == "mpc":
             executable_paths += ("control/mpc_controller.py",)
+        publication_context = _capture_publication_context(
+            executable_paths,
+            repository_root=ROOT,
+        )
+        outcome = run_simulation(
+            scenario,
+            mode=mode,
+            hub_config=hub_config,
+            evaluation_policy=DEFAULT_EVALUATION_POLICY,
+        )
         artifact: RunBundle | Path | None = None
         if isinstance(outcome, (ValidRun, InvalidRun)):
             try:
@@ -1317,6 +1327,7 @@ def main():
                     DEFAULT_EVALUATION_POLICY,
                     results_root=RESULTS_DIR,
                     executable_paths=executable_paths,
+                    publication_context=publication_context,
                 )
             except ValueError as exc:
                 # Compatibility-frame Runs deliberately lack source provenance and

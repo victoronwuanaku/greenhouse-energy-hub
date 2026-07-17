@@ -20,6 +20,7 @@ from accounting import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationReport,
     RunBundle,
+    _capture_publication_context,
     evaluate_run,
     saving_percent,
 )
@@ -96,6 +97,17 @@ def main() -> None:
     scenario = load_data(start_month=args.start_month, n_days=args.days)
 
     print("\nBaseline (limited-capability reference)...")
+    baseline_executable_paths = (
+        "accounting.py",
+        "scenarios.py",
+        "models/hub_model.py",
+        "control/rolling_horizon.py",
+        "experiments/ablations.py",
+    )
+    baseline_publication_context = _capture_publication_context(
+        baseline_executable_paths,
+        repository_root=ROOT,
+    )
     baseline_outcome = run_simulation(
         scenario,
         mode="baseline",
@@ -106,13 +118,8 @@ def main() -> None:
         baseline_outcome,
         EVALUATION_POLICY,
         results_root=ROOT / "results",
-        executable_paths=(
-            "accounting.py",
-            "scenarios.py",
-            "models/hub_model.py",
-            "control/rolling_horizon.py",
-            "experiments/ablations.py",
-        ),
+        executable_paths=baseline_executable_paths,
+        publication_context=baseline_publication_context,
     )
     if not isinstance(baseline_outcome, ValidRun):
         print(
@@ -130,6 +137,18 @@ def main() -> None:
         hub_configuration = variant["hub_configuration"]
         mpc_options = variant["mpc_options"]
         print(f"\nMPC variant: {name} {mpc_options}")
+        mpc_executable_paths = (
+            "accounting.py",
+            "scenarios.py",
+            "models/hub_model.py",
+            "control/rolling_horizon.py",
+            "control/mpc_controller.py",
+            "experiments/ablations.py",
+        )
+        mpc_publication_context = _capture_publication_context(
+            mpc_executable_paths,
+            repository_root=ROOT,
+        )
         outcome = run_simulation(
             scenario,
             mode="mpc",
@@ -141,14 +160,8 @@ def main() -> None:
             outcome,
             EVALUATION_POLICY,
             results_root=ROOT / "results",
-            executable_paths=(
-                "accounting.py",
-                "scenarios.py",
-                "models/hub_model.py",
-                "control/rolling_horizon.py",
-                "control/mpc_controller.py",
-                "experiments/ablations.py",
-            ),
+            executable_paths=mpc_executable_paths,
+            publication_context=mpc_publication_context,
         )
         if not isinstance(outcome, ValidRun):
             print(

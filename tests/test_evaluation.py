@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 import pytest
@@ -138,8 +139,15 @@ def _policy():
 
 
 def _publication_ready_run(**run_options):
-    """Attach source and sidecar provenance to the compact evaluation fixture."""
-    from scenarios import SourceProvenance
+    """Build a compact, provenance-backed Run whose records obey shared physics."""
+    from control.rolling_horizon import OperatingRecord
+    from models.hub_model import (
+        ExogenousInputs,
+        HubControl,
+        advance_hub,
+        initial_state,
+    )
+    from scenarios import ScenarioPoint, SourceProvenance
 
     run = _two_step_valid_run(**run_options)
     provenance = SourceProvenance(
@@ -155,9 +163,52 @@ def _publication_ready_run(**run_options):
         units={"value": "kW"},
         transformations=("test-fixture",),
     )
+    safe_points = tuple(
+        ScenarioPoint(
+            point.timestamp_utc,
+            point.price_eur_per_kwh,
+            point.pv_kw,
+            point.electric_load_kw,
+            19.0,
+            point.irradiance_w_per_m2,
+        )
+        for point in run.scenario.points
+    )
+    scenario = replace(
+        run.scenario,
+        points=safe_points,
+        provenance=(provenance,),
+    )
+    state = initial_state(run.hub_configuration)
+    records = []
+    zero_control = HubControl(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    for operating_step, point in enumerate(scenario.points):
+        exogenous = ExogenousInputs(
+            pv_kw=point.pv_kw,
+            electric_load_kw=point.electric_load_kw,
+            price_eur_per_kwh=point.price_eur_per_kwh,
+            outdoor_temperature_c=point.outdoor_temperature_c,
+            irradiance_w_per_m2=point.irradiance_w_per_m2,
+        )
+        step = advance_hub(state, zero_control, exogenous, run.hub_configuration)
+        records.append(
+            OperatingRecord(
+                operating_step=operating_step,
+                timestamp_utc=point.timestamp_utc,
+                start_state=state,
+                control=zero_control,
+                exogenous=exogenous,
+                reached_state=step.successor,
+                flows=step.flows,
+            )
+        )
+        state = step.successor
     return replace(
         run,
-        scenario=replace(run.scenario, provenance=(provenance,)),
+        scenario=scenario,
+        initial_state=records[0].start_state,
+        records=tuple(records),
+        terminal_state=state,
     )
 
 
@@ -187,6 +238,72 @@ def _committed_executable_repository(tmp_path: Path) -> Path:
         check=True,
     )
     return repository
+
+
+def _rehash_bundle(bundle_path: Path) -> Path:
+    """Rehash an adversarially edited bundle without fixing its semantics."""
+    from accounting import canonical_json_bytes, sha256_bytes
+
+    manifest_path = bundle_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for member in (
+        "trajectory.csv",
+        "controller_diagnostics.csv",
+        "summary.json",
+        "validation.json",
+    ):
+        manifest["member_hashes"][member] = sha256_bytes(
+            (bundle_path / member).read_bytes()
+        )
+    identity_manifest = dict(manifest)
+    identity_manifest.pop("run_bundle_identifier", None)
+    identifier = sha256_bytes(canonical_json_bytes(identity_manifest))
+    manifest["run_bundle_identifier"] = identifier
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    renamed = bundle_path.with_name(
+        bundle_path.name.rsplit("--", 1)[0] + f"--{identifier}"
+    )
+    bundle_path.rename(renamed)
+    return renamed
+
+
+def _rewrite_csv(path: Path, mutate) -> None:
+    rows = list(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8"))))
+    fieldnames = list(rows[0])
+    mutate(fieldnames, rows)
+    target = io.StringIO(newline="")
+    writer = csv.DictWriter(target, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    path.write_text(target.getvalue(), encoding="utf-8", newline="")
+
+
+def _created_test_bundle(tmp_path: Path, *, controller_name: str = "baseline"):
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run(
+        controller_name=controller_name,
+        capability_policy=(
+            BASELINE_CAPABILITY_POLICY
+            if controller_name == "baseline"
+            else {"battery": True, "hydrogen": True, "thermal_store": True}
+        ),
+    )
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    bundle = create_run_bundle(
+        run,
+        report,
+        specification,
+        tmp_path / "results" / "runs",
+    )
+    return repository, run, report, specification, bundle
 
 
 def test_evaluation_stable_interfaces_have_exact_fields():
@@ -638,7 +755,9 @@ def test_run_identity_interfaces_and_canonical_json_are_exact_and_finite():
 
 def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axis(
     tmp_path,
+    monkeypatch,
 ):
+    import accounting
     from accounting import build_run_specification
     from scenarios import ScenarioPoint
 
@@ -690,13 +809,18 @@ def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axi
     )
     changed_runtime = dict(base.runtime)
     changed_runtime["platform"] = f"{changed_runtime['platform']}-changed"
+    monkeypatch.setattr(
+        accounting,
+        "_actual_runtime_manifest",
+        lambda: changed_runtime,
+    )
     runtime_specification = build_run_specification(
         run,
         _policy(),
         executable_paths=("runner.py",),
         repository_root=repository,
-        runtime=changed_runtime,
     )
+    monkeypatch.undo()
     (repository / "runner.py").write_text(
         "def run():\n    return 'dirty-working-bytes'\n",
         encoding="utf-8",
@@ -744,6 +868,23 @@ def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axi
     )
 
 
+def test_run_specification_runtime_is_actual_and_not_publicly_overrideable(tmp_path):
+    import inspect
+
+    from accounting import build_run_specification
+
+    repository = _committed_executable_repository(tmp_path)
+    assert "runtime" not in inspect.signature(build_run_specification).parameters
+    with pytest.raises(TypeError, match="runtime"):
+        build_run_specification(
+            _publication_ready_run(),
+            _policy(),
+            executable_paths=("runner.py",),
+            repository_root=repository,
+            runtime={"python": "forged"},
+        )
+
+
 def test_code_provenance_scopes_dirty_checks_to_explicit_executables(tmp_path):
     from accounting import collect_code_provenance
 
@@ -763,6 +904,27 @@ def test_code_provenance_scopes_dirty_checks_to_explicit_executables(tmp_path):
     assert "REVIEW_RESPONSE.md" not in clean["executable_path_hashes"]
     assert untracked["publication_eligible"] is False
     assert untracked["untracked_executable_paths"] == ["generated.py"]
+
+
+@pytest.mark.parametrize("symlink_component", [False, True])
+def test_code_provenance_rejects_symlinked_executable_selectors(
+    tmp_path,
+    symlink_component,
+):
+    from accounting import collect_code_provenance
+
+    repository = _committed_executable_repository(tmp_path)
+    if symlink_component:
+        (repository / "real").mkdir()
+        shutil.copy2(repository / "runner.py", repository / "real" / "runner.py")
+        (repository / "linked").symlink_to("real", target_is_directory=True)
+        selector = "linked/runner.py"
+    else:
+        (repository / "runner-link.py").symlink_to("runner.py")
+        selector = "runner-link.py"
+
+    with pytest.raises(ValueError, match="symlink"):
+        collect_code_provenance((selector,), repository_root=repository)
 
 
 def test_run_specification_rejects_nonfinite_missing_provenance_and_bad_mpc_evidence(
@@ -879,13 +1041,221 @@ def test_valid_run_serialization_is_fixed_finite_utc_and_one_row_per_step():
     assert all(row["timestamp_utc"].endswith("Z") for row in trajectory_rows)
     summary = json.loads(members["summary.json"])
     validation = json.loads(members["validation.json"])
+    assert set(summary) == {
+        "schema_version",
+        "policy",
+        "nominal",
+        "wear_sensitivities",
+        "step_line_items",
+    }
+    assert summary["schema_version"] == "evaluation-report-v1"
     assert summary["policy"] == report.policy.to_serializable_metadata()
     assert summary["nominal"] == asdict(report.nominal)
     assert len(summary["step_line_items"]) == run.scenario.operating_step_count
+    assert set(validation) == {
+        "schema_version",
+        "complete",
+        "valid",
+        "checked_operating_steps",
+        "issues",
+        "steps",
+    }
+    assert validation["schema_version"] == "run-validation-v1"
     assert validation["complete"] is validation["valid"] is True
     assert validation["checked_operating_steps"] == run.scenario.operating_step_count
     assert len(validation["steps"]) == run.scenario.operating_step_count
     assert all(step["physical_invariants_valid"] for step in validation["steps"])
+
+
+@pytest.mark.parametrize("member", ["trajectory.csv", "controller_diagnostics.csv"])
+def test_bundle_verification_requires_exact_ordered_csv_headers(tmp_path, member):
+    from accounting import verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+
+    def truncate(fieldnames, rows):
+        removed = fieldnames.pop()
+        for row in rows:
+            row.pop(removed)
+
+    _rewrite_csv(bundle.path / member, truncate)
+    mutated = _rehash_bundle(bundle.path)
+    with pytest.raises(ValueError, match="schema|header|columns"):
+        verify_run_bundle(mutated)
+
+
+@pytest.mark.parametrize(
+    ("member", "mutation"),
+    [
+        (
+            "summary.json",
+            lambda value: value.update({"nominal": {"operating_cost_eur": 0.0}}),
+        ),
+        (
+            "validation.json",
+            lambda value: value["steps"][0].update({"control_valid": False}),
+        ),
+        (
+            "validation.json",
+            lambda value: value["steps"][0].update({"flows_valid": "true"}),
+        ),
+    ],
+)
+def test_bundle_verification_rejects_internally_rehashed_semantic_json_mutations(
+    tmp_path,
+    member,
+    mutation,
+):
+    from accounting import canonical_json_bytes, verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    path = bundle.path / member
+    content = json.loads(path.read_text(encoding="utf-8"))
+    mutation(content)
+    path.write_bytes(canonical_json_bytes(content))
+    mutated = _rehash_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="summary|validation|evidence|schema"):
+        verify_run_bundle(mutated)
+
+
+@pytest.mark.parametrize(
+    ("controller_name", "column", "value"),
+    [
+        ("baseline", "adapter", "mpc"),
+        ("baseline", "solver_success", "true"),
+        ("baseline", "solver_return_status", "Solve_Succeeded"),
+        ("mpc", "solver_success", "false"),
+        ("mpc", "decision_status", "failure"),
+    ],
+)
+def test_bundle_verification_binds_controller_and_solver_semantics(
+    tmp_path,
+    controller_name,
+    column,
+    value,
+):
+    from accounting import verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(
+        tmp_path,
+        controller_name=controller_name,
+    )
+
+    def contradict(_fieldnames, rows):
+        rows[0][column] = value
+
+    _rewrite_csv(bundle.path / "controller_diagnostics.csv", contradict)
+    mutated = _rehash_bundle(bundle.path)
+    with pytest.raises(ValueError, match="controller|diagnostic|solver|status|adapter"):
+        verify_run_bundle(mutated)
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "battery_charge_kw",
+        "grid_kw",
+        "reached_soc_battery_kwh",
+        "start_indoor_temperature_c",
+        "pv_kw",
+    ],
+)
+def test_bundle_verification_recomputes_physics_and_record_continuity(
+    tmp_path,
+    column,
+):
+    from accounting import verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+
+    def change_physics(_fieldnames, rows):
+        rows[0][column] = str(float(rows[0][column]) + 1.0)
+
+    _rewrite_csv(bundle.path / "trajectory.csv", change_physics)
+    mutated = _rehash_bundle(bundle.path)
+    with pytest.raises(ValueError, match="physics|flow|state|control|Scenario|continuity"):
+        verify_run_bundle(mutated)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda manifest: manifest.update(
+            {"run_specification_identifier": "f" * 64}
+        ),
+        lambda manifest: manifest["input_hashes"].update(
+            {"scenario": "f" * 64}
+        ),
+        lambda manifest: manifest["scenario"]["provenance"][0].update(
+            {"sha256": "f" * 64}
+        ),
+        lambda manifest: manifest["input_hashes"]["sources"].update(
+            {"data/test-source.csv": "f" * 64}
+        ),
+        lambda manifest: manifest["code_provenance"].update(
+            {"executable_source_tree_sha256": "f" * 64}
+        ),
+    ],
+)
+def test_bundle_verification_reconstructs_the_complete_specification_identity_graph(
+    tmp_path,
+    mutation,
+):
+    from accounting import canonical_json_bytes, verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutation(manifest)
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    mutated = _rehash_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="Specification|scenario|provenance|source|digest|input"):
+        verify_run_bundle(mutated)
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "scenario",
+        "controller",
+        "asset_capabilities",
+        "evaluation_policy",
+        "code_provenance",
+        "runtime",
+        "input_hashes",
+    ],
+)
+def test_bundle_verification_rejects_unknown_nested_identity_fields(
+    tmp_path,
+    section,
+):
+    from accounting import canonical_json_bytes, verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[section]["unknown_field"] = "forged"
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    mutated = _rehash_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="schema|unknown|incomplete|Specification"):
+        verify_run_bundle(mutated)
+
+
+def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_path):
+    from accounting import canonical_json_bytes, verify_run_bundle
+
+    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["runtime"]["python"] = "forged-runtime"
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    mutated = _rehash_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="runtime"):
+        verify_run_bundle(mutated)
 
 
 def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, monkeypatch):
@@ -929,6 +1299,226 @@ def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, mon
     (first.path / "summary.json").write_bytes(b"{}")
     with pytest.raises(BundleCollisionError):
         create_run_bundle(run, report, specification, runs_root)
+
+
+@pytest.mark.parametrize("claimant_kind", ["empty-directory", "file", "broken-symlink"])
+def test_atomic_publication_never_clobbers_a_racing_claimant(
+    tmp_path,
+    monkeypatch,
+    claimant_kind,
+):
+    import accounting
+    from accounting import (
+        BundleCollisionError,
+        build_run_specification,
+        create_run_bundle,
+        evaluate_run,
+    )
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run(capability_policy=BASELINE_CAPABILITY_POLICY)
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    runs_root = tmp_path / "results" / "runs"
+    real_publish = getattr(accounting, "_atomic_noreplace_directory", os.replace)
+    claimant: dict[str, object] = {}
+
+    def racing_publish(source, destination):
+        destination = Path(destination)
+        if claimant_kind == "empty-directory":
+            destination.mkdir()
+        elif claimant_kind == "file":
+            destination.write_bytes(b"other owner's exact bytes")
+        else:
+            destination.symlink_to("missing-other-owner")
+        claimant["path"] = destination
+        claimant["inode"] = destination.lstat().st_ino
+        claimant["bytes"] = (
+            destination.read_bytes() if claimant_kind == "file" else None
+        )
+        claimant["target"] = (
+            os.readlink(destination) if claimant_kind == "broken-symlink" else None
+        )
+        return real_publish(source, destination)
+
+    monkeypatch.setattr(
+        accounting,
+        "_atomic_noreplace_directory",
+        racing_publish,
+        raising=False,
+    )
+    monkeypatch.setattr(accounting.os, "replace", racing_publish)
+    with pytest.raises(BundleCollisionError):
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            runs_root,
+            repository_root=repository,
+        )
+
+    destination = claimant["path"]
+    assert isinstance(destination, Path)
+    assert destination.lstat().st_ino == claimant["inode"]
+    if claimant_kind == "empty-directory":
+        assert destination.is_dir() and not any(destination.iterdir())
+    elif claimant_kind == "file":
+        assert destination.read_bytes() == claimant["bytes"]
+    else:
+        assert destination.is_symlink()
+        assert os.readlink(destination) == claimant["target"]
+
+
+@pytest.mark.parametrize("winner_matches", [True, False])
+def test_atomic_publication_verifies_a_cooperative_racing_winner(
+    tmp_path,
+    monkeypatch,
+    winner_matches,
+):
+    import accounting
+    from accounting import (
+        BundleCollisionError,
+        build_run_specification,
+        create_run_bundle,
+        evaluate_run,
+    )
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run(capability_policy=BASELINE_CAPABILITY_POLICY)
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    runs_root = tmp_path / "results" / "runs"
+    real_publish = getattr(accounting, "_atomic_noreplace_directory", os.replace)
+    winner_inode = []
+
+    def racing_publish(source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        shutil.copytree(source, destination)
+        if not winner_matches:
+            (destination / "summary.json").write_bytes(b"{}")
+        winner_inode.append(destination.stat().st_ino)
+        return real_publish(source, destination)
+
+    monkeypatch.setattr(
+        accounting,
+        "_atomic_noreplace_directory",
+        racing_publish,
+        raising=False,
+    )
+    monkeypatch.setattr(accounting.os, "replace", racing_publish)
+    if winner_matches:
+        bundle = create_run_bundle(
+            run,
+            report,
+            specification,
+            runs_root,
+            repository_root=repository,
+        )
+        assert bundle.path.stat().st_ino == winner_inode[0]
+    else:
+        with pytest.raises(BundleCollisionError):
+            create_run_bundle(
+                run,
+                report,
+                specification,
+                runs_root,
+                repository_root=repository,
+            )
+
+
+def test_publication_revalidates_code_bytes_after_specification_capture(tmp_path):
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run()
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    (repository / "runner.py").write_text(
+        "def run():\n    return 'dirtied-after-capture'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="dirty|changed|executable"):
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            tmp_path / "results" / "runs",
+            repository_root=repository,
+        )
+
+
+def test_publication_revalidates_actual_runtime_after_specification_capture(
+    tmp_path,
+    monkeypatch,
+):
+    import accounting
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run()
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    forged = dict(specification.runtime)
+    forged["python"] = "runtime-changed-after-capture"
+    monkeypatch.setattr(accounting, "_actual_runtime_manifest", lambda: forged)
+
+    with pytest.raises(ValueError, match="runtime"):
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            tmp_path / "results" / "runs",
+            repository_root=repository,
+        )
+
+
+def test_entrypoints_capture_complete_publication_context_before_execution():
+    import inspect
+
+    from control import rolling_horizon
+    from experiments import ablations
+
+    rolling_source = inspect.getsource(rolling_horizon.main)
+    ablation_source = inspect.getsource(ablations.main)
+    marker = "_capture_publication_context"
+    assert marker in rolling_source
+    assert marker in ablation_source
+    assert rolling_source.index(marker) < rolling_source.index("run_simulation(")
+    assert ablation_source.index(marker) < ablation_source.index("run_simulation(")
+    for dependency in (
+        "accounting.py",
+        "scenarios.py",
+        "models/hub_model.py",
+        "control/rolling_horizon.py",
+    ):
+        assert dependency in rolling_source
+        assert dependency in ablation_source
+    assert "control/mpc_controller.py" in rolling_source
+    assert "control/mpc_controller.py" in ablation_source
+    assert "experiments/ablations.py" in ablation_source
 
 
 def test_one_specification_retains_divergent_valid_outputs(tmp_path):
@@ -982,9 +1572,21 @@ def test_interrupted_bundle_write_removes_only_its_owned_temporary_directory(
     def interrupt_replace(_source, _destination):
         raise KeyboardInterrupt("simulated interruption")
 
+    monkeypatch.setattr(
+        accounting,
+        "_atomic_noreplace_directory",
+        interrupt_replace,
+        raising=False,
+    )
     monkeypatch.setattr(accounting.os, "replace", interrupt_replace)
     with pytest.raises(KeyboardInterrupt):
-        create_run_bundle(run, report, specification, runs_root)
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            runs_root,
+            repository_root=repository,
+        )
 
     assert unrelated.is_dir()
     assert sorted(path.name for path in runs_root.glob(".tmp-*")) == [
@@ -1023,15 +1625,117 @@ def test_invalid_run_writes_separate_non_bundle_diagnostics(tmp_path):
     )
     diagnostics_root = tmp_path / "results" / "diagnostics"
 
-    path = write_failure_diagnostics(invalid, specification, diagnostics_root)
+    path = write_failure_diagnostics(
+        invalid,
+        specification,
+        diagnostics_root,
+        policy=_policy(),
+    )
+    second_path = write_failure_diagnostics(
+        invalid,
+        specification,
+        diagnostics_root,
+        policy=_policy(),
+    )
 
     assert path.parent.name == specification.identifier
     assert path.is_relative_to(diagnostics_root)
+    assert second_path.parent == path.parent
+    assert second_path != path
     assert (path / "failure.json").is_file()
     assert (path / "controller_diagnostics.csv").is_file()
     assert not (path / "manifest.json").exists()
     with pytest.raises(ValueError, match="Run Bundle|manifest"):
         verify_run_bundle(path)
+
+
+@pytest.mark.parametrize(
+    "identity_axis",
+    [
+        "controller_name",
+        "controller_configuration",
+        "capability_policy",
+        "hub_configuration",
+        "evaluation_policy",
+        "input_hashes",
+    ],
+)
+def test_failure_diagnostics_binds_every_specification_identity_axis(
+    tmp_path,
+    identity_axis,
+):
+    from accounting import (
+        RunSpecification,
+        build_run_specification,
+        run_specification_identifier,
+        write_failure_diagnostics,
+    )
+    from control.rolling_horizon import InvalidRun
+    from models.hub_model import AssetCapabilities, HubConfiguration
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    valid = _publication_ready_run()
+    invalid = InvalidRun(
+        scenario=valid.scenario,
+        controller_name=valid.controller_name,
+        controller_configuration=valid.controller_configuration,
+        capability_policy=valid.capability_policy,
+        hub_configuration=valid.hub_configuration,
+        failed_step=0,
+        failure_code="forced_failure",
+        message="diagnostic evidence only",
+        partial_records=(),
+        controller_diagnostics=(),
+    )
+    policy = _policy()
+    mutated = invalid
+    specification_policy = policy
+    if identity_axis == "controller_name":
+        mutated = replace(invalid, controller_name="mpc")
+    elif identity_axis == "controller_configuration":
+        mutated = replace(invalid, controller_configuration={"horizon_steps": 9})
+    elif identity_axis == "capability_policy":
+        mutated = replace(invalid, capability_policy={"hydrogen_dispatch": False})
+    elif identity_axis == "hub_configuration":
+        mutated = replace(
+            invalid,
+            hub_configuration=HubConfiguration(
+                capabilities=AssetCapabilities(hydrogen=False)
+            ),
+        )
+    elif identity_axis == "evaluation_policy":
+        specification_policy = replace(
+            policy,
+            grid_import_fee_eur_per_kwh=0.123,
+        )
+
+    specification = build_run_specification(
+        mutated,
+        specification_policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    if identity_axis == "input_hashes":
+        content = json.loads(
+            json.dumps(
+                specification.canonical_content,
+                default=lambda value: dict(value),
+            )
+        )
+        content["input_hashes"]["scenario"] = "f" * 64
+        specification = RunSpecification(
+            identifier=run_specification_identifier(content),
+            canonical_content=content,
+            publication_eligible=specification.publication_eligible,
+        )
+
+    with pytest.raises(ValueError, match="Specification|controller|capabil|Hub|policy|input"):
+        write_failure_diagnostics(
+            invalid,
+            specification,
+            tmp_path / "results" / "diagnostics",
+            policy=policy,
+        )
 
 
 def test_legacy_entry_point_persists_valid_bundles_and_invalid_diagnostics(tmp_path):
