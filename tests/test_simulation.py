@@ -55,18 +55,45 @@ def _zero_control():
     )
 
 
-@pytest.mark.xfail(strict=True, reason="PF-01: one-step terminal state is unconstrained")
+def _forecast_points(
+    prices,
+    *,
+    temperatures=None,
+    start="2023-01-02 00:00:00+00:00",
+):
+    from control.rolling_horizon import _LegacyScenarioPoint
+
+    prices = tuple(float(price) for price in prices)
+    if temperatures is None:
+        temperatures = (5.0,) * len(prices)
+    timestamps = pd.date_range(start, periods=len(prices), freq="h", tz="UTC")
+    return tuple(
+        _LegacyScenarioPoint(
+            timestamp_utc=timestamp.to_pydatetime(),
+            price_eur_per_kwh=price,
+            pv_kw=0.0,
+            electric_load_kw=400.0,
+            outdoor_temperature_c=float(temperature),
+            irradiance_w_per_m2=0.0,
+        )
+        for timestamp, price, temperature in zip(
+            timestamps, prices, temperatures, strict=True
+        )
+    )
+
+
 def test_one_step_mpc_keeps_every_reached_state_valid():
-    from control.rolling_horizon import load_data, run_simulation
+    from control.rolling_horizon import ValidRun, load_data, run_simulation
     from models.hub_model import state_bounds
 
     outcome = run_simulation(
-        load_data(start_month=1, n_days=2),
+        load_data(start_month=1, n_days=2, forecast_hours=1),
         mode="mpc",
         n_horizon=1,
     )
+    assert isinstance(outcome, ValidRun)
     bounds = state_bounds()
-    frame = outcome if isinstance(outcome, pd.DataFrame) else outcome.to_frame()
+    frame = outcome.to_frame()
     for state, column in {
         "SOC_bat": "SOC_bat_kWh",
         "SOC_h2": "SOC_h2_kg",
@@ -106,7 +133,11 @@ def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch,
     import models.hub_model as hub_model
 
     failed_mpc = _FailedMpc()
-    monkeypatch.setattr(mpc_controller, "build_mpc", lambda **_kwargs: (failed_mpc, object()))
+    monkeypatch.setattr(
+        mpc_controller,
+        "build_mpc",
+        lambda *_args, **_kwargs: (failed_mpc, object()),
+    )
 
     real_hub_dynamics = hub_model.hub_dynamics
     plant_calls = 0
@@ -541,6 +572,206 @@ def test_mpc_adapter_configuration_mappings_are_read_only_copies():
         adapter.capability_policy["battery"] = False
 
 
+class _ForecastAwareMpc:
+    def __init__(self):
+        self.x0 = None
+        self.solver_stats = {
+            "success": True,
+            "return_status": "Solve_Succeeded",
+            "iter_count": 2,
+            "t_wall_total": 0.01,
+        }
+        self.make_step_calls = []
+        self.forecast_activations = []
+        self.forecast_clears = 0
+
+        owner = self
+
+        class _ForecastSource:
+            def activate(
+                self,
+                forecast,
+                terminal_electric_value,
+                terminal_heat_value,
+            ):
+                owner.forecast_activations.append(
+                    (
+                        tuple(forecast),
+                        terminal_electric_value,
+                        terminal_heat_value,
+                    )
+                )
+
+            def clear(self):
+                owner.forecast_clears += 1
+
+        self._forecast_source = _ForecastSource()
+
+    def make_step(self, x0):
+        self.make_step_calls.append(np.asarray(x0).copy())
+        return np.zeros((len(INPUT_NAMES), 1))
+
+
+def _mpc_adapter(mpc, horizon_steps):
+    from control.mpc_controller import MpcControllerAdapter
+
+    return MpcControllerAdapter(
+        mpc=mpc,
+        forecast_horizon_steps=horizon_steps,
+        configuration={"horizon_steps": horizon_steps},
+        capability_policy={"battery": True},
+    )
+
+
+def test_mpc_rejects_wrong_length_forecast_before_solver():
+    from control.rolling_horizon import ControllerFailure
+    from models.hub_model import initial_state
+
+    mpc = _ForecastAwareMpc()
+    adapter = _mpc_adapter(mpc, horizon_steps=2)
+
+    decision = adapter.decide(initial_state(), _forecast_points([0.1, 0.2]))
+
+    assert isinstance(decision, ControllerFailure)
+    assert decision.code == "forecast_coverage"
+    assert decision.diagnostics.decision_status == "failure"
+    assert decision.diagnostics.solver_success is None
+    assert decision.diagnostics.solver_return_status is None
+    assert mpc.make_step_calls == []
+    assert mpc.forecast_activations == []
+
+
+def test_terminal_coefficients_use_only_controlled_stage_points():
+    from control.rolling_horizon import ControlDecision
+    from models.hub_model import HP_COP, initial_state
+
+    mpc = _ForecastAwareMpc()
+    adapter = _mpc_adapter(mpc, horizon_steps=2)
+    forecast = _forecast_points(
+        [0.10, 0.30, 9.90],
+        temperatures=[5.0, 25.0, -20.0],
+    )
+
+    decision = adapter.decide(initial_state(), forecast)
+
+    assert isinstance(decision, ControlDecision)
+    assert decision.diagnostics.terminal_electric_value_eur_per_kwh == pytest.approx(
+        0.20
+    )
+    assert decision.diagnostics.terminal_heat_value_eur_per_kwhth == pytest.approx(
+        0.10 / HP_COP
+    )
+    assert len(mpc.forecast_activations) == 1
+    active_forecast, electric_value, heat_value = mpc.forecast_activations[0]
+    assert active_forecast == forecast
+    assert electric_value == pytest.approx(0.20)
+    assert heat_value == pytest.approx(0.10 / HP_COP)
+    assert mpc.forecast_clears == 1
+
+
+def test_mpc_enables_operational_terminal_bounds():
+    from control.mpc_controller import MpcConfiguration, build_mpc
+    from models.hub_model import (
+        HubConfiguration,
+        STATE_MODEL_NAMES,
+        operational_state_bounds,
+    )
+
+    hub_config = HubConfiguration()
+    mpc, _ = build_mpc(hub_config, MpcConfiguration(horizon_steps=2))
+
+    assert mpc.settings.use_terminal_bounds is True
+    for field_name, (lower, upper) in operational_state_bounds(hub_config).items():
+        model_name = STATE_MODEL_NAMES[field_name]
+        assert float(mpc.terminal_bounds["lower", model_name]) == pytest.approx(lower)
+        assert float(mpc.terminal_bounds["upper", model_name]) == pytest.approx(upper)
+
+
+def test_load_data_separates_operating_window_and_rejects_missing_coverage():
+    from control.rolling_horizon import (
+        CoveredFrame,
+        ForecastCoverageError,
+        load_data,
+    )
+
+    covered = load_data(start_month=1, n_days=1, forecast_hours=3)
+
+    assert isinstance(covered, CoveredFrame)
+    assert covered.operating_step_count == 24
+    assert len(covered.frame) == 27
+    assert covered.frame.index[-1] == covered.frame.index[23] + pd.Timedelta(hours=3)
+
+    with pytest.raises(ForecastCoverageError):
+        load_data(start_month=12, n_days=30, forecast_hours=49)
+
+
+def test_covered_frame_iterates_only_operating_window(monkeypatch, hourly_frame):
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControlDecision, CoveredFrame, ValidRun
+    from models.hub_model import HubFlows, HubStep
+
+    observed_forecasts = []
+
+    def decide(_self, _state, forecast):
+        observed_forecasts.append(tuple(point.timestamp_utc for point in forecast))
+        return ControlDecision(
+            control=_zero_control(), diagnostics=_test_diagnostics(forecast)
+        )
+
+    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(
+        rolling_horizon,
+        "advance_hub",
+        lambda state, *_args: HubStep(
+            successor=state,
+            flows=HubFlows(
+                grid_kw=0.0,
+                generated_heat_kw=0.0,
+                heat_to_air_kw=0.0,
+                thermal_charge_margin_kw=0.0,
+                hydrogen_production_kg_per_h=0.0,
+                hydrogen_consumption_kg_per_h=0.0,
+            ),
+        ),
+    )
+    covered = CoveredFrame(frame=hourly_frame.iloc[:4], operating_step_count=2)
+
+    outcome = rolling_horizon.run_simulation(covered, mode="baseline")
+
+    assert isinstance(outcome, ValidRun)
+    assert len(outcome.records) == 2
+    assert [window[0] for window in observed_forecasts] == [
+        timestamp.to_pydatetime() for timestamp in hourly_frame.index[:2]
+    ]
+
+
+def test_missing_final_forecast_coverage_fails_without_clamping(hourly_frame):
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import InvalidRun
+    from models.hub_model import HubConfiguration
+
+    # Two operating steps with a two-stage controller require four points in total;
+    # three points deliberately leave the final N+1 view one point short.
+    scenario = rolling_horizon._legacy_scenario_from_frame(
+        hourly_frame.iloc[:3],
+        forecast_horizon_steps=2,
+        operating_step_count=2,
+    )
+    mpc = _ForecastAwareMpc()
+    adapter = _mpc_adapter(mpc, horizon_steps=2)
+
+    outcome = rolling_horizon.simulate_run(
+        scenario, adapter, HubConfiguration()
+    )
+
+    assert isinstance(outcome, InvalidRun)
+    assert outcome.failure_code == "forecast_coverage"
+    assert outcome.failed_step == 1
+    assert len(outcome.partial_records) == 1
+    assert len(mpc.make_step_calls) == 1
+    assert [len(activation[0]) for activation in mpc.forecast_activations] == [3]
+
+
 def test_cli_does_not_serialize_invalid_run(monkeypatch, tmp_path, hourly_frame):
     import control.rolling_horizon as rolling_horizon
     from control.rolling_horizon import ControllerFailure, DecisionDiagnostics
@@ -607,30 +838,53 @@ def test_disabled_asset_is_inert_zero_capacity(capability, state_field, control_
 
 
 def _first_mpc_control(prices: np.ndarray) -> np.ndarray:
-    from control.mpc_controller import build_mpc
-    from models.hub_model import initial_state
+    from datetime import timedelta
 
-    n = len(prices)
-    controller, _ = build_mpc(
-        price_forecast=prices,
-        pv_forecast=np.zeros(n),
-        load_elec_forecast=np.full(n, 400.0),
-        temp_out_forecast=np.full(n, 5.0),
-        irr_forecast=np.zeros(n),
-        n_horizon=24,
+    from control.mpc_controller import (
+        MpcConfiguration,
+        MpcControllerAdapter,
+        build_mpc,
     )
+    from control.rolling_horizon import ControlDecision, _LegacyScenario
+    from models.hub_model import HubConfiguration, initial_state
+
+    points = _forecast_points(prices)
+    step_duration = timedelta(hours=1)
+    scenario = _LegacyScenario(
+        name="causal_test",
+        operating_start=points[0].timestamp_utc,
+        operating_end=points[0].timestamp_utc + step_duration,
+        forecast_end=points[-1].timestamp_utc,
+        forecast_horizon_capacity_steps=24,
+        step_duration=step_duration,
+        operating_step_count=1,
+        points=points,
+    )
+    hub_config = HubConfiguration()
+    mpc, _ = build_mpc(hub_config, MpcConfiguration(horizon_steps=24))
     initial = initial_state()
-    x0 = np.array(
-        [[initial["SOC_bat"]], [initial["SOC_h2"]], [initial["SOC_tes"]], [initial["T_in"]]]
+    mpc.x0 = np.array(
+        [
+            [initial["SOC_bat"]],
+            [initial["SOC_h2"]],
+            [initial["SOC_tes"]],
+            [initial["T_in"]],
+        ]
     )
-    controller.x0 = x0
-    controller.set_initial_guess()
-    controller.make_step(x0)
-    assert controller.solver_stats["success"] is True
-    return np.array([float(np.squeeze(controller.u0[name])) for name in INPUT_NAMES])
+    mpc.set_initial_guess()
+    adapter = MpcControllerAdapter(
+        mpc=mpc,
+        forecast_horizon_steps=24,
+        configuration={"horizon_steps": 24},
+        capability_policy={"battery": True},
+    )
+
+    decision = adapter.decide(initial, scenario.forecast_view(0, 24))
+
+    assert isinstance(decision, ControlDecision)
+    return np.array([float(decision.control[name]) for name in INPUT_NAMES])
 
 
-@pytest.mark.xfail(strict=True, reason="PF-03: terminal value reads beyond the forecast horizon")
 def test_first_control_is_independent_of_out_of_horizon_prices():
     shared_horizon = np.full(25, 0.10)
     low_tail = np.concatenate([shared_horizon, np.full(24, -1.0)])

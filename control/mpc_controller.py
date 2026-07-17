@@ -62,7 +62,7 @@ from control.rolling_horizon import (
     JSONValue,
 )
 from models.hub_model import (
-    HubState, hub_control_from_array, hub_state_array,
+    HubConfiguration, HubState, hub_control_from_array, hub_state_array,
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
     ETA_ELZ, E_H2_LHV_KWH_KG,
     FC_P_MAX_KW, ETA_FC_E, ETA_FC_H,
@@ -71,7 +71,9 @@ from models.hub_model import (
     GRID_P_MAX_KW, GRID_IMPORT_FEE_EUR_KWH,
     C_AIR_KWH_K, U_EFF_KW_K, K_VENT_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
     Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, T_SETPOINT_C,
-    state_bounds, input_bounds, BALANCE_STATE_TOLERANCE, STATE_SCALE, INPUT_SCALE,
+    STATE_MODEL_NAMES, CONTROL_MODEL_NAMES,
+    operational_state_bounds, control_bounds,
+    BALANCE_STATE_TOLERANCE, STATE_SCALE, INPUT_SCALE,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,17 +95,77 @@ W_RTERM     = 1e-4      # input-move smoothing (rterm)
 
 @dataclass(frozen=True)
 class MpcConfiguration:
-    horizon_steps: int = 24
-    terminal_weight: float = 1.0
-    battery_wear_eur_per_kwh: float = 0.005
-    thermal_store_wear_eur_per_kwh: float = 0.0005
-    electrolyser_wear_eur_per_kwh: float = 0.002
-    fuel_cell_wear_eur_per_kwh: float = 0.002
-    complementarity_weight: float = 0.001
-    comfort_slack_weight: float = 10.0
-    input_move_weight: float = 0.0001
+    horizon_steps: int = N_HORIZON
+    terminal_weight: float = W_TERMINAL
+    battery_wear_eur_per_kwh: float = W_BAT_THRU
+    thermal_store_wear_eur_per_kwh: float = W_TES_THRU
+    electrolyser_wear_eur_per_kwh: float = W_ELZ_WEAR
+    fuel_cell_wear_eur_per_kwh: float = W_FC_WEAR
+    complementarity_weight: float = W_COMPL
+    comfort_slack_weight: float = W_TBAND
+    input_move_weight: float = W_RTERM
     solver_max_iterations: int = 800
     solver_tolerance: float = 1e-6
+
+
+@dataclass(frozen=True)
+class _NeutralForecastPoint:
+    price_eur_per_kwh: float = 0.0
+    pv_kw: float = 0.0
+    electric_load_kw: float = 0.0
+    outdoor_temperature_c: float = T_SETPOINT_C
+    irradiance_w_per_m2: float = 0.0
+
+
+class _ForecastTVPSource:
+    """Expose only the active N+1 immutable forecast view to do-mpc."""
+
+    def __init__(self, tvp_template: object, horizon_steps: int) -> None:
+        self._tvp_template = tvp_template
+        self._horizon_steps = horizon_steps
+        self._neutral_forecast = tuple(
+            _NeutralForecastPoint() for _ in range(horizon_steps + 1)
+        )
+        self.clear()
+
+    def activate(
+        self,
+        forecast: tuple[object, ...],
+        terminal_electric_value: float,
+        terminal_heat_value: float,
+    ) -> None:
+        self._active_forecast = forecast
+        self._terminal_electric_value = terminal_electric_value
+        self._terminal_heat_value = terminal_heat_value
+
+    def clear(self) -> None:
+        self._active_forecast = self._neutral_forecast
+        self._terminal_electric_value = 0.0
+        self._terminal_heat_value = 0.0
+
+    def __call__(self, _t_now: object) -> object:
+        for step in range(self._horizon_steps + 1):
+            point = self._active_forecast[step]
+            self._tvp_template["_tvp", step, "price"] = float(
+                point.price_eur_per_kwh
+            )
+            self._tvp_template["_tvp", step, "P_pv"] = float(point.pv_kw)
+            self._tvp_template["_tvp", step, "P_load"] = float(
+                point.electric_load_kw
+            )
+            self._tvp_template["_tvp", step, "T_out"] = float(
+                point.outdoor_temperature_c
+            )
+            self._tvp_template["_tvp", step, "G_Wm2"] = float(
+                point.irradiance_w_per_m2
+            )
+            self._tvp_template[
+                "_tvp", step, "terminal_electric_value"
+            ] = self._terminal_electric_value
+            self._tvp_template[
+                "_tvp", step, "terminal_heat_value"
+            ] = self._terminal_heat_value
+        return self._tvp_template
 
 
 class MpcControllerAdapter:
@@ -127,9 +189,61 @@ class MpcControllerAdapter:
         state: HubState,
         forecast: tuple[object, ...],
     ) -> ControlDecision | ControllerFailure:
+        required_points = self.forecast_horizon_steps + 1
+        if not isinstance(forecast, tuple) or len(forecast) != required_points:
+            received_points = len(forecast) if hasattr(forecast, "__len__") else 0
+            return ControllerFailure(
+                code="forecast_coverage",
+                message=(
+                    f"MPC horizon {self.forecast_horizon_steps} requires "
+                    f"{required_points} immutable forecast points; received "
+                    f"{received_points}"
+                ),
+                diagnostics=DecisionDiagnostics(
+                    adapter="mpc",
+                    decision_status="failure",
+                    solver_success=None,
+                    solver_return_status=None,
+                    solver_iterations=None,
+                    solver_wall_seconds=None,
+                    forecast_start_utc=(
+                        forecast[0].timestamp_utc if received_points else None
+                    ),
+                    forecast_end_utc=(
+                        forecast[-1].timestamp_utc if received_points else None
+                    ),
+                    terminal_electric_value_eur_per_kwh=None,
+                    terminal_heat_value_eur_per_kwhth=None,
+                ),
+            )
+
+        stage_points = forecast[:-1]
+        terminal_electric_value = float(
+            np.mean([point.price_eur_per_kwh for point in stage_points])
+        )
+        heating_prices = [
+            point.price_eur_per_kwh
+            for point in stage_points
+            if point.outdoor_temperature_c < T_SETPOINT_C
+        ]
+        terminal_heat_value = (
+            float(np.mean(heating_prices)) / HP_COP if heating_prices else 0.0
+        )
+
         x0 = hub_state_array(state)
         self._mpc.x0 = x0
-        raw_control = self._mpc.make_step(x0)
+        forecast_source = getattr(self._mpc, "_forecast_source", None)
+        if forecast_source is not None:
+            forecast_source.activate(
+                forecast,
+                terminal_electric_value,
+                terminal_heat_value,
+            )
+        try:
+            raw_control = self._mpc.make_step(x0)
+        finally:
+            if forecast_source is not None:
+                forecast_source.clear()
         stats = dict(self._mpc.solver_stats)
         diagnostics = DecisionDiagnostics(
             adapter="mpc",
@@ -142,8 +256,8 @@ class MpcControllerAdapter:
             ),
             forecast_start_utc=forecast[0].timestamp_utc,
             forecast_end_utc=forecast[-1].timestamp_utc,
-            terminal_electric_value_eur_per_kwh=None,
-            terminal_heat_value_eur_per_kwhth=None,
+            terminal_electric_value_eur_per_kwh=terminal_electric_value,
+            terminal_heat_value_eur_per_kwhth=terminal_heat_value,
         )
         if stats.get("success") is not True:
             return ControllerFailure(
@@ -175,34 +289,22 @@ def _enable_text_solver_stat_storage(mpc: object) -> None:
     mpc.data.update = update_with_text_arrays
 
 
-def build_mpc(price_forecast: np.ndarray,
-              pv_forecast: np.ndarray,
-              load_elec_forecast: np.ndarray,
-              temp_out_forecast: np.ndarray,
-              irr_forecast: np.ndarray,
-              n_horizon: int = N_HORIZON,
-              disable_h2: bool = False,
-              disable_tes: bool = False,
-              terminal_weight: float = W_TERMINAL) -> tuple:
+def build_mpc(
+    hub_config: HubConfiguration,
+    config: MpcConfiguration,
+) -> tuple[object, object]:
     """
     Construct and return a configured do-mpc MPC controller for the hub.
 
-    Parameters
-    ----------
-    price_forecast     : [n] array, EUR/kWh
-    pv_forecast        : [n] array, kW
-    load_elec_forecast : [n] array, kW (lighting + base electrical load)
-    temp_out_forecast  : [n] array, degC
-    irr_forecast       : [n] array, W/m2
-    n_horizon          : prediction horizon [h]; set 1 for a myopic (no-foresight) ablation
-    disable_h2         : if True, lock electrolyser + fuel cell off (no-H2 ablation)
-    disable_tes        : if True, lock the thermal store off (no-TES ablation)
-    terminal_weight    : weight on the terminal stored-energy value (0 disables it)
+    The controller is configured from physical and solver policy only. Forecast data
+    is supplied later as an immutable N+1 view to ``MpcControllerAdapter.decide``.
 
     Returns
     -------
     (mpc, model) : configured do_mpc controller + symbolic model
     """
+    if config.horizon_steps < 1:
+        raise ValueError("MPC horizon_steps must be at least one")
     # ------------------------------------------------------------------
     # 1. Symbolic model
     # ------------------------------------------------------------------
@@ -228,6 +330,10 @@ def build_mpc(price_forecast: np.ndarray,
     P_load = model.set_variable("_tvp", "P_load")
     T_out  = model.set_variable("_tvp", "T_out")
     G_Wm2  = model.set_variable("_tvp", "G_Wm2")
+    terminal_electric_value = model.set_variable(
+        "_tvp", "terminal_electric_value"
+    )
+    terminal_heat_value = model.set_variable("_tvp", "terminal_heat_value")
 
     # --- Conversions ---
     Q_hp      = HP_COP * P_hp
@@ -277,9 +383,10 @@ def build_mpc(price_forecast: np.ndarray,
     # ------------------------------------------------------------------
     mpc = do_mpc.controller.MPC(model)
     mpc.set_param(
-        n_horizon=n_horizon,
+        n_horizon=config.horizon_steps,
         t_step=DT_H * 3600,      # do-mpc expects seconds
         n_robust=0,
+        use_terminal_bounds=True,
         store_full_solution=True,
         store_solver_stats=[
             "success",
@@ -291,8 +398,8 @@ def build_mpc(price_forecast: np.ndarray,
             "ipopt.print_level": 0,
             "ipopt.sb": "yes",
             "print_time": 0,
-            "ipopt.max_iter": 800,
-            "ipopt.tol": 1e-6,
+            "ipopt.max_iter": config.solver_max_iterations,
+            "ipopt.tol": config.solver_tolerance,
             # do-mpc enforces continuity in state-scaled NLP coordinates.
             # Convert the physical state tolerance to the tightest scale.
             "ipopt.constr_viol_tol": (
@@ -321,13 +428,18 @@ def build_mpc(price_forecast: np.ndarray,
     import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + IMPORT_SMOOTH_EPS2))
     lterm = (
         (price * P_grid_expr + GRID_IMPORT_FEE_EUR_KWH * import_kw) * DT_H
-        + W_BAT_THRU * (P_bat_ch + P_bat_dis) * DT_H
-        + W_TES_THRU * (Q_tes_ch + Q_tes_dis) * DT_H
-        + W_ELZ_WEAR * P_elz * DT_H
-        + W_FC_WEAR * P_fc * DT_H
-        + W_COMPL * (P_bat_ch * P_bat_dis / BAT_P_MAX_KW
-                     + Q_tes_ch * Q_tes_dis / TES_P_MAX_KW
-                     + P_elz * P_fc / FC_P_MAX_KW)
+        + config.battery_wear_eur_per_kwh * (P_bat_ch + P_bat_dis) * DT_H
+        + config.thermal_store_wear_eur_per_kwh
+        * (Q_tes_ch + Q_tes_dis)
+        * DT_H
+        + config.electrolyser_wear_eur_per_kwh * P_elz * DT_H
+        + config.fuel_cell_wear_eur_per_kwh * P_fc * DT_H
+        + config.complementarity_weight
+        * (
+            P_bat_ch * P_bat_dis / BAT_P_MAX_KW
+            + Q_tes_ch * Q_tes_dis / TES_P_MAX_KW
+            + P_elz * P_fc / FC_P_MAX_KW
+        )
     )
 
     # Terminal cost: reward stored energy valued at the price it would be used at
@@ -335,20 +447,20 @@ def build_mpc(price_forecast: np.ndarray,
     # valued at the horizon-average price. TES heat only displaces FUTURE HEATING
     # electricity, so it is valued at the average price during heating hours / COP —
     # this is ~0 in summer (no heating need), which prevents pointless heat hoarding.
-    lam_avg = float(np.mean(price_forecast))
-    heating_mask = temp_out_forecast < T_SETPOINT_C
-    if heating_mask.any():
-        lam_heat = float(np.mean(price_forecast[heating_mask])) / HP_COP
-    else:
-        lam_heat = 0.0
-    stored_value = (lam_avg * ETA_BAT_DIS * SOC_bat                       # battery -> elec
-                    + lam_avg * ETA_FC_E * E_H2_LHV_KWH_KG * SOC_h2       # H2 -> elec (lossy)
-                    + lam_heat * SOC_tes)                                 # TES -> heating elec
-    mterm = -terminal_weight * stored_value
+    stored_value = (
+        terminal_electric_value * ETA_BAT_DIS * SOC_bat
+        + terminal_electric_value * ETA_FC_E * E_H2_LHV_KWH_KG * SOC_h2
+        + terminal_heat_value * SOC_tes
+    )
+    mterm = -config.terminal_weight * stored_value
 
     mpc.set_objective(lterm=lterm, mterm=mterm)
-    mpc.set_rterm(P_bat_ch=W_RTERM, P_bat_dis=W_RTERM,
-                  P_hp=W_RTERM, P_eboiler=W_RTERM)
+    mpc.set_rterm(
+        P_bat_ch=config.input_move_weight,
+        P_bat_dis=config.input_move_weight,
+        P_hp=config.input_move_weight,
+        P_eboiler=config.input_move_weight,
+    )
 
     # ------------------------------------------------------------------
     # 4. Constraints
@@ -359,52 +471,55 @@ def build_mpc(price_forecast: np.ndarray,
     # TES can only charge from generated heat
     mpc.set_nl_cons("tes_charge_feas", model.aux["tes_charge_feas"], ub=0.0)
     # Soft indoor-temperature comfort band [16, 24] degC
-    mpc.set_nl_cons("T_upper", T_in, ub=T_MAX_C,
-                    soft_constraint=True, penalty_term_cons=W_TBAND, maximum_violation=10.0)
-    mpc.set_nl_cons("T_lower", -T_in, ub=-T_MIN_C,
-                    soft_constraint=True, penalty_term_cons=W_TBAND, maximum_violation=10.0)
+    hard_temperature_lower, hard_temperature_upper = operational_state_bounds(
+        hub_config
+    )["indoor_temperature_c"]
+    mpc.set_nl_cons(
+        "T_upper",
+        T_in,
+        ub=T_MAX_C,
+        soft_constraint=True,
+        penalty_term_cons=config.comfort_slack_weight,
+        maximum_violation=hard_temperature_upper - T_MAX_C,
+    )
+    mpc.set_nl_cons(
+        "T_lower",
+        -T_in,
+        ub=-T_MIN_C,
+        soft_constraint=True,
+        penalty_term_cons=config.comfort_slack_weight,
+        maximum_violation=T_MIN_C - hard_temperature_lower,
+    )
 
     # ------------------------------------------------------------------
     # 5. Bounds
     # ------------------------------------------------------------------
-    sb, ib = state_bounds(), input_bounds()
-    for s in ("SOC_bat", "SOC_h2", "SOC_tes", "T_in"):
-        mpc.bounds["lower", "_x", s] = sb[s][0]
-        mpc.bounds["upper", "_x", s] = sb[s][1]
-    for uname, (lo, hi) in ib.items():
-        mpc.bounds["lower", "_u", uname] = lo
-        mpc.bounds["upper", "_u", uname] = hi
+    for field_name, (lower, upper) in operational_state_bounds(hub_config).items():
+        model_name = STATE_MODEL_NAMES[field_name]
+        mpc.bounds["lower", "_x", model_name] = lower
+        mpc.bounds["upper", "_x", model_name] = upper
+        mpc.terminal_bounds["lower", model_name] = lower
+        mpc.terminal_bounds["upper", model_name] = upper
+    for field_name, (lower, upper) in control_bounds(hub_config).items():
+        model_name = CONTROL_MODEL_NAMES[field_name]
+        mpc.bounds["lower", "_u", model_name] = lower
+        mpc.bounds["upper", "_u", model_name] = upper
 
-    # Ablations: lock selected assets off by pinning their upper bound to zero.
-    if disable_h2:
+    # Temporary capability pins; Task 4 moves these into shared configured bounds.
+    if not hub_config.capabilities.hydrogen:
         mpc.bounds["upper", "_u", "P_elz"] = 0.0
         mpc.bounds["upper", "_u", "P_fc"] = 0.0
-    if disable_tes:
+    if not hub_config.capabilities.thermal_store:
         mpc.bounds["upper", "_u", "Q_tes_ch"] = 0.0
         mpc.bounds["upper", "_u", "Q_tes_dis"] = 0.0
 
     # ------------------------------------------------------------------
-    # 6. Time-varying parameters (perfect-foresight forecasts)
+    # 6. Time-varying parameters (causal N+1 forecast view)
     # ------------------------------------------------------------------
-    forecasts = {
-        "price":  price_forecast,
-        "P_pv":   pv_forecast,
-        "P_load": load_elec_forecast,
-        "T_out":  temp_out_forecast,
-        "G_Wm2":  irr_forecast,
-    }
-    n = len(price_forecast)
     tvp_template = mpc.get_tvp_template()
-
-    def tvp_fun(t_now):
-        k = int(round(float(np.squeeze(t_now)) / (DT_H * 3600)))
-        for i in range(n_horizon + 1):
-            idx = min(k + i, n - 1)
-            for key, arr in forecasts.items():
-                tvp_template["_tvp", i, key] = float(arr[idx])
-        return tvp_template
-
-    mpc.set_tvp_fun(tvp_fun)
+    forecast_source = _ForecastTVPSource(tvp_template, config.horizon_steps)
+    mpc.set_tvp_fun(forecast_source)
     mpc.setup()
     _enable_text_solver_stat_storage(mpc)
+    mpc._forecast_source = forecast_source
     return mpc, model

@@ -210,27 +210,67 @@ def test_invalid_control_reports_simultaneous_flows_above_exact_tolerance():
 # ---------------------------------------------------------------------------
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------
+def _mpc_forecast_points(price, pv, load, tout, irr):
+    from control.rolling_horizon import _LegacyScenarioPoint
+
+    timestamps = pd.date_range("2023-01-01", periods=len(price), freq="h", tz="UTC")
+    return tuple(
+        _LegacyScenarioPoint(
+            timestamp_utc=timestamp.to_pydatetime(),
+            price_eur_per_kwh=float(price_value),
+            pv_kw=float(pv_value),
+            electric_load_kw=float(load_value),
+            outdoor_temperature_c=float(tout_value),
+            irradiance_w_per_m2=float(irr_value),
+        )
+        for timestamp, price_value, pv_value, load_value, tout_value, irr_value in zip(
+            timestamps, price, pv, load, tout, irr, strict=True
+        )
+    )
+
+
+def _configured_mpc(horizon_steps=24):
+    from control.mpc_controller import (
+        MpcConfiguration,
+        MpcControllerAdapter,
+        build_mpc,
+    )
+    from models.hub_model import HubConfiguration
+
+    config = MpcConfiguration(horizon_steps=horizon_steps)
+    mpc, model = build_mpc(HubConfiguration(), config)
+    adapter = MpcControllerAdapter(
+        mpc=mpc,
+        forecast_horizon_steps=horizon_steps,
+        configuration={"horizon_steps": horizon_steps},
+        capability_policy={"battery": True},
+    )
+    mpc.x0 = np.asarray(list(initial_state().values())).reshape(-1, 1)
+    mpc.set_initial_guess()
+    return mpc, model, adapter
+
+
 def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
-    from control.mpc_controller import build_mpc
+    from control.rolling_horizon import ControlDecision
     from models.hub_model import BALANCE_STATE_TOLERANCE, STATE_SCALE
 
     n = 25
-    mpc, _ = build_mpc(
-        price_forecast=np.full(n, 0.10),
-        pv_forecast=np.zeros(n),
-        load_elec_forecast=np.full(n, 400.0),
-        temp_out_forecast=np.full(n, 5.0),
-        irr_forecast=np.zeros(n),
+    forecast = _mpc_forecast_points(
+        np.full(n, 0.10),
+        np.zeros(n),
+        np.full(n, 400.0),
+        np.full(n, 5.0),
+        np.zeros(n),
     )
+    mpc, _, adapter = _configured_mpc()
     state = initial_state()
     x0 = np.array(
         [state["SOC_bat"], state["SOC_h2"], state["SOC_tes"], state["T_in"]]
     ).reshape(-1, 1)
-    mpc.x0 = x0
-    mpc.set_initial_guess()
 
-    raw_control = mpc.make_step(x0)
+    decision = adapter.decide(state, forecast)
 
+    assert isinstance(decision, ControlDecision)
     required_statistics = (
         "success",
         "return_status",
@@ -249,12 +289,16 @@ def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
         else:
             assert stored.shape[0] == 0
     np.testing.assert_allclose(mpc.data._x[-1], x0.reshape(-1))
-    np.testing.assert_allclose(mpc.data._u[-1], raw_control.reshape(-1))
+    np.testing.assert_allclose(
+        mpc.data._u[-1],
+        np.array([decision.control[name] for name in input_bounds()]),
+    )
 
 
 def test_mpc_builds_steps_and_respects_balance():
     """A few closed-loop MPC steps solve and yield balance-feasible controls."""
-    from control.mpc_controller import build_mpc
+    from control.rolling_horizon import ControlDecision
+    from models.hub_model import HubState
     n = 30
     rng = np.random.default_rng(0)
     price = 0.05 + 0.05 * np.sin(np.linspace(0, 6, n)) + 0.01 * rng.standard_normal(n)
@@ -263,17 +307,24 @@ def test_mpc_builds_steps_and_respects_balance():
     tout = np.full(n, 5.0)
     irr = np.zeros(n)
 
-    mpc, _ = build_mpc(price, pv, load, tout, irr)
+    forecast = _mpc_forecast_points(price, pv, load, tout, irr)
+    mpc, _, adapter = _configured_mpc()
     x = initial_state()
-    x0 = np.array([x["SOC_bat"], x["SOC_h2"], x["SOC_tes"], x["T_in"]])
-    mpc.x0 = x0
-    mpc.set_initial_guess()
 
-    sb, ib = state_bounds(), input_bounds()
+    ib = input_bounds()
     for k in range(5):
-        x0 = np.array([[x["SOC_bat"]], [x["SOC_h2"]], [x["SOC_tes"]], [x["T_in"]]])
-        mpc.x0 = x0
-        mpc.make_step(x0)
+        stable_state = (
+            x
+            if isinstance(x, HubState)
+            else HubState(
+                soc_battery_kwh=x["SOC_bat"],
+                soc_hydrogen_kg=x["SOC_h2"],
+                soc_thermal_kwh=x["SOC_tes"],
+                indoor_temperature_c=x["T_in"],
+            )
+        )
+        decision = adapter.decide(stable_state, forecast[k : k + 25])
+        assert isinstance(decision, ControlDecision)
         if k == 0:
             configured_statistics = (
                 "success",
@@ -286,7 +337,7 @@ def test_mpc_builds_steps_and_respects_balance():
                 expected_rows = 1 if statistic in mpc.solver_stats else 0
                 assert getattr(mpc.data, statistic).shape[0] == expected_rows
             assert mpc.data.return_status[-1, 0] == "Solve_Succeeded"
-        u = {name: float(np.squeeze(mpc.u0[name])) for name in ib}
+        u = {name: float(decision.control[name]) for name in ib}
         for name, (lo, hi) in ib.items():
             # 1e-4 tolerance absorbs IPOPT's constraint-satisfaction noise
             assert lo - 1e-4 <= u[name] <= hi + 1e-4, f"{name} out of bounds: {u[name]}"

@@ -40,7 +40,7 @@ Usage
 
 import argparse
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from numbers import Integral, Real
 import sys
@@ -120,11 +120,34 @@ class _LegacyScenario:
     ) -> tuple[_LegacyScenarioPoint, ...]:
         required = horizon_steps + 1
         view = self.points[operating_step : operating_step + required]
-        if view and len(view) < required:
-            # Preserve the legacy end-of-frame TVP clamp. Task 5 replaces this
-            # temporary bridge with strict Scenario coverage semantics.
-            view = (*view, *((view[-1],) * (required - len(view))))
         return tuple(view)
+
+
+class ForecastCoverageError(ValueError):
+    """The requested operating window lacks explicit forecast points."""
+
+
+@dataclass(frozen=True)
+class CoveredFrame:
+    """Temporary bridge separating operating rows from N-step forecast coverage."""
+
+    frame: pd.DataFrame
+    operating_step_count: int
+
+    def __post_init__(self) -> None:
+        if not 0 < self.operating_step_count <= len(self.frame):
+            raise ValueError(
+                "operating_step_count must be positive and no greater than frame length"
+            )
+
+    def __len__(self) -> int:
+        return len(self.frame)
+
+    def __getitem__(self, key: object) -> object:
+        return self.frame.__getitem__(key)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.frame, name)
 
 
 @dataclass(frozen=True)
@@ -260,7 +283,11 @@ def _key_by_hour(frame: pd.DataFrame) -> pd.DataFrame:
     return f.drop_duplicates("_key").set_index("_key")
 
 
-def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
+def load_data(
+    start_month: int = 6,
+    n_days: int = 14,
+    forecast_hours: int = 24,
+) -> CoveredFrame:
     """
     Load PV/weather (PVGIS) and price (energy-charts) data and align them on an
     explicit (month, day, hour) key for the requested window. PV/weather and prices
@@ -275,10 +302,15 @@ def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
     demand = pd.read_csv(DATA_DIR / "demand_profile.csv",
                          index_col="timestamp", parse_dates=True)
 
+    if forecast_hours < 0:
+        raise ValueError("forecast_hours must be nonnegative")
+
     price_year = prices.index[0].year
     start = pd.Timestamp(f"{price_year}-{start_month:02d}-01", tz="UTC")
-    end = start + pd.Timedelta(days=n_days)
-    prices_window = prices.loc[start:end].iloc[:-1]
+    operating_end = start + pd.Timedelta(days=n_days)
+    coverage_end = operating_end + pd.Timedelta(hours=forecast_hours)
+    expected_index = pd.date_range(start, coverage_end, freq="h", inclusive="left")
+    prices_window = prices.reindex(expected_index)
 
     pv_k, dem_k = _key_by_hour(pv), _key_by_hour(demand)
     keys = list(zip(prices_window.index.month, prices_window.index.day,
@@ -292,14 +324,26 @@ def load_data(start_month: int = 6, n_days: int = 14) -> pd.DataFrame:
     df["T_out_C"] = pv_k["T2m_C"].reindex(keys).values
     df["P_elec_kW"] = dem_k["P_elec_kW"].reindex(keys).values
 
-    df = df.dropna()
-    print(f"Simulation: {df.index[0]} -> {df.index[-1]}  ({len(df)} steps)")
+    missing_rows = df.index[df.isna().any(axis=1)]
+    if len(missing_rows):
+        raise ForecastCoverageError(
+            f"requested {len(expected_index)} hourly points through "
+            f"{coverage_end}; {len(missing_rows)} aligned points are missing"
+        )
+
+    operating_step_count = len(
+        pd.date_range(start, operating_end, freq="h", inclusive="left")
+    )
+    print(
+        f"Simulation: {df.index[0]} -> {df.index[operating_step_count - 1]}  "
+        f"({operating_step_count} operating steps + {forecast_hours} forecast hours)"
+    )
     print(f"  Price: {df.price_EUR_MWh.min():.1f} - {df.price_EUR_MWh.max():.1f} EUR/MWh "
           f"(negative: {(df.price_EUR_MWh < 0).sum()} h)")
     print(f"  PV peak: {df.P_pv_kW.max():.0f} kW   Elec load: "
           f"{df.P_elec_kW.min():.0f}-{df.P_elec_kW.max():.0f} kW   "
           f"T_out: {df.T_out_C.min():.1f}-{df.T_out_C.max():.1f} C")
-    return df
+    return CoveredFrame(frame=df, operating_step_count=operating_step_count)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +479,9 @@ def _timestamp_utc(value: object) -> datetime:
 
 
 def _legacy_scenario_from_frame(
-    frame: pd.DataFrame, forecast_horizon_steps: int
+    frame: pd.DataFrame,
+    forecast_horizon_steps: int,
+    operating_step_count: int | None = None,
 ) -> _LegacyScenario:
     points = tuple(
         _LegacyScenarioPoint(
@@ -450,15 +496,21 @@ def _legacy_scenario_from_frame(
     )
     if not points:
         raise ValueError("legacy simulation frame must contain at least one operating step")
+    if operating_step_count is None:
+        operating_step_count = len(points)
+    if not 0 < operating_step_count <= len(points):
+        raise ValueError(
+            "operating_step_count must be positive and no greater than point count"
+        )
     duration = timedelta(hours=DT_H)
     return _LegacyScenario(
         name="legacy_frame",
         operating_start=points[0].timestamp_utc,
-        operating_end=points[-1].timestamp_utc + duration,
+        operating_end=points[operating_step_count - 1].timestamp_utc + duration,
         forecast_end=points[-1].timestamp_utc,
         forecast_horizon_capacity_steps=forecast_horizon_steps,
         step_duration=duration,
-        operating_step_count=len(points),
+        operating_step_count=operating_step_count,
         points=points,
     )
 
@@ -497,6 +549,7 @@ def _validate_decision_diagnostics(
     diagnostics: object,
     controller: ControllerAdapter,
     expected_status: str,
+    failure_code: str | None = None,
 ) -> tuple[ValidationIssue, ...]:
     """Validate controller evidence without reaching back into controller internals."""
     if not isinstance(diagnostics, DecisionDiagnostics):
@@ -721,7 +774,25 @@ def _validate_decision_diagnostics(
                     message="ControllerFailure cannot report solver_success=True",
                 )
             )
-        if controller.name == "mpc":
+        if controller.name == "mpc" and failure_code == "forecast_coverage":
+            for field_name in (
+                "solver_success",
+                "solver_return_status",
+                "solver_iterations",
+                "solver_wall_seconds",
+            ):
+                if getattr(diagnostics, field_name) is not None:
+                    issues.append(
+                        ValidationIssue(
+                            code="branch_mismatch",
+                            field=field_name,
+                            message=(
+                                "pre-solver forecast coverage failure requires empty "
+                                "solver diagnostics"
+                            ),
+                        )
+                    )
+        elif controller.name == "mpc":
             if diagnostics.solver_success is not False:
                 issues.append(
                     ValidationIssue(
@@ -774,7 +845,16 @@ def simulate_run(
                 operating_step, controller.forecast_horizon_steps
             )
             if not forecast:
-                raise ValueError("controller forecast is empty")
+                return _invalid_run(
+                    scenario,
+                    controller,
+                    hub_config,
+                    operating_step,
+                    "forecast_coverage",
+                    "controller forecast is empty",
+                    records,
+                    diagnostics,
+                )
         except Exception as exc:
             return _invalid_run(
                 scenario,
@@ -819,6 +899,7 @@ def simulate_run(
             decision.diagnostics,
             controller,
             expected_status,
+            decision.code if isinstance(decision, ControllerFailure) else None,
         )
         if isinstance(decision.diagnostics, DecisionDiagnostics):
             diagnostics.append(decision.diagnostics)
@@ -1030,46 +1111,75 @@ def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
 
 
 def run_simulation(
-    df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs
+    data: pd.DataFrame | CoveredFrame, mode: str = "mpc", **mpc_kwargs
 ) -> ValidRun | InvalidRun:
     """Compatibility wrapper from a legacy frame to the stable Run outcome union."""
     if mode not in ("mpc", "baseline"):
         raise ValueError(f"Unknown mode: {mode}")
 
-    hub_config = HubConfiguration()
+    if isinstance(data, CoveredFrame):
+        frame = data.frame
+        operating_step_count = data.operating_step_count
+    else:
+        frame = data
+        operating_step_count = len(frame)
+
+    hub_config = HubConfiguration(
+        capabilities=AssetCapabilities(
+            hydrogen=not bool(mpc_kwargs.get("disable_h2", False)),
+            thermal_store=not bool(mpc_kwargs.get("disable_tes", False)),
+        )
+    )
     if mode == "baseline":
         controller: ControllerAdapter = BaselineControllerAdapter()
-        scenario = _legacy_scenario_from_frame(df, controller.forecast_horizon_steps)
+        scenario = _legacy_scenario_from_frame(
+            frame,
+            controller.forecast_horizon_steps,
+            operating_step_count=operating_step_count,
+        )
         return simulate_run(scenario, controller, hub_config)
 
-    from control.mpc_controller import MpcControllerAdapter, N_HORIZON, build_mpc
+    from control.mpc_controller import (
+        MpcConfiguration,
+        MpcControllerAdapter,
+        N_HORIZON,
+        build_mpc,
+    )
 
     horizon_steps = int(mpc_kwargs.get("n_horizon", N_HORIZON))
     print(
         f"\nBuilding MPC controller (horizon={horizon_steps}h, "
         f"{', '.join(key for key, value in mpc_kwargs.items() if value) or 'full'})..."
     )
+    config_field_names = {field.name for field in fields(MpcConfiguration)}
+    config_values = {
+        key: value
+        for key, value in mpc_kwargs.items()
+        if key in config_field_names
+    }
+    config_values["horizon_steps"] = horizon_steps
+    mpc_config = MpcConfiguration(**config_values)
     mpc, _ = build_mpc(
-        price_forecast=df["price_EUR_kWh"].to_numpy(),
-        pv_forecast=df["P_pv_kW"].to_numpy(),
-        load_elec_forecast=df["P_elec_kW"].to_numpy(),
-        temp_out_forecast=df["T_out_C"].to_numpy(),
-        irr_forecast=df["G_Wm2"].to_numpy(),
-        **mpc_kwargs,
+        hub_config,
+        mpc_config,
     )
     mpc.x0 = hub_state_array(initial_state(hub_config))
     mpc.set_initial_guess()
     controller = MpcControllerAdapter(
         mpc=mpc,
         forecast_horizon_steps=horizon_steps,
-        configuration={"horizon_steps": horizon_steps, **mpc_kwargs},
+        configuration=asdict(mpc_config),
         capability_policy={
             "battery": True,
             "hydrogen": not bool(mpc_kwargs.get("disable_h2", False)),
             "thermal_store": not bool(mpc_kwargs.get("disable_tes", False)),
         },
     )
-    scenario = _legacy_scenario_from_frame(df, horizon_steps)
+    scenario = _legacy_scenario_from_frame(
+        frame,
+        horizon_steps,
+        operating_step_count=operating_step_count,
+    )
     print("MPC controller ready.\n")
     return simulate_run(scenario, controller, hub_config)
 
