@@ -129,6 +129,25 @@ def _uncited_causal_claims(
     return uncited
 
 
+def _generated_publication_candidates() -> dict[str, str]:
+    """Read the optional generated index, skipping only before generation begins."""
+    if not CANDIDATE_INDEX.exists() and not CANDIDATE_INDEX.is_symlink():
+        pytest.skip(
+            "Task 13 prerequisite: generated publication candidate index is absent"
+        )
+
+    assert CANDIDATE_INDEX.is_file() and not CANDIDATE_INDEX.is_symlink()
+    candidates = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
+    assert isinstance(candidates, dict)
+    assert set(candidates) == EXPECTED_PUBLICATION_CANDIDATE_KEYS
+    assert all(
+        isinstance(identifier, str)
+        and re.fullmatch(r"[0-9a-f]{64}", identifier)
+        for identifier in candidates.values()
+    )
+    return candidates
+
+
 def _write_handcrafted_bundle(
     root: Path,
     *,
@@ -233,8 +252,8 @@ def test_readme_names_the_baseline_as_limited_capability_not_unqualified_fair():
     assert "limited-capability" in readme
 
 
-@pytest.mark.xfail(strict=True, reason="PF-04: Baseline Run manifests omit capability policy")
 def test_every_baseline_run_manifest_contains_the_exact_capability_policy():
+    _generated_publication_candidates()
     manifests = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(RUNS.glob("*/manifest.json"))
@@ -407,25 +426,6 @@ def test_publication_lookup_requires_a_known_full_bundle_identifier(tmp_path, id
 
     with pytest.raises((KeyError, ValueError, FileNotFoundError)):
         load_run_bundle(tmp_path, requested, repository_root=ROOT)
-
-
-def _generated_publication_candidates() -> dict[str, str]:
-    """Read the optional generated index, skipping only before generation begins."""
-    if not CANDIDATE_INDEX.exists() and not CANDIDATE_INDEX.is_symlink():
-        pytest.skip(
-            "Task 13 prerequisite: generated publication candidate index is absent"
-        )
-
-    assert CANDIDATE_INDEX.is_file() and not CANDIDATE_INDEX.is_symlink()
-    candidates = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
-    assert isinstance(candidates, dict)
-    assert set(candidates) == EXPECTED_PUBLICATION_CANDIDATE_KEYS
-    assert all(
-        isinstance(identifier, str)
-        and re.fullmatch(r"[0-9a-f]{64}", identifier)
-        for identifier in candidates.values()
-    )
-    return candidates
 
 
 def _csv_member_rows(bundle_path: Path, member: str) -> list[dict[str, str]]:
