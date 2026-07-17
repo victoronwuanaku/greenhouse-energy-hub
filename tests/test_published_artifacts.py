@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -10,6 +12,32 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "results" / "runs"
+CANDIDATE_INDEX = ROOT / "results" / "diagnostics" / "publication-candidates.json"
+
+EXPECTED_PUBLICATION_CANDIDATE_KEYS = frozenset(
+    {
+        "ablation-full",
+        "ablation-no-h2",
+        "ablation-no-tes",
+        "ablation-one-step",
+        "summer-baseline",
+        "summer-mpc",
+        "winter-baseline",
+        "winter-mpc",
+    }
+)
+EXPECTED_UTC_WINDOWS = {
+    "winter-2023-14d": (
+        "2023-01-01T23:00:00Z",
+        "2023-01-15T23:00:00Z",
+        "2023-01-16T23:00:00Z",
+    ),
+    "summer-2023-14d": (
+        "2023-05-31T22:00:00Z",
+        "2023-06-14T22:00:00Z",
+        "2023-06-15T22:00:00Z",
+    ),
+}
 
 BASELINE_CAPABILITY_POLICY = {
     "hydrogen_dispatch": False,
@@ -379,3 +407,135 @@ def test_publication_lookup_requires_a_known_full_bundle_identifier(tmp_path, id
 
     with pytest.raises((KeyError, ValueError, FileNotFoundError)):
         load_run_bundle(tmp_path, requested, repository_root=ROOT)
+
+
+def _generated_publication_candidates() -> dict[str, str]:
+    """Read the optional generated index, skipping only before generation begins."""
+    if not CANDIDATE_INDEX.exists() and not CANDIDATE_INDEX.is_symlink():
+        pytest.skip(
+            "Task 13 prerequisite: generated publication candidate index is absent"
+        )
+
+    assert CANDIDATE_INDEX.is_file() and not CANDIDATE_INDEX.is_symlink()
+    candidates = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
+    assert isinstance(candidates, dict)
+    assert set(candidates) == EXPECTED_PUBLICATION_CANDIDATE_KEYS
+    assert all(
+        isinstance(identifier, str)
+        and re.fullmatch(r"[0-9a-f]{64}", identifier)
+        for identifier in candidates.values()
+    )
+    return candidates
+
+
+def _csv_member_rows(bundle_path: Path, member: str) -> list[dict[str, str]]:
+    with (bundle_path / member).open(encoding="utf-8", newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+def test_generated_bundle_full_scope_evidence():
+    """Verify the eight generated Task 13 candidates and all publication evidence."""
+    from greenhouse_energy_hub.evaluation import load_run_bundle, verify_run_bundle
+
+    candidates = _generated_publication_candidates()
+    verified_bundles = {}
+    for key, identifier in candidates.items():
+        resolved = load_run_bundle(RUNS, identifier, repository_root=ROOT)
+        verified = verify_run_bundle(
+            resolved.path,
+            expected_identifier=identifier,
+            repository_root=ROOT,
+        )
+        assert resolved.identifier == verified.identifier == identifier
+        verified_bundles[key] = verified
+
+    for key, bundle in verified_bundles.items():
+        manifest_member = json.loads(
+            (bundle.path / "manifest.json").read_text(encoding="utf-8")
+        )
+        scenario = manifest_member["scenario"]
+        controller = manifest_member["controller"]
+        provenance = manifest_member["code_provenance"]
+        summary = json.loads((bundle.path / "summary.json").read_text(encoding="utf-8"))
+        validation = json.loads(
+            (bundle.path / "validation.json").read_text(encoding="utf-8")
+        )
+        trajectory_rows = _csv_member_rows(bundle.path, "trajectory.csv")
+        diagnostic_rows = _csv_member_rows(
+            bundle.path,
+            "controller_diagnostics.csv",
+        )
+
+        assert scenario["operating_step_count"] == 336
+        assert len(validation["steps"]) == 336
+        assert len(trajectory_rows) == len(diagnostic_rows) == 336
+        assert [row["operating_step"] for row in trajectory_rows] == [
+            str(step) for step in range(336)
+        ]
+        assert [row["operating_step"] for row in diagnostic_rows] == [
+            str(step) for step in range(336)
+        ]
+        assert (
+            scenario["operating_start_utc"],
+            scenario["operating_end_utc"],
+            scenario["forecast_end_utc"],
+        ) == EXPECTED_UTC_WINDOWS[scenario["name"]]
+
+        for operating_step, evidence in enumerate(validation["steps"]):
+            assert evidence["operating_step"] == operating_step
+            assert evidence["decision_status"] == "success"
+            assert all(
+                evidence[field] is True
+                for field in (
+                    "control_valid",
+                    "flows_valid",
+                    "successor_valid",
+                    "physical_invariants_valid",
+                )
+            )
+
+        assert all(row["adapter"] == controller["name"] for row in diagnostic_rows)
+        assert all(row["decision_status"] == "success" for row in diagnostic_rows)
+        if controller["name"] == "mpc":
+            for row in diagnostic_rows:
+                assert row["solver_success"] == "true"
+                assert row["solver_return_status"] in {
+                    "Solve_Succeeded",
+                    "Solved_To_Acceptable_Level",
+                }
+                assert int(row["solver_iterations"]) >= 0
+                assert math.isfinite(float(row["solver_wall_seconds"]))
+                assert float(row["solver_wall_seconds"]) >= 0.0
+        else:
+            assert controller["name"] == "baseline"
+            assert controller["capability_policy"] == BASELINE_CAPABILITY_POLICY
+            assert all(
+                not row[field]
+                for row in diagnostic_rows
+                for field in (
+                    "solver_success",
+                    "solver_return_status",
+                    "solver_iterations",
+                    "solver_wall_seconds",
+                )
+            )
+
+        assert summary["policy"] == manifest_member["evaluation_policy"]
+        assert len(summary["step_line_items"]) == 336
+        assert set(summary["wear_sensitivities"]) == {"0x", "1x", "2x"}
+
+        assert provenance["publication_eligible"] is True
+        assert re.fullmatch(r"[0-9a-f]{40}", provenance["git_revision"])
+        assert provenance["dirty_executable_paths"] == []
+        assert provenance["untracked_executable_paths"] == []
+        assert provenance["executable_path_hashes"]
+        assert (
+            provenance["executable_path_hashes"]
+            == provenance["committed_executable_path_hashes"]
+        )
+        assert all(
+            re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in provenance["executable_path_hashes"].values()
+        ), key
+
+    assert not list((ROOT / "results" / "diagnostics").rglob("failure.json"))
