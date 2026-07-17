@@ -63,12 +63,13 @@ from models.hub_model import (
     HP_P_MAX_KW, HP_COP, EBOILER_P_MAX_KW, ETA_EBOILER,
     TES_P_MAX_KW,
     C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
-    GRID_IMPORT_FEE_EUR_KWH, Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
+    Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
 from accounting import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationPolicy,
     evaluate_run,
+    evaluate_step,
     saving_percent,
 )
 from scenarios import (
@@ -1031,14 +1032,19 @@ def simulate_run(
 
 def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    step_hours = run.scenario.step_duration.total_seconds() / 3600.0
     for record in run.records:
         serialized_control = normalize_control(
             record.control,
             run.hub_configuration,
         )
+        line_items = evaluate_step(
+            record,
+            DEFAULT_EVALUATION_POLICY,
+            step_hours,
+        )
         grid_kw = float(record.flows.grid_kw)
         price = float(record.exogenous.price_eur_per_kwh)
-        reached_temperature = float(record.reached_state.indoor_temperature_c)
         row = {
             "timestamp": pd.Timestamp(record.timestamp_utc),
             "SOC_bat_kWh": float(record.start_state.soc_battery_kwh),
@@ -1055,15 +1061,10 @@ def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
             "price_EUR_kWh": price,
             "T_out_C": float(record.exogenous.outdoor_temperature_c),
             "G_Wm2": float(record.exogenous.irradiance_w_per_m2),
-            "grid_cost_EUR": (
-                grid_kw * price
-                + GRID_IMPORT_FEE_EUR_KWH * max(0.0, grid_kw)
-            )
-            * DT_H,
+            "grid_cost_EUR": line_items.grid_cost_eur,
             "elec_residual_kW": 0.0,
             "Q_air_kW": float(record.flows.heat_to_air_kw),
-            "T_violation_C": max(0.0, reached_temperature - T_MAX_C)
-            + max(0.0, T_MIN_C - reached_temperature),
+            "T_violation_C": line_items.comfort_violation_c_h,
             "is_terminal": False,
         }
         rows.append(row)

@@ -279,11 +279,73 @@ def test_wear_sensitivities_reuse_records_at_zero_one_and_two_times():
         report.wear_sensitivities["3x"] = two
 
 
+@pytest.mark.parametrize(
+    "multipliers",
+    [
+        (),
+        (1.0,),
+        (0.0, 1.0),
+        (1.0, 2.0),
+        (0.0, 2.0),
+    ],
+)
+def test_evaluation_policy_requires_zero_nominal_and_double_wear_evidence(
+    multipliers,
+):
+    from accounting import EvaluationPolicy
+
+    with pytest.raises(ValueError, match="0x, 1x, and 2x"):
+        EvaluationPolicy(sensitivity_multipliers=multipliers)
+
+
+def test_evaluation_policy_allows_additional_unique_nonnegative_sensitivities():
+    from accounting import EvaluationPolicy, evaluate_run
+
+    policy = EvaluationPolicy(
+        sensitivity_multipliers=(0.0, 0.5, 1.0, 2.0, 3.0)
+    )
+
+    report = evaluate_run(_two_step_valid_run(), policy)
+
+    assert tuple(report.wear_sensitivities) == (
+        "0x",
+        "0.5x",
+        "1x",
+        "2x",
+        "3x",
+    )
+
+
 def test_serialized_policy_metadata_labels_provisional_coefficients_and_is_immutable():
+    from types import MappingProxyType
+
     policy = _policy()
     metadata = policy.to_metadata()
+    assert isinstance(metadata, MappingProxyType)
+    assert isinstance(metadata["wear"], MappingProxyType)
+    assert isinstance(metadata["sensitivity_multipliers"], tuple)
+    with pytest.raises(TypeError):
+        dict.__setitem__(metadata, "name", "bypassed-freeze")
+    with pytest.raises(TypeError):
+        dict.__setitem__(
+            metadata["wear"],
+            "battery_eur_per_kwh",
+            999.0,
+        )
+    with pytest.raises(TypeError):
+        json.dumps(metadata, sort_keys=True, allow_nan=False)
 
-    assert json.loads(json.dumps(metadata, sort_keys=True, allow_nan=False)) == {
+    normalized = policy.to_serializable_metadata()
+
+    canonical_json = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert '"coefficient_status":"provisional"' in canonical_json
+    assert json.loads(canonical_json) == {
         "comfort_valuation": None,
         "grid_import_fee_eur_per_kwh": 0.025,
         "name": "greenhouse-hub-evaluation",
@@ -298,10 +360,19 @@ def test_serialized_policy_metadata_labels_provisional_coefficients_and_is_immut
             "thermal_store_eur_per_kwh": 0.0005,
         },
     }
+    assert isinstance(normalized, dict)
+    assert isinstance(normalized["wear"], dict)
+    assert isinstance(normalized["sensitivity_multipliers"], list)
     with pytest.raises(TypeError):
         metadata["name"] = "changed"
     with pytest.raises(TypeError):
         metadata["wear"]["battery_eur_per_kwh"] = 999.0
+
+    normalized["wear"]["battery_eur_per_kwh"] = 999.0
+    assert (
+        policy.to_serializable_metadata()["wear"]["battery_eur_per_kwh"]
+        == 0.005
+    )
 
 
 @pytest.mark.parametrize("capability", ["battery", "hydrogen", "thermal_store"])

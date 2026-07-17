@@ -536,6 +536,42 @@ def test_run_configuration_mappings_are_read_only(hourly_frame):
         outcome.capability_policy["hydrogen_dispatch"] = True
 
 
+def test_valid_run_frame_uses_shared_evaluation_step_line_items(
+    monkeypatch,
+    hourly_frame,
+):
+    from accounting import DEFAULT_EVALUATION_POLICY, StepLineItems
+    from control import rolling_horizon
+
+    outcome = rolling_horizon.run_simulation(
+        hourly_frame.iloc[:1], mode="baseline"
+    )
+    calls = []
+
+    def shared_line_items(record, policy, step_hours):
+        calls.append((record, policy, step_hours))
+        return StepLineItems(
+            operating_step=record.operating_step,
+            grid_cost_eur=123.456,
+            battery_wear_eur=0.0,
+            thermal_store_wear_eur=0.0,
+            electrolyser_wear_eur=0.0,
+            fuel_cell_wear_eur=0.0,
+            operating_cost_eur=123.456,
+            comfort_violation_c_h=7.89,
+        )
+
+    monkeypatch.setattr(rolling_horizon, "evaluate_step", shared_line_items)
+
+    frame = outcome.to_frame()
+
+    assert frame.iloc[0]["grid_cost_EUR"] == pytest.approx(123.456)
+    assert frame.iloc[0]["T_violation_C"] == pytest.approx(7.89)
+    assert calls == [
+        (outcome.records[0], DEFAULT_EVALUATION_POLICY, 1.0)
+    ]
+
+
 def test_baseline_run_records_exact_capability_policy(hourly_frame):
     from control.rolling_horizon import ValidRun, run_simulation
 

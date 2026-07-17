@@ -739,13 +739,21 @@ def test_mpc_beats_or_matches_baseline(results):
 # 4. Published-artifact consistency and accounting bounds
 # ---------------------------------------------------------------------------
 def test_summary_consistent_with_scenario_csvs():
-    """results/scenarios/summary.csv must be reproducible from the committed scenario
-    CSVs via the shared accounting module — so the published table cannot drift from
-    the underlying data without a test failing."""
+    """Characterize only the committed pre-migration grid-only summary.
+
+    Task 14 deletes this test and its private accounting adapter when regenerated
+    artifacts use valid Run Bundles and the current Evaluation Policy.
+    """
     scen = RESULTS / "scenarios"
     if not (scen / "summary.csv").exists():
         pytest.skip("No scenario summary committed yet.")
-    from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
+    import accounting
+    from accounting import (
+        _legacy_grid_inventory_adjusted_cost,
+        saving_pct,
+        stored_equiv_kwh,
+    )
+    assert not hasattr(accounting, "inventory_adjusted_cost")
     x0 = initial_state()
     init_eq = stored_equiv_kwh(x0["SOC_bat"], x0["SOC_h2"], x0["SOC_tes"])
     summ = pd.read_csv(scen / "summary.csv")
@@ -755,8 +763,12 @@ def test_summary_consistent_with_scenario_csvs():
         settle = m["price_EUR_kWh"].mean()
         assert b["grid_cost_EUR"].sum() == pytest.approx(row.baseline_eur, abs=1.0)
         assert m["grid_cost_EUR"].sum() == pytest.approx(row.mpc_eur, abs=1.0)
-        assert inventory_adjusted_cost(b, init_eq, settle) == pytest.approx(row.baseline_adj_eur, abs=1.0)
-        assert inventory_adjusted_cost(m, init_eq, settle) == pytest.approx(row.mpc_adj_eur, abs=1.0)
+        assert _legacy_grid_inventory_adjusted_cost(
+            b, init_eq, settle
+        ) == pytest.approx(row.baseline_adj_eur, abs=1.0)
+        assert _legacy_grid_inventory_adjusted_cost(
+            m, init_eq, settle
+        ) == pytest.approx(row.mpc_adj_eur, abs=1.0)
         assert saving_pct(b["grid_cost_EUR"].sum(), m["grid_cost_EUR"].sum()) == pytest.approx(row.saving_pct, abs=0.2)
 
 

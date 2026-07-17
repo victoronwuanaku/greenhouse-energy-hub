@@ -36,21 +36,32 @@ PROVISIONAL_COEFFICIENT_STATUS = "provisional"
 SETTLEMENT_RULE = "arithmetic-mean-operating-wholesale-price"
 
 
-class _FrozenJSONDict(dict):
-    """A JSON-serializable mapping snapshot that cannot be mutated."""
+def _immutable_metadata(value: object) -> object:
+    """Recursively freeze policy metadata without inheriting mutable containers."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _immutable_metadata(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_immutable_metadata(item) for item in value)
+    return value
 
-    @staticmethod
-    def _immutable(*_args: object, **_kwargs: object) -> None:
-        raise TypeError("serialized policy metadata is immutable")
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
+def _normal_json_primitives(value: object) -> object:
+    """Copy immutable metadata into ordinary JSON dict/list/scalar primitives."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _normal_json_primitives(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normal_json_primitives(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise TypeError(f"metadata value {value!r} is not JSON-compatible")
 
 
 def _finite_nonnegative(value: object, field_name: str) -> float:
@@ -110,31 +121,38 @@ class EvaluationPolicy:
             _finite_nonnegative(value, "sensitivity_multipliers")
             for value in self.sensitivity_multipliers
         )
-        if not multipliers or 1.0 not in multipliers:
-            raise ValueError("sensitivity_multipliers must contain nominal 1x")
         if len(set(multipliers)) != len(multipliers):
             raise ValueError("sensitivity_multipliers must be unique")
+        if not {0.0, 1.0, 2.0}.issubset(multipliers):
+            raise ValueError(
+                "sensitivity_multipliers must contain mandatory 0x, 1x, and 2x"
+            )
         object.__setattr__(self, "sensitivity_multipliers", multipliers)
 
     def to_metadata(self) -> Mapping[str, object]:
-        """Return deterministic, deeply immutable, JSON-compatible metadata."""
-        wear = _FrozenJSONDict(
-            {
-                **asdict(self.wear),
-                "coefficient_status": PROVISIONAL_COEFFICIENT_STATUS,
-            }
-        )
-        return _FrozenJSONDict(
+        """Return deterministic metadata backed by genuine immutable containers."""
+        metadata = _immutable_metadata(
             {
                 "name": self.name,
                 "version": self.version,
                 "grid_import_fee_eur_per_kwh": self.grid_import_fee_eur_per_kwh,
-                "wear": wear,
+                "wear": {
+                    **asdict(self.wear),
+                    "coefficient_status": PROVISIONAL_COEFFICIENT_STATUS,
+                },
                 "sensitivity_multipliers": self.sensitivity_multipliers,
                 "settlement_rule": SETTLEMENT_RULE,
                 "comfort_valuation": None,
             }
         )
+        assert isinstance(metadata, Mapping)
+        return metadata
+
+    def to_serializable_metadata(self) -> dict[str, object]:
+        """Return a fresh ordinary JSON-primitive copy of policy metadata."""
+        normalized = _normal_json_primitives(self.to_metadata())
+        assert isinstance(normalized, dict)
+        return normalized
 
 
 DEFAULT_EVALUATION_POLICY = EvaluationPolicy()
@@ -410,12 +428,19 @@ def stored_equiv_from_row(
     )
 
 
-def inventory_adjusted_cost(
+def _legacy_grid_inventory_adjusted_cost(
     results_df: object,
     init_equiv: float,
     settle_price: float,
     config: HubConfiguration = HubConfiguration(),
 ) -> float:
+    """Characterize committed pre-migration grid-only artifact summaries.
+
+    This private adapter is not a current evaluation API: it intentionally omits
+    policy wear so the old committed CSV/summary characterization remains readable.
+    Task 14 must delete it with that characterization when artifacts regenerate from
+    valid Run Bundles under ``evaluate_run``.
+    """
     final_equiv = stored_equiv_from_row(results_df.iloc[-1], config)
     return float(results_df["grid_cost_EUR"].sum()) + settle_price * (
         init_equiv - final_equiv
