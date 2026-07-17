@@ -42,6 +42,14 @@ from greenhouse_energy_hub.simulation import (
 # Limited-capability Baseline: a frugal thermostat that holds the lower comfort
 # bound. Its exact missing capabilities are declared by BaselineControllerAdapter.
 BASELINE_TARGET_C = T_MIN_C + 0.5
+BASELINE_CAPABILITY_POLICY: Mapping[str, JSONValue] = _read_only_mapping(
+    {
+        "hydrogen_dispatch": False,
+        "thermal_store_charging": False,
+        "grid_battery_charging": False,
+        "battery_discharge_price_threshold_eur_per_kwh": 0.12,
+    }
+)
 
 
 def baseline_control(
@@ -107,14 +115,7 @@ class BaselineControllerAdapter:
     configuration: Mapping[str, JSONValue] = _read_only_mapping(
         {"target_indoor_temperature_c": BASELINE_TARGET_C}
     )
-    capability_policy: Mapping[str, JSONValue] = _read_only_mapping(
-        {
-            "hydrogen_dispatch": False,
-            "thermal_store_charging": False,
-            "grid_battery_charging": False,
-            "battery_discharge_price_threshold_eur_per_kwh": 0.12,
-        }
-    )
+    capability_policy = BASELINE_CAPABILITY_POLICY
     forecast_horizon_steps = 0
     requires_operational_storage_bounds = False
 

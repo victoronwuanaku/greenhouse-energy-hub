@@ -51,16 +51,21 @@ def _two_step_valid_run(
     from greenhouse_energy_hub.scenarios import Scenario, ScenarioPoint
 
     start = datetime(2023, 1, 2, tzinfo=timezone.utc)
-    points = (
+    operating_points = (
         ScenarioPoint(start, 0.10, 0.0, 400.0, 5.0, 0.0),
         ScenarioPoint(start + timedelta(hours=1), 0.20, 0.0, 400.0, 5.0, 0.0),
+    )
+    points = operating_points + (
+        (ScenarioPoint(start + timedelta(hours=2), 0.30, 0.0, 400.0, 5.0, 0.0),)
+        if controller_name == "mpc"
+        else ()
     )
     scenario = Scenario(
         name="two-step-evaluation",
         operating_start=start,
         operating_end=start + timedelta(hours=2),
-        forecast_end=start + timedelta(hours=2),
-        forecast_horizon_capacity_steps=0,
+        forecast_end=start + timedelta(hours=2 + (controller_name == "mpc")),
+        forecast_horizon_capacity_steps=1 if controller_name == "mpc" else 0,
         step_duration=timedelta(hours=1),
         operating_step_count=2,
         points=points,
@@ -106,7 +111,11 @@ def _two_step_valid_run(
             solver_iterations=3 if controller_name == "mpc" else None,
             solver_wall_seconds=0.01 if controller_name == "mpc" else None,
             forecast_start_utc=point.timestamp_utc,
-            forecast_end_utc=point.timestamp_utc,
+            forecast_end_utc=(
+                points[index + 1].timestamp_utc
+                if controller_name == "mpc"
+                else point.timestamp_utc
+            ),
             terminal_electric_value_eur_per_kwh=(
                 point.price_eur_per_kwh if controller_name == "mpc" else None
             ),
@@ -114,13 +123,17 @@ def _two_step_valid_run(
                 point.price_eur_per_kwh / 3.5 if controller_name == "mpc" else None
             ),
         )
-        for point in points
+        for index, point in enumerate(operating_points)
     )
     config = HubConfiguration()
     return ValidRun(
         scenario=scenario,
         controller_name=controller_name,
-        controller_configuration=controller_configuration or {},
+        controller_configuration=(
+            controller_configuration
+            if controller_configuration is not None
+            else ({"horizon_steps": 1} if controller_name == "mpc" else {})
+        ),
         capability_policy=capability_policy or {},
         hub_configuration=config,
         initial_state=initial,
@@ -188,7 +201,9 @@ def _publication_ready_run(**run_options):
     state = initial_state(run.hub_configuration)
     records = []
     zero_control = HubControl(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    for operating_step, point in enumerate(scenario.points):
+    for operating_step, point in enumerate(
+        scenario.points[: scenario.operating_step_count]
+    ):
         exogenous = ExogenousInputs(
             pv_kw=point.pv_kw,
             electric_load_kw=point.electric_load_kw,
@@ -214,6 +229,17 @@ def _publication_ready_run(**run_options):
         scenario=scenario,
         initial_state=records[0].start_state,
         records=tuple(records),
+        controller_diagnostics=(
+            tuple(
+                replace(
+                    diagnostics,
+                    terminal_heat_value_eur_per_kwhth=0.0,
+                )
+                for diagnostics in run.controller_diagnostics
+            )
+            if run.controller_name == "mpc"
+            else run.controller_diagnostics
+        ),
         terminal_state=state,
     )
 
@@ -1189,6 +1215,73 @@ def test_bundle_verification_binds_controller_and_solver_semantics(
     mutated = _rehash_bundle(bundle.path)
     with pytest.raises(ValueError, match="controller|diagnostic|solver|status|adapter"):
         verify_run_bundle(mutated, repository_root=repository)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "recorded-horizon",
+        "forecast-end",
+        "terminal-electric-value",
+        "terminal-heat-value",
+    ],
+)
+def test_bundle_verification_rejects_rehashed_forecast_semantic_forgery(
+    tmp_path,
+    forgery,
+):
+    """Hashes and identities cannot make causal diagnostic evidence truthful."""
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
+
+    root = Path(__file__).resolve().parent.parent
+    source = next(root.glob("results/runs/winter-2023-14d--mpc--1e9ee84c*"))
+    copied = tmp_path / source.name
+    shutil.copytree(source, copied)
+
+    if forgery == "recorded-horizon":
+        manifest_path = copied / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["controller"]["configuration"]["horizon_steps"] = 23
+        from greenhouse_energy_hub.evaluation import canonical_json_bytes
+
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+        forged = _rehash_specification_and_bundle(copied)
+    else:
+        def forge_diagnostics(_fieldnames, rows):
+            if forgery == "forecast-end":
+                rows[0]["forecast_end_utc"] = "2023-01-02T22:00:00Z"
+            elif forgery == "terminal-electric-value":
+                rows[0]["terminal_electric_value_eur_per_kwh"] = str(
+                    float(rows[0]["terminal_electric_value_eur_per_kwh"]) + 0.01
+                )
+            else:
+                rows[0]["terminal_heat_value_eur_per_kwhth"] = str(
+                    float(rows[0]["terminal_heat_value_eur_per_kwhth"]) + 0.01
+                )
+
+        _rewrite_csv(copied / "controller_diagnostics.csv", forge_diagnostics)
+        forged = _rehash_bundle(copied)
+
+    with pytest.raises(ValueError, match="horizon|forecast|terminal"):
+        verify_run_bundle(forged, repository_root=root)
+
+
+def test_bundle_verification_rejects_rehashed_baseline_terminal_coefficients(tmp_path):
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
+
+    root = Path(__file__).resolve().parent.parent
+    source = next(root.glob("results/runs/winter-2023-14d--baseline--509c81dd*"))
+    copied = tmp_path / source.name
+    shutil.copytree(source, copied)
+
+    def forge_terminal(_fieldnames, rows):
+        rows[0]["terminal_electric_value_eur_per_kwh"] = "0.1"
+
+    _rewrite_csv(copied / "controller_diagnostics.csv", forge_terminal)
+    forged = _rehash_bundle(copied)
+
+    with pytest.raises(ValueError, match="Baseline.*terminal|terminal.*Baseline"):
+        verify_run_bundle(forged, repository_root=root)
 
 
 @pytest.mark.parametrize(

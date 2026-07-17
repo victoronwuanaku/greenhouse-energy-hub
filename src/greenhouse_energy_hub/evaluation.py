@@ -36,6 +36,7 @@ from greenhouse_energy_hub.hub import (
     ETA_BAT_DIS,
     ETA_FC_E,
     HP_COP,
+    T_SETPOINT_C,
     T_MAX_C,
     T_MIN_C,
     AssetCapabilities,
@@ -1794,6 +1795,50 @@ def _validate_identity_graph(
     return scenario, hub_configuration, policy, controller
 
 
+def _controller_horizon_steps(controller: Mapping[str, object]) -> int:
+    """Derive the causal forecast horizon from exact recorded controller metadata."""
+    name = controller["name"]
+    configuration = controller["configuration"]
+    assert isinstance(configuration, Mapping)
+    if name == "baseline":
+        return 0
+    if name != "mpc":
+        raise ValueError(f"Run Bundle controller {name!r} is unsupported")
+    horizon = configuration.get("horizon_steps")
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
+        raise ValueError(
+            "Run Bundle MPC controller configuration requires a positive integer "
+            "horizon_steps"
+        )
+    return horizon
+
+
+def _expected_mpc_terminal_values(
+    scenario: Scenario,
+    operating_step: int,
+    horizon_steps: int,
+) -> tuple[float, float]:
+    stage_points = scenario.points[
+        operating_step : operating_step + horizon_steps
+    ]
+    if len(stage_points) != horizon_steps:
+        raise ValueError("Run Bundle MPC forecast lacks exact recorded horizon coverage")
+    electric_value = math.fsum(
+        point.price_eur_per_kwh for point in stage_points
+    ) / horizon_steps
+    heating_prices = [
+        point.price_eur_per_kwh
+        for point in stage_points
+        if point.outdoor_temperature_c < T_SETPOINT_C
+    ]
+    heat_value = (
+        math.fsum(heating_prices) / len(heating_prices) / HP_COP
+        if heating_prices
+        else 0.0
+    )
+    return electric_value, heat_value
+
+
 def _verify_bundle_directory(
     bundle_path: Path,
     expected_identifier: str | None,
@@ -1891,6 +1936,9 @@ def _verify_bundle_directory(
         manifest,
         repository_root,
     )
+    controller_horizon_steps = _controller_horizon_steps(controller)
+    if controller_horizon_steps > scenario.forecast_horizon_capacity_steps:
+        raise ValueError("Run Bundle controller horizon exceeds Scenario coverage")
 
     validation = _read_canonical_json(
         bundle_path / "validation.json",
@@ -2066,12 +2114,52 @@ def _verify_bundle_directory(
             raise ValueError("Run Bundle Baseline diagnostics claim solver evidence")
         if diagnostics.forecast_start_utc != scenario.points[operating_step].timestamp_utc:
             raise ValueError("Run Bundle diagnostics forecast start is inconsistent")
-        if (
-            diagnostics.forecast_end_utc is None
-            or diagnostics.forecast_end_utc < diagnostics.forecast_start_utc
-            or diagnostics.forecast_end_utc > scenario.forecast_end
-        ):
-            raise ValueError("Run Bundle diagnostics forecast window is inconsistent")
+        expected_forecast_end = (
+            diagnostics.forecast_start_utc
+            + controller_horizon_steps * scenario.step_duration
+        )
+        if diagnostics.forecast_end_utc != expected_forecast_end:
+            raise ValueError(
+                "Run Bundle diagnostics forecast end does not match the recorded "
+                "controller horizon"
+            )
+        if controller["name"] == "baseline":
+            if (
+                diagnostics.terminal_electric_value_eur_per_kwh is not None
+                or diagnostics.terminal_heat_value_eur_per_kwhth is not None
+            ):
+                raise ValueError(
+                    "Run Bundle Baseline diagnostics must not contain terminal "
+                    "coefficients"
+                )
+        else:
+            expected_electric, expected_heat = _expected_mpc_terminal_values(
+                scenario,
+                operating_step,
+                controller_horizon_steps,
+            )
+            observed_electric = diagnostics.terminal_electric_value_eur_per_kwh
+            observed_heat = diagnostics.terminal_heat_value_eur_per_kwhth
+            if (
+                observed_electric is None
+                or not math.isclose(
+                    observed_electric,
+                    expected_electric,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                or observed_heat is None
+                or not math.isclose(
+                    observed_heat,
+                    expected_heat,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "Run Bundle MPC terminal coefficients do not match the exact "
+                    "recorded Scenario stage points"
+                )
         records.append(record)
         diagnostics_values.append(diagnostics)
 
@@ -2630,6 +2718,25 @@ PUBLICATION_FIGURE_FILENAMES = frozenset(
         "fig6_ablation.png",
     }
 )
+_PUBLICATION_FULL_ASSET_CAPABILITIES = {
+    "battery": True,
+    "hydrogen": True,
+    "thermal_store": True,
+}
+_PUBLICATION_WINDOWS = {
+    "winter": {
+        "name": "winter-2023-14d",
+        "operating_start_utc": "2023-01-01T23:00:00Z",
+        "operating_end_utc": "2023-01-15T23:00:00Z",
+        "forecast_end_utc": "2023-01-16T23:00:00Z",
+    },
+    "summer": {
+        "name": "summer-2023-14d",
+        "operating_start_utc": "2023-05-31T22:00:00Z",
+        "operating_end_utc": "2023-06-14T22:00:00Z",
+        "forecast_end_utc": "2023-06-15T22:00:00Z",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -2869,6 +2976,182 @@ def validate_publication_bundles(bundles: Mapping[str, RunBundle]) -> None:
         raise ValueError("publication comparisons use different Evaluation Policies")
 
 
+def _publication_bundle_section(
+    bundle: RunBundle,
+    section: str,
+) -> Mapping[str, object]:
+    value = bundle.manifest.get(section)
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"publication semantic role {bundle.identifier} lacks {section} metadata"
+        )
+    return value
+
+
+def _validate_publication_candidate_semantics(
+    bundles: Mapping[str, RunBundle],
+) -> None:
+    """Enforce the exact approved publication-role and causal comparison matrix."""
+    if set(bundles) != PUBLICATION_CANDIDATE_KEYS:
+        raise ValueError("publication semantic matrix has missing or extra stable roles")
+
+    from greenhouse_energy_hub.controllers.baseline import (
+        BASELINE_CAPABILITY_POLICY,
+    )
+
+    expected_roles: dict[str, tuple[str, str, int, dict[str, bool]]] = {
+        "winter-baseline": (
+            "winter",
+            "baseline",
+            0,
+            _PUBLICATION_FULL_ASSET_CAPABILITIES,
+        ),
+        "winter-mpc": ("winter", "mpc", 24, _PUBLICATION_FULL_ASSET_CAPABILITIES),
+        "summer-baseline": (
+            "summer",
+            "baseline",
+            0,
+            _PUBLICATION_FULL_ASSET_CAPABILITIES,
+        ),
+        "summer-mpc": ("summer", "mpc", 24, _PUBLICATION_FULL_ASSET_CAPABILITIES),
+        "ablation-full": (
+            "winter",
+            "mpc",
+            24,
+            _PUBLICATION_FULL_ASSET_CAPABILITIES,
+        ),
+        "ablation-no-h2": (
+            "winter",
+            "mpc",
+            24,
+            {"battery": True, "hydrogen": False, "thermal_store": True},
+        ),
+        "ablation-no-tes": (
+            "winter",
+            "mpc",
+            24,
+            {"battery": True, "hydrogen": True, "thermal_store": False},
+        ),
+        "ablation-one-step": (
+            "winter",
+            "mpc",
+            1,
+            _PUBLICATION_FULL_ASSET_CAPABILITIES,
+        ),
+    }
+
+    for key, (season, controller_name, horizon, capabilities) in expected_roles.items():
+        bundle = bundles[key]
+        scenario = _publication_bundle_section(bundle, "scenario")
+        controller = _publication_bundle_section(bundle, "controller")
+        assets = _publication_bundle_section(bundle, "asset_capabilities")
+        expected_window = _PUBLICATION_WINDOWS[season]
+        if any(scenario.get(field) != value for field, value in expected_window.items()):
+            raise ValueError(
+                f"publication semantic role {key!r} has the wrong Scenario/window"
+            )
+        if (
+            scenario.get("operating_step_count") != 336
+            or scenario.get("forecast_horizon_capacity_steps") != 24
+            or scenario.get("step_duration_seconds") != 3600.0
+        ):
+            raise ValueError(
+                f"publication semantic role {key!r} must have 336 operating steps "
+                "and 24-step Forecast Coverage"
+            )
+        if controller.get("name") != controller_name:
+            raise ValueError(
+                f"publication semantic role {key!r} has the wrong controller"
+            )
+        if _controller_horizon_steps(controller) != horizon:
+            raise ValueError(
+                f"publication semantic role {key!r} has the wrong controller horizon"
+            )
+        if dict(assets) != capabilities:
+            raise ValueError(
+                f"publication semantic role {key!r} has the wrong Asset capabilities"
+            )
+        capability_policy = controller.get("capability_policy")
+        if controller_name == "baseline":
+            if capability_policy != BASELINE_CAPABILITY_POLICY:
+                raise ValueError(
+                    f"publication semantic role {key!r} has the wrong Baseline "
+                    "capability policy"
+                )
+        elif capability_policy != capabilities:
+            raise ValueError(
+                f"publication semantic role {key!r} has inconsistent MPC capabilities"
+            )
+
+    scenarios = {
+        key: _publication_bundle_section(bundle, "scenario")
+        for key, bundle in bundles.items()
+    }
+    if scenarios["winter-baseline"] != scenarios["winter-mpc"]:
+        raise ValueError("publication winter comparison Scenarios are not identical")
+    if scenarios["summer-baseline"] != scenarios["summer-mpc"]:
+        raise ValueError("publication summer comparison Scenarios are not identical")
+    ablation_scenarios = [
+        scenarios[f"ablation-{variant}"]
+        for variant in ("full", "no-h2", "no-tes", "one-step")
+    ]
+    if any(scenario != ablation_scenarios[0] for scenario in ablation_scenarios[1:]):
+        raise ValueError("publication ablation Scenarios are not identical")
+    if scenarios["winter-mpc"] != scenarios["ablation-full"]:
+        raise ValueError(
+            "publication direct/full winter MPC Scenarios are not semantically equal"
+        )
+
+    full = bundles["ablation-full"].manifest
+    full_controller = _publication_bundle_section(bundles["ablation-full"], "controller")
+    full_configuration = full_controller["configuration"]
+    full_policy = full["evaluation_policy"]
+    for variant in ("no-h2", "no-tes"):
+        candidate = bundles[f"ablation-{variant}"].manifest
+        controller = _publication_bundle_section(
+            bundles[f"ablation-{variant}"], "controller"
+        )
+        if (
+            controller["configuration"] != full_configuration
+            or candidate["evaluation_policy"] != full_policy
+        ):
+            raise ValueError(
+                f"publication ablation {variant!r} differs from full beyond its "
+                "named capability"
+            )
+
+    one_step = bundles["ablation-one-step"].manifest
+    one_step_controller = _publication_bundle_section(
+        bundles["ablation-one-step"], "controller"
+    )
+    normalized_one_step_configuration = dict(one_step_controller["configuration"])
+    normalized_one_step_configuration["horizon_steps"] = 24
+    if (
+        normalized_one_step_configuration != full_configuration
+        or one_step_controller["capability_policy"]
+        != full_controller["capability_policy"]
+        or one_step["asset_capabilities"] != full["asset_capabilities"]
+        or one_step["evaluation_policy"] != full_policy
+    ):
+        raise ValueError(
+            "publication one-step ablation differs from full beyond controller horizon"
+        )
+
+    direct = bundles["winter-mpc"].manifest
+    if any(
+        direct[field] != full[field]
+        for field in (
+            "scenario",
+            "controller",
+            "asset_capabilities",
+            "evaluation_policy",
+        )
+    ):
+        raise ValueError(
+            "publication direct/full winter MPC evidence is not semantically equal"
+        )
+
+
 def _load_verified_publication_candidates(
     candidates: Mapping[str, str],
     *,
@@ -2886,7 +3169,6 @@ def _load_verified_publication_candidates(
         if verified.identifier != identifier:
             raise ValueError(f"Run Bundle for {key!r} did not retain its requested ID")
         bundles[key] = verified
-    validate_publication_bundles(bundles)
     return bundles
 
 
@@ -2898,11 +3180,13 @@ def build_publication_manifest(
 ) -> dict[str, object]:
     """Build a recipe only after every candidate verifies as a Run Bundle."""
     candidates = _read_publication_candidate_index(candidate_index)
-    _load_verified_publication_candidates(
+    bundles = _load_verified_publication_candidates(
         candidates,
         runs_root=runs_root,
         repository_root=repository_root,
     )
+    _validate_publication_candidate_semantics(bundles)
+    validate_publication_bundles(bundles)
     return _publication_manifest_from_candidates(candidates)
 
 
@@ -2919,6 +3203,8 @@ def load_verified_publication_evidence(
         runs_root=runs_root,
         repository_root=repository_root,
     )
+    _validate_publication_candidate_semantics(bundles)
+    validate_publication_bundles(bundles)
     return PublicationEvidence(
         candidates=candidates,
         bundles=bundles,

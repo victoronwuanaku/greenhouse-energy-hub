@@ -833,6 +833,70 @@ def test_publisher_builds_the_exact_verified_full_id_recipe(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "left,right",
+    [
+        ("winter-baseline", "winter-mpc"),
+        ("winter-mpc", "summer-mpc"),
+        ("ablation-no-h2", "ablation-no-tes"),
+    ],
+)
+def test_publisher_rejects_otherwise_valid_bundles_swapped_between_semantic_roles(
+    tmp_path,
+    left,
+    right,
+):
+    from greenhouse_energy_hub.evaluation import build_publication_manifest
+
+    candidates = _generated_publication_candidates()
+    candidates[left], candidates[right] = candidates[right], candidates[left]
+    candidate_index = tmp_path / "publication-candidates.json"
+    candidate_index.write_text(json.dumps(candidates), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="publication.*semantic|role|Scenario|capabil"):
+        build_publication_manifest(
+            candidate_index,
+            runs_root=RUNS,
+            repository_root=ROOT,
+        )
+
+
+def test_committed_manifest_loading_rejects_semantically_swapped_roles():
+    from greenhouse_energy_hub.evaluation import (
+        load_verified_publication_evidence,
+        publication_candidates_from_manifest,
+    )
+
+    manifest = json.loads(
+        (ROOT / "results" / "publication_manifest.json").read_text(encoding="utf-8")
+    )
+    winter = manifest["comparisons"]["winter"]["mpc_bundle_id"]
+    summer = manifest["comparisons"]["summer"]["mpc_bundle_id"]
+
+    def swap_ids(value):
+        if isinstance(value, dict):
+            return {key: swap_ids(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [swap_ids(item) for item in value]
+        if value == winter:
+            return summer
+        if value == summer:
+            return winter
+        return value
+
+    forged_manifest = swap_ids(manifest)
+    assert set(publication_candidates_from_manifest(forged_manifest)) == (
+        EXPECTED_PUBLICATION_CANDIDATE_KEYS
+    )
+
+    with pytest.raises(ValueError, match="publication.*semantic|role|Scenario|window"):
+        load_verified_publication_evidence(
+            forged_manifest,
+            runs_root=RUNS,
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
     ("candidate_key", "candidate_value"),
     [
         ("unexpected", "0" * 64),
