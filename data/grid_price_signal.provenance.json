@@ -1,0 +1,84 @@
+{
+  "historic_acquisition_time": null,
+  "original_timezone": "UTC",
+  "output": {
+    "path": "data/grid_price_signal.csv",
+    "sha256": "6fb88162430934af362a55423bfbf76e8ff27db8990a880b6961a3ebf553c768"
+  },
+  "parameters": {
+    "bidding_zone": "NL",
+    "monthly_request_windows": [
+      {
+        "end": "2023-02-01",
+        "start": "2023-01-01"
+      },
+      {
+        "end": "2023-03-01",
+        "start": "2023-02-01"
+      },
+      {
+        "end": "2023-04-01",
+        "start": "2023-03-01"
+      },
+      {
+        "end": "2023-05-01",
+        "start": "2023-04-01"
+      },
+      {
+        "end": "2023-06-01",
+        "start": "2023-05-01"
+      },
+      {
+        "end": "2023-07-01",
+        "start": "2023-06-01"
+      },
+      {
+        "end": "2023-08-01",
+        "start": "2023-07-01"
+      },
+      {
+        "end": "2023-09-01",
+        "start": "2023-08-01"
+      },
+      {
+        "end": "2023-10-01",
+        "start": "2023-09-01"
+      },
+      {
+        "end": "2023-11-01",
+        "start": "2023-10-01"
+      },
+      {
+        "end": "2023-12-01",
+        "start": "2023-11-01"
+      },
+      {
+        "end": "2024-01-01",
+        "start": "2023-12-01"
+      }
+    ],
+    "year": 2023
+  },
+  "provenance_status": "legacy-import",
+  "row_count": 8760,
+  "schema_version": "source-provenance-v1",
+  "source": {
+    "name": "energy-charts.info NL day-ahead electricity price",
+    "url": "https://api.energy-charts.info/price"
+  },
+  "transformations": [
+    "unix_seconds_to_utc",
+    "filter_requested_year",
+    "EUR_per_MWh_to_EUR_per_kWh"
+  ],
+  "units": {
+    "price_EUR_MWh": "EUR/MWh",
+    "price_EUR_kWh": "EUR/kWh"
+  },
+  "utc_coverage": {
+    "end": "2023-12-31T23:00:00+00:00",
+    "row_count": 8760,
+    "start": "2023-01-01T00:00:00+00:00",
+    "step": "PT1H"
+  }
+}

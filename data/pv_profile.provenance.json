@@ -1,0 +1,41 @@
+{
+  "historic_acquisition_time": null,
+  "original_timezone": "UTC",
+  "output": {
+    "path": "data/pv_profile.csv",
+    "sha256": "ae8f4aa914d07f44457a6eebb6e11a209d2cbb64c5c41df5c45bf050bf4860ab"
+  },
+  "parameters": {
+    "aspect_degrees": 0,
+    "latitude": 52.0,
+    "longitude": 4.25,
+    "mounting_place": "free",
+    "peak_power_kwp": 1.0,
+    "radiation_database": "PVGIS-SARAH2",
+    "system_loss_percent": 14,
+    "tilt_degrees": 30,
+    "year": 2020
+  },
+  "provenance_status": "legacy-import",
+  "row_count": 8784,
+  "schema_version": "source-provenance-v1",
+  "source": {
+    "name": "PVGIS Westland PV and weather profile",
+    "url": "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
+  },
+  "transformations": [
+    "PVGIS_HH11_timestamp_floor_to_UTC_hour",
+    "watts_per_kWp_to_kW_per_kWp"
+  ],
+  "units": {
+    "G_Wm2": "W/m2",
+    "P_kW": "kW/kWp",
+    "T2m_C": "degC"
+  },
+  "utc_coverage": {
+    "end": "2020-12-31T23:00:00+00:00",
+    "row_count": 8784,
+    "start": "2020-01-01T00:00:00+00:00",
+    "step": "PT1H"
+  }
+}

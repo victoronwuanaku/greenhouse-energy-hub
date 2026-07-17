@@ -66,6 +66,13 @@ from models.hub_model import (
     GRID_IMPORT_FEE_EUR_KWH, Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
 from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
+from scenarios import (
+    Scenario,
+    ScenarioCoverageError,
+    ScenarioPoint,
+    ScenarioValidationError,
+    build_scenario,
+)
 # NOTE: build_mpc is imported lazily inside run_simulation() so that importing this
 # module (e.g. for load_data or the baseline) does not pull in the do-mpc/IPOPT stack.
 
@@ -91,63 +98,9 @@ def _read_only_mapping(
     return MappingProxyType(dict(values))
 
 
-@dataclass(frozen=True)
-class _LegacyScenarioPoint:
-    timestamp_utc: datetime
-    price_eur_per_kwh: float
-    pv_kw: float
-    electric_load_kw: float
-    outdoor_temperature_c: float
-    irradiance_w_per_m2: float
-
-
-@dataclass(frozen=True)
-class _LegacyScenario:
-    """Small DataFrame bridge retained only until the Scenario migration task."""
-
-    name: str
-    operating_start: datetime
-    operating_end: datetime
-    forecast_end: datetime
-    forecast_horizon_capacity_steps: int
-    step_duration: timedelta
-    operating_step_count: int
-    points: tuple[_LegacyScenarioPoint, ...]
-    provenance: tuple[object, ...] = ()
-
-    def forecast_view(
-        self, operating_step: int, horizon_steps: int
-    ) -> tuple[_LegacyScenarioPoint, ...]:
-        required = horizon_steps + 1
-        view = self.points[operating_step : operating_step + required]
-        return tuple(view)
-
-
-class ForecastCoverageError(ValueError):
-    """The requested operating window lacks explicit forecast points."""
-
-
-@dataclass(frozen=True)
-class CoveredFrame:
-    """Temporary bridge separating operating rows from N-step forecast coverage."""
-
-    frame: pd.DataFrame
-    operating_step_count: int
-
-    def __post_init__(self) -> None:
-        if not 0 < self.operating_step_count <= len(self.frame):
-            raise ValueError(
-                "operating_step_count must be positive and no greater than frame length"
-            )
-
-    def __len__(self) -> int:
-        return len(self.frame)
-
-    def __getitem__(self, key: object) -> object:
-        return self.frame.__getitem__(key)
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self.frame, name)
+# Temporary import aliases keep pre-migration characterization helpers importable;
+# both names resolve to the Scenario Module's real immutable types.
+_LegacyScenarioPoint = ScenarioPoint
 
 
 @dataclass(frozen=True)
@@ -187,7 +140,7 @@ class ControllerAdapter(Protocol):
     def decide(
         self,
         state: HubState,
-        forecast: tuple[_LegacyScenarioPoint, ...],
+        forecast: tuple[ScenarioPoint, ...],
     ) -> ControlDecision | ControllerFailure:
         raise NotImplementedError
 
@@ -213,7 +166,7 @@ class OperatingRecord:
 
 @dataclass(frozen=True)
 class ValidRun:
-    scenario: _LegacyScenario
+    scenario: Scenario
     controller_name: str
     controller_configuration: Mapping[str, JSONValue]
     capability_policy: Mapping[str, JSONValue]
@@ -243,7 +196,7 @@ class ValidRun:
 
 @dataclass(frozen=True)
 class InvalidRun:
-    scenario: _LegacyScenario
+    scenario: Scenario
     controller_name: str
     controller_configuration: Mapping[str, JSONValue]
     capability_policy: Mapping[str, JSONValue]
@@ -270,80 +223,64 @@ class InvalidRun:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def _key_by_hour(frame: pd.DataFrame) -> pd.DataFrame:
-    """Index a frame by an explicit (month, day, hour) key, flooring sub-hour stamps.
-
-    PVGIS timestamps fall on HH:11 (solar-time offset); flooring to the hour and
-    keying by (month, day, hour) makes the price/PV/demand alignment explicit and
-    robust to the cross-year (and leap-day) mismatch, instead of relying on row order.
-    """
-    f = frame.copy()
-    f.index = f.index.floor("h")
-    f["_key"] = list(zip(f.index.month, f.index.day, f.index.hour))
-    return f.drop_duplicates("_key").set_index("_key")
-
-
 def load_data(
     start_month: int = 6,
     n_days: int = 14,
     forecast_hours: int = 24,
-) -> CoveredFrame:
+) -> Scenario:
+    """Build the legacy month/day request through the validated Scenario path.
+
+    The acquired 2023 price bytes begin at 2023-01-01T00:00Z, one hour after
+    January 1 local midnight.  January requests therefore start January 2 local,
+    the first complete local-midnight window; direct ``build_scenario`` calls for
+    January 1 fail closed and never clamp or synthesize the missing instant.
     """
-    Load PV/weather (PVGIS) and price (energy-charts) data and align them on an
-    explicit (month, day, hour) key for the requested window. PV/weather and prices
-    may come from different years (and PVGIS 2020 is a leap year); keying by calendar
-    hour — not array position — makes that alignment explicit. Feb 29 has no price
-    counterpart in a non-leap price year and is simply dropped by the key join.
-    """
-    pv = pd.read_csv(DATA_DIR / "pv_profile.csv",
-                     index_col="timestamp", parse_dates=True)
-    prices = pd.read_csv(DATA_DIR / "grid_price_signal.csv",
-                         index_col="timestamp", parse_dates=True)
-    demand = pd.read_csv(DATA_DIR / "demand_profile.csv",
-                         index_col="timestamp", parse_dates=True)
+    if isinstance(start_month, bool) or not isinstance(start_month, Integral):
+        raise ValueError("start_month must be an integer from 1 through 12")
+    if not 1 <= int(start_month) <= 12:
+        raise ValueError("start_month must be an integer from 1 through 12")
+    if isinstance(n_days, bool) or not isinstance(n_days, Integral) or n_days <= 0:
+        raise ValueError("n_days must be a positive integer")
+    if (
+        isinstance(forecast_hours, bool)
+        or not isinstance(forecast_hours, Integral)
+        or forecast_hours < 0
+    ):
+        raise ValueError("forecast_hours must be a nonnegative integer")
 
-    if forecast_hours < 0:
-        raise ValueError("forecast_hours must be nonnegative")
-
-    price_year = prices.index[0].year
-    start = pd.Timestamp(f"{price_year}-{start_month:02d}-01", tz="UTC")
-    operating_end = start + pd.Timedelta(days=n_days)
-    coverage_end = operating_end + pd.Timedelta(hours=forecast_hours)
-    expected_index = pd.date_range(start, coverage_end, freq="h", inclusive="left")
-    prices_window = prices.reindex(expected_index)
-
-    pv_k, dem_k = _key_by_hour(pv), _key_by_hour(demand)
-    keys = list(zip(prices_window.index.month, prices_window.index.day,
-                    prices_window.index.hour))
-
-    df = pd.DataFrame(index=prices_window.index)
-    df["price_EUR_kWh"] = prices_window["price_EUR_kWh"].values
-    df["price_EUR_MWh"] = prices_window["price_EUR_MWh"].values
-    df["P_pv_kW"] = pv_k["P_kW"].reindex(keys).values * 500.0   # scale 1 kWp -> 500 kWp
-    df["G_Wm2"] = pv_k["G_Wm2"].reindex(keys).values
-    df["T_out_C"] = pv_k["T2m_C"].reindex(keys).values
-    df["P_elec_kW"] = dem_k["P_elec_kW"].reindex(keys).values
-
-    missing_rows = df.index[df.isna().any(axis=1)]
-    if len(missing_rows):
-        raise ForecastCoverageError(
-            f"requested {len(expected_index)} hourly points through "
-            f"{coverage_end}; {len(missing_rows)} aligned points are missing"
-        )
-
-    operating_step_count = len(
-        pd.date_range(start, operating_end, freq="h", inclusive="left")
+    start_day = 2 if int(start_month) == 1 else 1
+    start = pd.Timestamp(
+        f"2023-{int(start_month):02d}-{start_day:02d} 00:00",
+        tz="Europe/Amsterdam",
+    )
+    scenario = build_scenario(
+        name=scenario_tag(int(start_month), int(n_days)),
+        operating_start=start,
+        calendar_days=int(n_days),
+        max_horizon_steps=int(forecast_hours),
+    )
+    operating_points = scenario.points[: scenario.operating_step_count]
+    prices_mwh = np.array(
+        [point.price_eur_per_kwh * 1000.0 for point in scenario.points]
     )
     print(
-        f"Simulation: {df.index[0]} -> {df.index[operating_step_count - 1]}  "
-        f"({operating_step_count} operating steps + {forecast_hours} forecast hours)"
+        f"Simulation: {scenario.operating_start} -> "
+        f"{operating_points[-1].timestamp_utc}  "
+        f"({scenario.operating_step_count} operating steps + "
+        f"{scenario.forecast_horizon_capacity_steps} forecast hours)"
     )
-    print(f"  Price: {df.price_EUR_MWh.min():.1f} - {df.price_EUR_MWh.max():.1f} EUR/MWh "
-          f"(negative: {(df.price_EUR_MWh < 0).sum()} h)")
-    print(f"  PV peak: {df.P_pv_kW.max():.0f} kW   Elec load: "
-          f"{df.P_elec_kW.min():.0f}-{df.P_elec_kW.max():.0f} kW   "
-          f"T_out: {df.T_out_C.min():.1f}-{df.T_out_C.max():.1f} C")
-    return CoveredFrame(frame=df, operating_step_count=operating_step_count)
+    print(
+        f"  Price: {prices_mwh.min():.1f} - {prices_mwh.max():.1f} EUR/MWh "
+        f"(negative: {(prices_mwh < 0).sum()} h)"
+    )
+    print(
+        f"  PV peak: {max(point.pv_kw for point in scenario.points):.0f} kW   "
+        f"Elec load: {min(point.electric_load_kw for point in scenario.points):.0f}-"
+        f"{max(point.electric_load_kw for point in scenario.points):.0f} kW   "
+        f"T_out: {min(point.outdoor_temperature_c for point in scenario.points):.1f}-"
+        f"{max(point.outdoor_temperature_c for point in scenario.points):.1f} C"
+    )
+    return scenario
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +368,7 @@ class BaselineControllerAdapter:
     def decide(
         self,
         state: HubState,
-        forecast: tuple[_LegacyScenarioPoint, ...],
+        forecast: tuple[ScenarioPoint, ...],
     ) -> ControlDecision | ControllerFailure:
         point = forecast[0]
         legacy_control = baseline_control(
@@ -482,19 +419,20 @@ class BaselineControllerAdapter:
 def _timestamp_utc(value: object) -> datetime:
     timestamp = pd.Timestamp(value)
     if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize(timezone.utc)
-    else:
-        timestamp = timestamp.tz_convert(timezone.utc)
+        raise ScenarioValidationError(
+            "frame compatibility timestamps must be timezone-aware"
+        )
+    timestamp = timestamp.tz_convert(timezone.utc)
     return timestamp.to_pydatetime()
 
 
-def _legacy_scenario_from_frame(
+def _scenario_from_frame(
     frame: pd.DataFrame,
     forecast_horizon_steps: int,
     operating_step_count: int | None = None,
-) -> _LegacyScenario:
+) -> Scenario:
     points = tuple(
-        _LegacyScenarioPoint(
+        ScenarioPoint(
             timestamp_utc=_timestamp_utc(timestamp),
             price_eur_per_kwh=float(row.price_EUR_kWh),
             pv_kw=float(row.P_pv_kW),
@@ -505,7 +443,7 @@ def _legacy_scenario_from_frame(
         for timestamp, row in frame.iterrows()
     )
     if not points:
-        raise ValueError("legacy simulation frame must contain at least one operating step")
+        raise ValueError("simulation frame must contain at least one operating step")
     if operating_step_count is None:
         operating_step_count = len(points)
     if not 0 < operating_step_count <= len(points):
@@ -513,20 +451,23 @@ def _legacy_scenario_from_frame(
             "operating_step_count must be positive and no greater than point count"
         )
     duration = timedelta(hours=DT_H)
-    return _LegacyScenario(
-        name="legacy_frame",
+    return Scenario(
+        name="frame_compatibility",
         operating_start=points[0].timestamp_utc,
         operating_end=points[operating_step_count - 1].timestamp_utc + duration,
-        forecast_end=points[-1].timestamp_utc,
+        forecast_end=points[operating_step_count - 1].timestamp_utc
+        + duration
+        + forecast_horizon_steps * duration,
         forecast_horizon_capacity_steps=forecast_horizon_steps,
         step_duration=duration,
         operating_step_count=operating_step_count,
         points=points,
+        provenance=(),
     )
 
 
 def _invalid_run(
-    scenario: _LegacyScenario,
+    scenario: Scenario,
     controller: ControllerAdapter,
     hub_config: HubConfiguration,
     failed_step: int,
@@ -826,7 +767,7 @@ def _validate_decision_diagnostics(
     return tuple(issues)
 
 
-def _exogenous_from_point(point: _LegacyScenarioPoint) -> ExogenousInputs:
+def _exogenous_from_point(point: ScenarioPoint) -> ExogenousInputs:
     exogenous = ExogenousInputs(
         pv_kw=float(point.pv_kw),
         electric_load_kw=float(point.electric_load_kw),
@@ -840,7 +781,7 @@ def _exogenous_from_point(point: _LegacyScenarioPoint) -> ExogenousInputs:
 
 
 def simulate_run(
-    scenario: _LegacyScenario,
+    scenario: Scenario,
     controller: ControllerAdapter,
     hub_config: HubConfiguration,
 ) -> ValidRun | InvalidRun:
@@ -865,6 +806,17 @@ def simulate_run(
                     records,
                     diagnostics,
                 )
+        except ScenarioCoverageError as exc:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "forecast_coverage",
+                str(exc),
+                records,
+                diagnostics,
+            )
         except Exception as exc:
             return _invalid_run(
                 scenario,
@@ -1134,32 +1086,30 @@ def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
 
 
 def run_simulation(
-    data: pd.DataFrame | CoveredFrame,
+    data: Scenario | pd.DataFrame,
     mode: str = "mpc",
     hub_config: HubConfiguration = HubConfiguration(),
     **mpc_kwargs: object,
 ) -> ValidRun | InvalidRun:
-    """Compatibility wrapper from a legacy frame to the stable Run outcome union."""
+    """Run one Controller against a Scenario (or a test-only frame adapter)."""
     if mode not in ("mpc", "baseline"):
         raise ValueError(f"Unknown mode: {mode}")
-
-    if isinstance(data, CoveredFrame):
-        frame = data.frame
-        operating_step_count = data.operating_step_count
-    else:
-        frame = data
-        operating_step_count = len(frame)
 
     if mode == "baseline":
         if mpc_kwargs:
             unexpected = ", ".join(sorted(mpc_kwargs))
             raise TypeError(f"unexpected Baseline options: {unexpected}")
         controller: ControllerAdapter = BaselineControllerAdapter(hub_config)
-        scenario = _legacy_scenario_from_frame(
-            frame,
-            controller.forecast_horizon_steps,
-            operating_step_count=operating_step_count,
-        )
+        if isinstance(data, Scenario):
+            scenario = data
+        elif isinstance(data, pd.DataFrame):
+            scenario = _scenario_from_frame(
+                data,
+                controller.forecast_horizon_steps,
+                operating_step_count=len(data),
+            )
+        else:
+            raise TypeError("data must be a Scenario or DataFrame")
         return simulate_run(scenario, controller, hub_config)
 
     from control.mpc_controller import (
@@ -1201,11 +1151,22 @@ def run_simulation(
         configuration=asdict(mpc_config),
         capability_policy=asdict(hub_config.capabilities),
     )
-    scenario = _legacy_scenario_from_frame(
-        frame,
-        horizon_steps,
-        operating_step_count=operating_step_count,
-    )
+    if isinstance(data, Scenario):
+        scenario = data
+    elif isinstance(data, pd.DataFrame):
+        operating_step_count = len(data) - horizon_steps
+        if operating_step_count <= 0:
+            raise ScenarioCoverageError(
+                "frame compatibility requires Operating Steps plus explicit "
+                "Forecast Coverage"
+            )
+        scenario = _scenario_from_frame(
+            data,
+            horizon_steps,
+            operating_step_count=operating_step_count,
+        )
+    else:
+        raise TypeError("data must be a Scenario or DataFrame")
     print("MPC controller ready.\n")
     return simulate_run(scenario, controller, hub_config)
 
@@ -1262,14 +1223,14 @@ def main():
     print("  Location: Westland, Netherlands")
     print("=" * 65)
 
-    df = load_data(start_month=args.start_month, n_days=args.days)
+    scenario = load_data(start_month=args.start_month, n_days=args.days)
     results = {}
 
     for i, mode in enumerate(["baseline", "mpc"]):
         if args.mode not in (mode, "both"):
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
-        outcome = run_simulation(df, mode=mode, hub_config=hub_config)
+        outcome = run_simulation(scenario, mode=mode, hub_config=hub_config)
         if not isinstance(outcome, ValidRun):
             print(
                 f"  INVALID RUN at step {outcome.failed_step}: "
@@ -1308,7 +1269,9 @@ def main():
         print("=" * 65)
 
         update_summary(scen_dir / "summary.csv", {
-            "scenario": tag, "window_start": str(df.index[0].date()), "days": args.days,
+            "scenario": tag,
+            "window_start": str(pd.Timestamp(scenario.operating_start).date()),
+            "days": args.days,
             "baseline_eur": round(base, 1), "mpc_eur": round(mpc_c, 1),
             "saving_pct": round(saving_pct(base, mpc_c), 2),
             "baseline_adj_eur": round(base_adj, 1), "mpc_adj_eur": round(mpc_adj, 1),

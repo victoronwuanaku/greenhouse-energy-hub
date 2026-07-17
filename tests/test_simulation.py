@@ -61,14 +61,14 @@ def _forecast_points(
     temperatures=None,
     start="2023-01-02 00:00:00+00:00",
 ):
-    from control.rolling_horizon import _LegacyScenarioPoint
+    from scenarios import ScenarioPoint
 
     prices = tuple(float(price) for price in prices)
     if temperatures is None:
         temperatures = (5.0,) * len(prices)
     timestamps = pd.date_range(start, periods=len(prices), freq="h", tz="UTC")
     return tuple(
-        _LegacyScenarioPoint(
+        ScenarioPoint(
             timestamp_utc=timestamp.to_pydatetime(),
             price_eur_per_kwh=price,
             pv_kw=0.0,
@@ -233,7 +233,7 @@ def test_malformed_success_diagnostics_fail_before_physics(
         requires_operational_storage_bounds=True,
         decide=decide,
     )
-    scenario = rolling_horizon._legacy_scenario_from_frame(
+    scenario = rolling_horizon._scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     plant_calls = 0
@@ -278,7 +278,7 @@ def test_controller_failure_requires_failure_diagnostics(monkeypatch, hourly_fra
         requires_operational_storage_bounds=False,
         decide=decide,
     )
-    scenario = rolling_horizon._legacy_scenario_from_frame(
+    scenario = rolling_horizon._scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     monkeypatch.setattr(
@@ -321,7 +321,7 @@ def test_baseline_success_requires_empty_solver_diagnostics(monkeypatch, hourly_
         requires_operational_storage_bounds=False,
         decide=decide,
     )
-    scenario = rolling_horizon._legacy_scenario_from_frame(
+    scenario = rolling_horizon._scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     monkeypatch.setattr(
@@ -710,27 +710,26 @@ def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
         assert float(mpc.scaling["_u", model_name]) == nominal_scale
 
 
-def test_load_data_separates_operating_window_and_rejects_missing_coverage():
-    from control.rolling_horizon import (
-        CoveredFrame,
-        ForecastCoverageError,
-        load_data,
+def test_load_data_returns_scenario_and_rejects_missing_coverage():
+    from control.rolling_horizon import load_data
+    from scenarios import Scenario, ScenarioCoverageError
+
+    scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
+
+    assert isinstance(scenario, Scenario)
+    assert scenario.operating_step_count == 24
+    assert len(scenario.points) == 27
+    assert scenario.points[-1].timestamp_utc == (
+        scenario.points[23].timestamp_utc + pd.Timedelta(hours=3)
     )
 
-    covered = load_data(start_month=1, n_days=1, forecast_hours=3)
-
-    assert isinstance(covered, CoveredFrame)
-    assert covered.operating_step_count == 24
-    assert len(covered.frame) == 27
-    assert covered.frame.index[-1] == covered.frame.index[23] + pd.Timedelta(hours=3)
-
-    with pytest.raises(ForecastCoverageError):
+    with pytest.raises(ScenarioCoverageError):
         load_data(start_month=12, n_days=30, forecast_hours=49)
 
 
-def test_covered_frame_iterates_only_operating_window(monkeypatch, hourly_frame):
+def test_scenario_iterates_only_operating_window(monkeypatch, hourly_frame):
     import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, CoveredFrame, ValidRun
+    from control.rolling_horizon import ControlDecision, ValidRun
     from models.hub_model import HubFlows, HubStep
 
     observed_forecasts = []
@@ -757,9 +756,11 @@ def test_covered_frame_iterates_only_operating_window(monkeypatch, hourly_frame)
             ),
         ),
     )
-    covered = CoveredFrame(frame=hourly_frame.iloc[:4], operating_step_count=2)
+    scenario = rolling_horizon._scenario_from_frame(
+        hourly_frame.iloc[:4], forecast_horizon_steps=2, operating_step_count=2
+    )
 
-    outcome = rolling_horizon.run_simulation(covered, mode="baseline")
+    outcome = rolling_horizon.run_simulation(scenario, mode="baseline")
 
     assert isinstance(outcome, ValidRun)
     assert len(outcome.records) == 2
@@ -768,31 +769,124 @@ def test_covered_frame_iterates_only_operating_window(monkeypatch, hourly_frame)
     ]
 
 
-def test_missing_final_forecast_coverage_fails_without_clamping(hourly_frame):
+def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
+    monkeypatch,
+):
+    from collections.abc import Mapping
+    from dataclasses import fields, is_dataclass
+    from datetime import datetime, timedelta
+    import json
+    from types import SimpleNamespace
+
     import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import InvalidRun
-    from models.hub_model import HubConfiguration
+    from control.rolling_horizon import (
+        BaselineControllerAdapter,
+        ControlDecision,
+        DecisionDiagnostics,
+        ValidRun,
+    )
+    from models.hub_model import HubConfiguration, HubFlows, HubStep
+
+    scenario = rolling_horizon.load_data(
+        start_month=1, n_days=1, forecast_hours=3
+    )
+    config = HubConfiguration()
+
+    def identity_step(state, *_args):
+        return HubStep(
+            successor=state,
+            flows=HubFlows(
+                grid_kw=0.0,
+                generated_heat_kw=0.0,
+                heat_to_air_kw=0.0,
+                thermal_charge_margin_kw=0.0,
+                hydrogen_production_kg_per_h=0.0,
+                hydrogen_consumption_kg_per_h=0.0,
+            ),
+        )
+
+    def mpc_decide(_state, forecast):
+        return ControlDecision(
+            control=_zero_control(),
+            diagnostics=DecisionDiagnostics(
+                adapter="mpc",
+                decision_status="success",
+                solver_success=True,
+                solver_return_status="Solve_Succeeded",
+                solver_iterations=1,
+                solver_wall_seconds=0.001,
+                forecast_start_utc=forecast[0].timestamp_utc,
+                forecast_end_utc=forecast[-1].timestamp_utc,
+                terminal_electric_value_eur_per_kwh=0.0,
+                terminal_heat_value_eur_per_kwhth=0.0,
+            ),
+        )
+
+    monkeypatch.setattr(rolling_horizon, "advance_hub", identity_step)
+    baseline = rolling_horizon.simulate_run(
+        scenario, BaselineControllerAdapter(config), config
+    )
+    mpc = rolling_horizon.simulate_run(
+        scenario,
+        SimpleNamespace(
+            name="mpc",
+            configuration={"horizon_steps": 3},
+            capability_policy={},
+            forecast_horizon_steps=3,
+            requires_operational_storage_bounds=True,
+            decide=mpc_decide,
+        ),
+        config,
+    )
+
+    assert isinstance(baseline, ValidRun)
+    assert isinstance(mpc, ValidRun)
+    assert baseline.scenario is scenario
+    assert mpc.scenario is scenario
+    assert baseline.scenario == mpc.scenario
+    assert scenario.forecast_horizon_capacity_steps == 3
+    assert len(baseline.records) == len(mpc.records) == scenario.operating_step_count
+    assert len(scenario.points) == scenario.operating_step_count + 3
+
+    def canonical_value(value):
+        if is_dataclass(value):
+            return {
+                field.name: canonical_value(getattr(value, field.name))
+                for field in fields(value)
+            }
+        if isinstance(value, Mapping):
+            return {key: canonical_value(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [canonical_value(item) for item in value]
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, timedelta):
+            return value.total_seconds()
+        return value
+
+    def canonical_bytes(run):
+        return json.dumps(
+            canonical_value(run.scenario),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    assert canonical_bytes(baseline) == canonical_bytes(mpc)
+
+
+def test_missing_final_forecast_coverage_fails_before_run(hourly_frame):
+    import control.rolling_horizon as rolling_horizon
+    from scenarios import ScenarioCoverageError
 
     # Two operating steps with a two-stage controller require four points in total;
-    # three points deliberately leave the final N+1 view one point short.
-    scenario = rolling_horizon._legacy_scenario_from_frame(
-        hourly_frame.iloc[:3],
-        forecast_horizon_steps=2,
-        operating_step_count=2,
-    )
-    mpc = _ForecastAwareMpc()
-    adapter = _mpc_adapter(mpc, horizon_steps=2)
-
-    outcome = rolling_horizon.simulate_run(
-        scenario, adapter, HubConfiguration()
-    )
-
-    assert isinstance(outcome, InvalidRun)
-    assert outcome.failure_code == "forecast_coverage"
-    assert outcome.failed_step == 1
-    assert len(outcome.partial_records) == 1
-    assert len(mpc.make_step_calls) == 1
-    assert [len(activation[0]) for activation in mpc.forecast_activations] == [3]
+    # three points deliberately leave the final N+1 view one point short. Scenario
+    # construction must reject this before any Controller can run.
+    with pytest.raises(ScenarioCoverageError):
+        rolling_horizon._scenario_from_frame(
+            hourly_frame.iloc[:3],
+            forecast_horizon_steps=2,
+            operating_step_count=2,
+        )
 
 
 def test_cli_does_not_serialize_invalid_run(monkeypatch, tmp_path, hourly_frame):
@@ -1185,20 +1279,22 @@ def _first_mpc_control(prices: np.ndarray) -> np.ndarray:
         MpcControllerAdapter,
         build_mpc,
     )
-    from control.rolling_horizon import ControlDecision, _LegacyScenario
+    from control.rolling_horizon import ControlDecision
     from models.hub_model import HubConfiguration, initial_state
+    from scenarios import Scenario
 
     points = _forecast_points(prices)
     step_duration = timedelta(hours=1)
-    scenario = _LegacyScenario(
+    scenario = Scenario(
         name="causal_test",
         operating_start=points[0].timestamp_utc,
         operating_end=points[0].timestamp_utc + step_duration,
-        forecast_end=points[-1].timestamp_utc,
-        forecast_horizon_capacity_steps=24,
+        forecast_end=points[-1].timestamp_utc + step_duration,
+        forecast_horizon_capacity_steps=len(points) - 1,
         step_duration=step_duration,
         operating_step_count=1,
         points=points,
+        provenance=(),
     )
     hub_config = HubConfiguration()
     mpc, _ = build_mpc(hub_config, MpcConfiguration(horizon_steps=24))

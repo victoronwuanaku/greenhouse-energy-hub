@@ -1,0 +1,56 @@
+{
+  "historic_acquisition_time": null,
+  "inputs": [
+    {
+      "path": "data/pv_profile.csv",
+      "row_count": 8784,
+      "sha256": "ae8f4aa914d07f44457a6eebb6e11a209d2cbb64c5c41df5c45bf050bf4860ab",
+      "utc_coverage": {
+        "end": "2020-12-31T23:00:00+00:00",
+        "row_count": 8784,
+        "start": "2020-01-01T00:00:00+00:00",
+        "step": "PT1H"
+      }
+    }
+  ],
+  "original_timezone": "UTC",
+  "output": {
+    "path": "data/demand_profile.csv",
+    "sha256": "0620149d343737d11c6170f6796b9a9b003b51f467a869d5e67e5bd2bd8f1c28"
+  },
+  "parameters": {
+    "base_electrical_load_w_per_m2": 12.0,
+    "floor_area_m2": 10000,
+    "lighting_end_local_hour": 22,
+    "lighting_start_local_hour": 6,
+    "maximum_daylight_dimming_fraction": 0.8,
+    "operating_timezone": "Europe/Amsterdam",
+    "peak_lighting_w_per_m2": 120.0,
+    "target_timezone": "UTC",
+    "target_year": 2023
+  },
+  "provenance_status": "derived-materialization",
+  "row_count": 8760,
+  "schema_version": "source-provenance-v1",
+  "source": {
+    "name": "scenarios.derive_electrical_demand",
+    "url": null
+  },
+  "transformations": [
+    "source_utc_calendar_transplant",
+    "target_utc_to_Europe_Amsterdam_for_lighting",
+    "seasonal_cosine_envelope",
+    "local_06:00_to_22:00_photoperiod",
+    "irradiance_daylight_dimming",
+    "add_constant_base_load"
+  ],
+  "units": {
+    "P_elec_kW": "kW"
+  },
+  "utc_coverage": {
+    "end": "2023-12-31T23:00:00+00:00",
+    "row_count": 8760,
+    "start": "2023-01-01T00:00:00+00:00",
+    "step": "PT1H"
+  }
+}
