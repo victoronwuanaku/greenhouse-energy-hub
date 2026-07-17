@@ -993,6 +993,83 @@ def test_experiment_configuration_constructs_one_asset_capability_owner():
     assert config.capabilities.thermal_store is False
 
 
+def test_execute_experiment_captures_package_initializers_and_their_dirty_state(
+    monkeypatch,
+    tmp_path,
+):
+    from datetime import datetime
+    import subprocess
+
+    from experiments import run_scenario
+
+    repository = tmp_path / "repository"
+    required_initializers = {
+        "src/greenhouse_energy_hub/__init__.py",
+        "src/greenhouse_energy_hub/controllers/__init__.py",
+    }
+    executable_paths = set(
+        run_scenario.executable_paths_for_controller("baseline")
+    ) | required_initializers
+    for relative_path in executable_paths:
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# committed executable input\n", encoding="utf-8")
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Task 10 Test"),
+        ("git", "config", "user.email", "task10@example.invalid"),
+        ("git", "add", "."),
+        ("git", "commit", "-qm", "fixture"),
+    ):
+        subprocess.run(
+            command,
+            cwd=repository,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    dirty_initializer = "src/greenhouse_energy_hub/__init__.py"
+    (repository / dirty_initializer).write_text(
+        "# dirty executable input\n",
+        encoding="utf-8",
+    )
+    observed = {}
+    real_capture = run_scenario._capture_publication_context
+
+    class CaptureComplete(Exception):
+        pass
+
+    def capture_then_stop(paths, *, repository_root):
+        context = real_capture(paths, repository_root=repository_root)
+        observed["paths"] = tuple(paths)
+        observed["code_provenance"] = context.code_provenance
+        raise CaptureComplete
+
+    monkeypatch.setattr(
+        run_scenario,
+        "_capture_publication_context",
+        capture_then_stop,
+    )
+
+    with pytest.raises(CaptureComplete):
+        run_scenario.execute_experiment(
+            name="capture-only",
+            operating_start=datetime.fromisoformat("2023-01-02T00:00:00+01:00"),
+            calendar_days=1,
+            controller_name="baseline",
+            scenario_max_horizon_steps=24,
+            repository_root=repository,
+            results_root=repository / "results",
+        )
+
+    assert required_initializers.issubset(observed["paths"])
+    provenance = observed["code_provenance"]
+    assert provenance["publication_eligible"] is False
+    assert provenance["dirty_executable_paths"] == (dirty_initializer,)
+    assert set(provenance["executable_path_hashes"]) >= required_initializers
+
+
 def test_publication_candidate_map_records_only_a_verified_full_identifier(
     monkeypatch,
     tmp_path,

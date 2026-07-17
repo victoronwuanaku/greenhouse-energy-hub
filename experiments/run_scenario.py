@@ -53,6 +53,8 @@ CANDIDATE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 DEFAULT_HORIZON_STEPS = 24
 
 CORE_EXECUTABLE_PATHS = (
+    "src/greenhouse_energy_hub/__init__.py",
+    "src/greenhouse_energy_hub/controllers/__init__.py",
     "src/greenhouse_energy_hub/evaluation.py",
     "src/greenhouse_energy_hub/scenarios.py",
     "src/greenhouse_energy_hub/hub.py",
