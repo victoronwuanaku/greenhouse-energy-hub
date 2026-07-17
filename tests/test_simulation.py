@@ -30,14 +30,37 @@ def _boundary_violations(source: str, origin: str) -> list[str]:
     """Return forbidden repository-root imports and interpreter path mutations."""
     tree = ast.parse(source, filename=origin)
     forbidden_roots = {"models", "control", "accounting"}
+    system_modules: set[str] = set()
+    system_paths: set[str] = set()
+    importlib_modules: set[str] = set()
+    import_module_functions: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "sys":
+                    system_modules.add(alias.asname or alias.name)
+                elif alias.name == "importlib":
+                    importlib_modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "sys":
+            for alias in node.names:
+                if alias.name == "path":
+                    system_paths.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_module_functions.add(alias.asname or alias.name)
+
     violations: list[str] = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "path"
             and isinstance(node.value, ast.Name)
-            and node.value.id == "sys"
+            and node.value.id in system_modules
         ):
+            violations.append(f"{origin}:{node.lineno}: interpreter path access")
+        elif isinstance(node, ast.Name) and node.id in system_paths:
             violations.append(f"{origin}:{node.lineno}: interpreter path access")
         elif isinstance(node, ast.Import):
             for alias in node.names:
@@ -46,7 +69,48 @@ def _boundary_violations(source: str, origin: str) -> list[str]:
         elif isinstance(node, ast.ImportFrom) and node.module:
             if node.module.split(".", 1)[0] in forbidden_roots:
                 violations.append(f"{origin}:{node.lineno}: root import {node.module}")
+        elif isinstance(node, ast.Call) and node.args:
+            function = node.func
+            is_dynamic_import = (
+                isinstance(function, ast.Name)
+                and function.id in import_module_functions | {"__import__"}
+            ) or (
+                isinstance(function, ast.Attribute)
+                and function.attr == "import_module"
+                and isinstance(function.value, ast.Name)
+                and function.value.id in importlib_modules
+            )
+            module_name = node.args[0]
+            if (
+                is_dynamic_import
+                and isinstance(module_name, ast.Constant)
+                and isinstance(module_name.value, str)
+                and module_name.value.split(".", 1)[0] in forbidden_roots
+            ):
+                violations.append(
+                    f"{origin}:{node.lineno}: dynamic root import {module_name.value}"
+                )
     return violations
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import sys as runtime\nruntime.path.insert(0, '.')\n",
+        "from sys import path as runtime_path\nruntime_path.insert(0, '.')\n",
+        (
+            "import importlib as loader\n"
+            f"loader.import_module({('mod' + 'els.hub_model')!r})\n"
+        ),
+        (
+            "from importlib import import_module as load_module\n"
+            f"load_module({('con' + 'trol.mpc')!r})\n"
+        ),
+        f"__import__({('account' + 'ing')!r})\n",
+    ),
+)
+def test_boundary_guard_rejects_aliased_paths_and_constant_dynamic_imports(source):
+    assert _boundary_violations(source, "characterization.py")
 
 
 def test_project_sources_use_only_installed_package_imports():
