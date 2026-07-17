@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ast
+import json
+from pathlib import Path
+import subprocess
+import venv
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -18,6 +24,102 @@ INPUT_NAMES = (
     "Q_tes_dis",
     "vent",
 )
+
+
+def _boundary_violations(source: str, origin: str) -> list[str]:
+    """Return forbidden repository-root imports and interpreter path mutations."""
+    tree = ast.parse(source, filename=origin)
+    forbidden_roots = {"models", "control", "accounting"}
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "path"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            violations.append(f"{origin}:{node.lineno}: interpreter path access")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".", 1)[0] in forbidden_roots:
+                    violations.append(f"{origin}:{node.lineno}: root import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".", 1)[0] in forbidden_roots:
+                violations.append(f"{origin}:{node.lineno}: root import {node.module}")
+    return violations
+
+
+def test_project_sources_use_only_installed_package_imports():
+    repository_root = Path(__file__).resolve().parent.parent
+    violations: list[str] = []
+    for directory in ("src", "experiments", "scripts", "tests"):
+        for path in sorted((repository_root / directory).rglob("*.py")):
+            violations.extend(
+                _boundary_violations(
+                    path.read_text(encoding="utf-8"),
+                    str(path.relative_to(repository_root)),
+                )
+            )
+
+    notebook_path = repository_root / "notebooks" / "results_analysis.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    for index, cell in enumerate(notebook["cells"]):
+        if cell.get("cell_type") == "code":
+            violations.extend(
+                _boundary_violations(
+                    "".join(cell.get("source", [])),
+                    f"{notebook_path.relative_to(repository_root)}:cell-{index}",
+                )
+            )
+
+    assert violations == []
+
+
+def test_editable_install_imports_all_owning_modules_outside_repository(tmp_path):
+    repository_root = Path(__file__).resolve().parent.parent
+    environment = tmp_path / "installed-package"
+    outside_repository = tmp_path / "outside-repository"
+    outside_repository.mkdir()
+    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(environment)
+    python = environment / "bin" / "python"
+
+    subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "-e",
+            str(repository_root),
+        ],
+        cwd=outside_repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    module_names = (
+        "greenhouse_energy_hub.hub",
+        "greenhouse_energy_hub.simulation",
+        "greenhouse_energy_hub.scenarios",
+        "greenhouse_energy_hub.evaluation",
+    )
+    probe = (
+        "import importlib, pathlib\n"
+        f"expected = pathlib.Path({str(repository_root / 'src')!r}).resolve()\n"
+        f"names = {module_names!r}\n"
+        "for name in names:\n"
+        "    module_path = pathlib.Path(importlib.import_module(name).__file__).resolve()\n"
+        "    assert module_path.is_relative_to(expected), (name, module_path, expected)\n"
+    )
+    subprocess.run(
+        [str(python), "-c", probe],
+        cwd=outside_repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _test_diagnostics(forecast, **overrides):

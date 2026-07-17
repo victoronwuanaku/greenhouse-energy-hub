@@ -12,23 +12,20 @@ Two groups of tests:
 Run:  pytest tests/ -q
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-from greenhouse_energy_hub.hub import (  # noqa: E402
+from greenhouse_energy_hub.hub import (
     hub_dynamics, initial_state, state_bounds, input_bounds,
     ETA_ELZ, ETA_FC_E, E_H2_LHV_KWH_KG,
     BAT_CAPACITY_KWH, H2_CAPACITY_KG, TES_CAPACITY_KWH,
     T_HARD_MIN_C, T_HARD_MAX_C,
 )
 
+ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
 
 
