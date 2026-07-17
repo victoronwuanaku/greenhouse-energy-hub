@@ -458,6 +458,49 @@ def test_shared_thermal_charge_margin_is_signed_and_validated_numerically():
     ]
 
 
+def test_legacy_wrapper_delegates_physics_and_conversions_to_shared_owners():
+    """Prevent compatibility metrics from becoming a second equation owner."""
+    import ast
+    import inspect
+    import textwrap
+
+    import models.hub_model as hub_model
+
+    wrapper_tree = ast.parse(
+        textwrap.dedent(inspect.getsource(hub_model.hub_dynamics))
+    )
+    expression_tree = ast.parse(
+        textwrap.dedent(inspect.getsource(hub_model.hub_step_expressions))
+    )
+
+    def called_functions(tree):
+        return {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+    wrapper_calls = called_functions(wrapper_tree)
+    expression_calls = called_functions(expression_tree)
+    wrapper_names = {
+        node.id for node in ast.walk(wrapper_tree) if isinstance(node, ast.Name)
+    }
+
+    assert {"advance_hub", "_hub_conversions"} <= wrapper_calls
+    assert "_hub_conversions" in expression_calls
+    assert wrapper_names.isdisjoint(
+        {
+            "HP_COP",
+            "ETA_EBOILER",
+            "ETA_ELZ",
+            "ETA_FC_E",
+            "ETA_FC_H",
+            "E_H2_LHV_KWH_KG",
+        }
+    )
+    assert not hasattr(hub_model, "fuel_cell_outputs")
+
+
 # ---------------------------------------------------------------------------
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------

@@ -910,6 +910,126 @@ def test_disabled_asset_configuration_is_exact_zero_capacity(
         assert control_bounds(config)[field] == (0.0, 0.0)
 
 
+@pytest.mark.parametrize("signed_value", [5e-7, -5e-7])
+@pytest.mark.parametrize(
+    ("capability", "state_field"),
+    [
+        ("battery", "soc_battery_kwh"),
+        ("hydrogen", "soc_hydrogen_kg"),
+        ("thermal_store", "soc_thermal_kwh"),
+    ],
+)
+def test_public_successor_validator_rejects_every_nonzero_disabled_state(
+    capability, state_field, signed_value
+):
+    from models.hub_model import (
+        AssetCapabilities,
+        HubConfiguration,
+        HubState,
+        initial_state,
+        validate_successor,
+    )
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+    state = initial_state(config)
+    nonzero_state = HubState(
+        **{**state.__dict__, state_field: signed_value}
+    )
+
+    issues = validate_successor(
+        nonzero_state,
+        config,
+        require_operational_storage=False,
+        tolerance=1e-4,
+    )
+
+    assert [(issue.code, issue.field) for issue in issues] == [
+        ("out_of_bounds", state_field)
+    ]
+
+
+@pytest.mark.parametrize("signed_value", [5e-7, -5e-7])
+@pytest.mark.parametrize(
+    ("capability", "control_field"),
+    [
+        ("battery", "battery_charge_kw"),
+        ("battery", "battery_discharge_kw"),
+        ("hydrogen", "electrolyser_kw"),
+        ("hydrogen", "fuel_cell_kw"),
+        ("thermal_store", "thermal_charge_kw"),
+        ("thermal_store", "thermal_discharge_kw"),
+    ],
+)
+def test_public_control_validator_rejects_every_nonzero_disabled_control(
+    capability, control_field, signed_value
+):
+    from models.hub_model import (
+        AssetCapabilities,
+        HubConfiguration,
+        HubControl,
+        validate_control,
+    )
+
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+    control = HubControl(
+        **{**_zero_control().__dict__, control_field: signed_value}
+    )
+
+    issues = validate_control(control, config, tolerance=1e-4)
+
+    assert [(issue.code, issue.field) for issue in issues] == [
+        ("out_of_bounds", control_field)
+    ]
+
+
+@pytest.mark.parametrize("signed_value", [5e-7, -5e-7])
+@pytest.mark.parametrize(
+    ("capability", "control_field"),
+    [
+        ("battery", "battery_charge_kw"),
+        ("battery", "battery_discharge_kw"),
+        ("hydrogen", "electrolyser_kw"),
+        ("hydrogen", "fuel_cell_kw"),
+        ("thermal_store", "thermal_charge_kw"),
+        ("thermal_store", "thermal_discharge_kw"),
+    ],
+)
+def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording(
+    monkeypatch, hourly_frame, capability, control_field, signed_value
+):
+    import control.rolling_horizon as rolling_horizon
+    from control.rolling_horizon import ControlDecision, ValidRun
+    from models.hub_model import AssetCapabilities, HubConfiguration, HubControl
+
+    raw_control = HubControl(
+        **{**_zero_control().__dict__, control_field: signed_value}
+    )
+
+    def decide(_self, _state, forecast):
+        return ControlDecision(
+            control=raw_control,
+            diagnostics=_test_diagnostics(forecast),
+        )
+
+    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    config = HubConfiguration(
+        capabilities=AssetCapabilities(**{capability: False})
+    )
+
+    outcome = rolling_horizon.run_simulation(
+        hourly_frame.iloc[:1],
+        mode="baseline",
+        hub_config=config,
+    )
+
+    assert isinstance(outcome, ValidRun)
+    assert getattr(outcome.records[0].control, control_field) == 0.0
+
+
 @pytest.mark.parametrize(
     ("capability", "state_field", "control_fields", "disabled_commands"),
     [

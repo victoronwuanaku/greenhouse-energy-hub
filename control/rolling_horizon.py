@@ -936,9 +936,27 @@ def simulate_run(
                 diagnostics,
             )
 
-        # Gate 2: validate and normalize the returned control before physics.
+        # Gate 2: absorb only accepted solver-bound noise, including residuals on
+        # Disabled Asset fields, then apply the exact configured public validator.
+        try:
+            control = normalize_control(
+                decision.control,
+                hub_config,
+                zero_small_flows=False,
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "invalid_control",
+                f"control normalization failed: {exc}",
+                records,
+                diagnostics,
+            )
         control_issues = validate_control(
-            decision.control,
+            control,
             hub_config,
             tolerance=SOLVER_BOUND_TOLERANCE_KW,
         )
@@ -953,11 +971,6 @@ def simulate_run(
                 records,
                 diagnostics,
             )
-        control = normalize_control(
-            decision.control,
-            hub_config,
-            zero_small_flows=False,
-        )
 
         # Gate 3: evaluate existing hub physics only after the control is accepted.
         try:

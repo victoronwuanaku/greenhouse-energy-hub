@@ -193,6 +193,22 @@ class HubStep:
     flows: HubFlows
 
 
+@dataclass(frozen=True)
+class _HubConversions:
+    battery_charge_kw: object
+    battery_discharge_kw: object
+    electrolyser_kw: object
+    fuel_cell_kw: object
+    thermal_charge_kw: object
+    thermal_discharge_kw: object
+    heat_pump_heat_kw: object
+    electric_boiler_heat_kw: object
+    fuel_cell_heat_kw: object
+    generated_heat_kw: object
+    hydrogen_production_kg_per_h: object
+    hydrogen_consumption_kg_per_h: object
+
+
 STATE_MODEL_NAMES = {
     "soc_battery_kwh": "SOC_bat",
     "soc_hydrogen_kg": "SOC_h2",
@@ -413,12 +429,49 @@ def input_bounds(
 # ---------------------------------------------------------------------------
 # Derived hub quantities (shared by plant and symbolic model)
 # ---------------------------------------------------------------------------
-def fuel_cell_outputs(P_fc):
-    """Fuel-cell H2 chemical draw [kW], H2 mass rate [kg/h], recovered heat [kW]."""
-    h2_chem_kW = P_fc / ETA_FC_E
-    m_h2_kg_h = h2_chem_kW / E_H2_LHV_KWH_KG
-    Q_fc_heat = ETA_FC_H * h2_chem_kW
-    return h2_chem_kW, m_h2_kg_h, Q_fc_heat
+def _hub_conversions(
+    control: HubControl,
+    config: HubConfiguration,
+) -> _HubConversions:
+    """Apply capabilities and own every asset conversion expression once."""
+    capabilities = config.capabilities
+    battery_charge = (
+        control.battery_charge_kw if capabilities.battery else 0.0
+    )
+    battery_discharge = (
+        control.battery_discharge_kw if capabilities.battery else 0.0
+    )
+    electrolyser = control.electrolyser_kw if capabilities.hydrogen else 0.0
+    fuel_cell = control.fuel_cell_kw if capabilities.hydrogen else 0.0
+    thermal_charge = (
+        control.thermal_charge_kw if capabilities.thermal_store else 0.0
+    )
+    thermal_discharge = (
+        control.thermal_discharge_kw if capabilities.thermal_store else 0.0
+    )
+
+    heat_pump_heat = HP_COP * control.heat_pump_kw
+    electric_boiler_heat = ETA_EBOILER * control.electric_boiler_kw
+    hydrogen_consumption = fuel_cell / ETA_FC_E / E_H2_LHV_KWH_KG
+    fuel_cell_heat = ETA_FC_H * fuel_cell / ETA_FC_E
+    hydrogen_production = ETA_ELZ * electrolyser / E_H2_LHV_KWH_KG
+
+    return _HubConversions(
+        battery_charge_kw=battery_charge,
+        battery_discharge_kw=battery_discharge,
+        electrolyser_kw=electrolyser,
+        fuel_cell_kw=fuel_cell,
+        thermal_charge_kw=thermal_charge,
+        thermal_discharge_kw=thermal_discharge,
+        heat_pump_heat_kw=heat_pump_heat,
+        electric_boiler_heat_kw=electric_boiler_heat,
+        fuel_cell_heat_kw=fuel_cell_heat,
+        generated_heat_kw=(
+            heat_pump_heat + electric_boiler_heat + fuel_cell_heat
+        ),
+        hydrogen_production_kg_per_h=hydrogen_production,
+        hydrogen_consumption_kg_per_h=hydrogen_consumption,
+    )
 
 
 def greenhouse_temperature_next(T_in, Q_air, vent, T_out):
@@ -476,12 +529,7 @@ def hub_dynamics(
         irradiance_w_per_m2=p.get("G_Wm2", 0.0),
     )
     step = advance_hub(state, control, exogenous, config)
-
-    heat_pump_heat = HP_COP * control.heat_pump_kw
-    electric_boiler_heat = ETA_EBOILER * control.electric_boiler_kw
-    fuel_cell_heat = (
-        step.flows.generated_heat_kw - heat_pump_heat - electric_boiler_heat
-    )
+    conversions = _hub_conversions(control, config)
     grid_kw = step.flows.grid_kw
     reached_temperature = step.successor.indoor_temperature_c
     thermal_charge_excess = max(0.0, step.flows.thermal_charge_margin_kw)
@@ -497,9 +545,9 @@ def hub_dynamics(
             "P_grid_kW": grid_kw,
             "elec_residual_kW": 0.0,
             "tes_charge_excess_kW": thermal_charge_excess,
-            "Q_hp_kW": heat_pump_heat,
-            "Q_eboiler_kW": electric_boiler_heat,
-            "Q_fc_heat_kW": fuel_cell_heat,
+            "Q_hp_kW": conversions.heat_pump_heat_kw,
+            "Q_eboiler_kW": conversions.electric_boiler_heat_kw,
+            "Q_fc_heat_kW": conversions.fuel_cell_heat_kw,
             "Q_air_kW": step.flows.heat_to_air_kw,
             "m_h2_prod_kg_h": step.flows.hydrogen_production_kg_per_h,
             "m_h2_fc_kg_h": step.flows.hydrogen_consumption_kg_per_h,
@@ -545,27 +593,7 @@ def hub_step_expressions(
 ) -> HubStep:
     """Return one physical step using float- and CasADi-compatible arithmetic."""
     capabilities = config.capabilities
-    battery_charge = (
-        control.battery_charge_kw if capabilities.battery else 0.0
-    )
-    battery_discharge = (
-        control.battery_discharge_kw if capabilities.battery else 0.0
-    )
-    electrolyser = control.electrolyser_kw if capabilities.hydrogen else 0.0
-    fuel_cell = control.fuel_cell_kw if capabilities.hydrogen else 0.0
-    thermal_charge = (
-        control.thermal_charge_kw if capabilities.thermal_store else 0.0
-    )
-    thermal_discharge = (
-        control.thermal_discharge_kw if capabilities.thermal_store else 0.0
-    )
-
-    heat_pump_heat = HP_COP * control.heat_pump_kw
-    electric_boiler_heat = ETA_EBOILER * control.electric_boiler_kw
-    hydrogen_consumption = fuel_cell / ETA_FC_E / E_H2_LHV_KWH_KG
-    fuel_cell_heat = ETA_FC_H * fuel_cell / ETA_FC_E
-    hydrogen_production = ETA_ELZ * electrolyser / E_H2_LHV_KWH_KG
-    generated_heat = heat_pump_heat + electric_boiler_heat + fuel_cell_heat
+    conversions = _hub_conversions(control, config)
     solar_heat = (
         SOLAR_GAIN_FRAC
         * exogenous.irradiance_w_per_m2
@@ -573,36 +601,43 @@ def hub_step_expressions(
         / 1000.0
     )
     heat_to_air = (
-        generated_heat - thermal_charge + thermal_discharge + solar_heat
+        conversions.generated_heat_kw
+        - conversions.thermal_charge_kw
+        + conversions.thermal_discharge_kw
+        + solar_heat
     )
     grid_kw = (
         exogenous.electric_load_kw
-        + battery_charge
-        + electrolyser
+        + conversions.battery_charge_kw
+        + conversions.electrolyser_kw
         + control.heat_pump_kw
         + control.electric_boiler_kw
         - exogenous.pv_kw
-        - battery_discharge
-        - fuel_cell
+        - conversions.battery_discharge_kw
+        - conversions.fuel_cell_kw
     )
 
     soc_battery_next = (
         state.soc_battery_kwh
-        + ETA_BAT_CH * battery_charge * DT_H
-        - battery_discharge / ETA_BAT_DIS * DT_H
+        + ETA_BAT_CH * conversions.battery_charge_kw * DT_H
+        - conversions.battery_discharge_kw / ETA_BAT_DIS * DT_H
         if capabilities.battery
         else 0.0
     )
     soc_hydrogen_next = (
         state.soc_hydrogen_kg
-        + (hydrogen_production - hydrogen_consumption) * DT_H
+        + (
+            conversions.hydrogen_production_kg_per_h
+            - conversions.hydrogen_consumption_kg_per_h
+        )
+        * DT_H
         if capabilities.hydrogen
         else 0.0
     )
     soc_thermal_next = (
         ETA_TES_STANDING * state.soc_thermal_kwh
-        + thermal_charge * DT_H
-        - thermal_discharge * DT_H
+        + conversions.thermal_charge_kw * DT_H
+        - conversions.thermal_discharge_kw * DT_H
         if capabilities.thermal_store
         else 0.0
     )
@@ -622,11 +657,17 @@ def hub_step_expressions(
         ),
         flows=HubFlows(
             grid_kw=grid_kw,
-            generated_heat_kw=generated_heat,
+            generated_heat_kw=conversions.generated_heat_kw,
             heat_to_air_kw=heat_to_air,
-            thermal_charge_margin_kw=thermal_charge - generated_heat,
-            hydrogen_production_kg_per_h=hydrogen_production,
-            hydrogen_consumption_kg_per_h=hydrogen_consumption,
+            thermal_charge_margin_kw=(
+                conversions.thermal_charge_kw - conversions.generated_heat_kw
+            ),
+            hydrogen_production_kg_per_h=(
+                conversions.hydrogen_production_kg_per_h
+            ),
+            hydrogen_consumption_kg_per_h=(
+                conversions.hydrogen_consumption_kg_per_h
+            ),
         ),
     )
 
@@ -691,7 +732,8 @@ def validate_control(
     bounds = control_bounds(config)
     for field_name, value in values.items():
         lower, upper = bounds[field_name]
-        field_tolerance = (
+        exact_zero_bound = lower == 0.0 and upper == 0.0
+        field_tolerance = 0.0 if exact_zero_bound else (
             tolerance
             if field_name != "ventilation_fraction"
             else BALANCE_STATE_TOLERANCE
@@ -783,7 +825,13 @@ def validate_successor(
     )
     for field_name, value in values.items():
         lower, upper = bounds[field_name]
-        if value < lower - tolerance or value > upper + tolerance:
+        field_tolerance = (
+            0.0 if lower == 0.0 and upper == 0.0 else tolerance
+        )
+        if (
+            value < lower - field_tolerance
+            or value > upper + field_tolerance
+        ):
             issues.append(
                 ValidationIssue(
                     code="out_of_bounds",
