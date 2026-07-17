@@ -2032,8 +2032,8 @@ def test_legacy_entry_points_no_longer_write_mutable_csv_or_figure_artifacts():
     rolling_source = inspect.getsource(run_scenario.main)
     ablation_source = inspect.getsource(ablations.main)
     assert ".to_csv(" not in rolling_source
-    assert "baseline_results.csv" not in rolling_source
-    assert "mpc_results.csv" not in rolling_source
+    for controller in ("baseline", "mpc"):
+        assert f"{controller}_results.csv" not in rolling_source
     assert "summary.csv" not in rolling_source
     assert ".to_csv(" not in ablation_source
     assert "ablations.csv" not in ablation_source

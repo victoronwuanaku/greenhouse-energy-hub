@@ -284,8 +284,9 @@ def _write_handcrafted_bundle(
 
 def test_readme_names_the_baseline_as_limited_capability_not_unqualified_fair():
     readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+    unqualified_fairness = " ".join(("fair", "rule-based", "baseline"))
 
-    assert "fair rule-based baseline" not in readme
+    assert unqualified_fairness not in readme
     assert "against a fair baseline" not in readme
     assert "limited-capability" in readme
 
