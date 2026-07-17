@@ -594,12 +594,14 @@ def test_generated_bundle_full_scope_evidence():
         ), key
 
 
-def test_publisher_builds_the_exact_verified_full_id_recipe():
+def test_publisher_builds_the_exact_verified_full_id_recipe(tmp_path):
     from greenhouse_energy_hub.evaluation import build_publication_manifest
 
     candidates = _generated_publication_candidates()
+    candidate_index = tmp_path / "publication-candidates.json"
+    candidate_index.write_text(json.dumps(candidates), encoding="utf-8")
     publication = build_publication_manifest(
-        CANDIDATE_INDEX,
+        candidate_index,
         runs_root=RUNS,
         repository_root=ROOT,
     )
