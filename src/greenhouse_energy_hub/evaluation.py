@@ -2994,7 +2994,7 @@ def _publication_bundle_section(
     return value
 
 
-def _validate_publication_candidate_semantics(
+def validate_publication_candidate_semantics(
     bundles: Mapping[str, RunBundle],
 ) -> None:
     """Enforce the exact approved publication-role and causal comparison matrix."""
@@ -3103,6 +3103,18 @@ def _validate_publication_candidate_semantics(
     ]
     if any(scenario != ablation_scenarios[0] for scenario in ablation_scenarios[1:]):
         raise ValueError("publication ablation Scenarios are not identical")
+    for section in ("runtime", "code_provenance"):
+        ablation_metadata = [
+            _publication_bundle_section(bundles[f"ablation-{variant}"], section)
+            for variant in ("full", "no-h2", "no-tes", "one-step")
+        ]
+        if any(
+            metadata != ablation_metadata[0]
+            for metadata in ablation_metadata[1:]
+        ):
+            raise ValueError(
+                f"publication ablation {section} mappings are not identical"
+            )
     if scenarios["winter-mpc"] != scenarios["ablation-full"]:
         raise ValueError(
             "publication direct/full winter MPC Scenarios are not semantically equal"
@@ -3156,6 +3168,18 @@ def _validate_publication_candidate_semantics(
         raise ValueError(
             "publication direct/full winter MPC evidence is not semantically equal"
         )
+    direct_member_hashes = _publication_bundle_section(
+        bundles["winter-mpc"], "member_hashes"
+    )
+    full_member_hashes = _publication_bundle_section(
+        bundles["ablation-full"], "member_hashes"
+    )
+    for member_name in ("trajectory.csv", "summary.json", "validation.json"):
+        if direct_member_hashes.get(member_name) != full_member_hashes.get(member_name):
+            raise ValueError(
+                "publication direct/full winter MPC result member differs: "
+                f"{member_name}"
+            )
 
 
 def _load_verified_publication_candidates(
@@ -3195,7 +3219,7 @@ def build_publication_manifest(
         runs_root=runs_root,
         repository_root=repository_root,
     )
-    _validate_publication_candidate_semantics(bundles)
+    validate_publication_candidate_semantics(bundles)
     validate_publication_bundles(bundles)
     return _publication_manifest_from_candidates(candidates)
 
@@ -3213,7 +3237,7 @@ def load_verified_publication_evidence(
         runs_root=runs_root,
         repository_root=repository_root,
     )
-    _validate_publication_candidate_semantics(bundles)
+    validate_publication_candidate_semantics(bundles)
     validate_publication_bundles(bundles)
     return PublicationEvidence(
         candidates=candidates,

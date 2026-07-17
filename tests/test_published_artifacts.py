@@ -178,6 +178,29 @@ def _generated_publication_candidates() -> dict[str, str]:
     return candidates
 
 
+def _verified_publication_bundles():
+    from greenhouse_energy_hub.evaluation import load_run_bundle, verify_run_bundle
+
+    bundles = {}
+    for key, identifier in _generated_publication_candidates().items():
+        loaded = load_run_bundle(RUNS, identifier, repository_root=ROOT)
+        bundles[key] = verify_run_bundle(
+            loaded.path,
+            expected_identifier=identifier,
+            repository_root=ROOT,
+        )
+    return bundles
+
+
+def _bundle_with_manifest(bundle, manifest):
+    return type(bundle)(
+        identifier=bundle.identifier,
+        specification_identifier=bundle.specification_identifier,
+        path=bundle.path,
+        manifest=manifest,
+    )
+
+
 def test_candidates_fall_back_to_the_committed_manifest_when_index_is_missing(tmp_path):
     from greenhouse_energy_hub.evaluation import read_publication_candidates
 
@@ -959,6 +982,72 @@ def test_publisher_rejects_otherwise_valid_bundles_swapped_between_semantic_role
             runs_root=RUNS,
             repository_root=ROOT,
         )
+
+
+def test_publisher_rejects_direct_full_swap_that_breaks_ablation_provenance(tmp_path):
+    from greenhouse_energy_hub.evaluation import build_publication_manifest
+
+    candidates = _generated_publication_candidates()
+    candidates["winter-mpc"], candidates["ablation-full"] = (
+        candidates["ablation-full"],
+        candidates["winter-mpc"],
+    )
+    candidate_index = tmp_path / "publication-candidates.json"
+    candidate_index.write_text(json.dumps(candidates), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="publication.*ablation.*provenance"):
+        build_publication_manifest(
+            candidate_index,
+            runs_root=RUNS,
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize("section", ["runtime", "code_provenance"])
+def test_publication_semantics_bind_ablation_runtime_and_code_provenance(section):
+    from greenhouse_energy_hub.evaluation import (
+        validate_publication_candidate_semantics,
+    )
+
+    bundles = _verified_publication_bundles()
+    candidate = bundles["ablation-no-h2"]
+    manifest = json.loads(
+        (candidate.path / "manifest.json").read_text(encoding="utf-8")
+    )
+    if section == "runtime":
+        manifest[section]["python"] = "different-runtime"
+    else:
+        manifest[section]["git_revision"] = "f" * 40
+    bundles["ablation-no-h2"] = _bundle_with_manifest(candidate, manifest)
+
+    with pytest.raises(ValueError, match=f"publication.*ablation.*{section}"):
+        validate_publication_candidate_semantics(bundles)
+
+
+def test_publication_semantics_bind_direct_full_result_members_only():
+    from greenhouse_energy_hub.evaluation import (
+        validate_publication_candidate_semantics,
+    )
+
+    bundles = _verified_publication_bundles()
+    direct = bundles["winter-mpc"]
+    altered_result_manifest = json.loads(
+        (direct.path / "manifest.json").read_text(encoding="utf-8")
+    )
+    altered_result_manifest["member_hashes"]["trajectory.csv"] = "f" * 64
+    bundles["winter-mpc"] = _bundle_with_manifest(direct, altered_result_manifest)
+
+    with pytest.raises(ValueError, match="publication.*direct/full.*trajectory.csv"):
+        validate_publication_candidate_semantics(bundles)
+
+    allowed_manifest = json.loads(
+        (direct.path / "manifest.json").read_text(encoding="utf-8")
+    )
+    allowed_manifest["member_hashes"]["diagnostics.json"] = "e" * 64
+    allowed_manifest["code_provenance"]["git_revision"] = "f" * 40
+    bundles["winter-mpc"] = _bundle_with_manifest(direct, allowed_manifest)
+
+    validate_publication_candidate_semantics(bundles)
 
 
 def test_committed_manifest_loading_rejects_semantically_swapped_roles():
