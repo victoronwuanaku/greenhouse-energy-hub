@@ -565,6 +565,10 @@ def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
     decision = adapter.decide(state, forecast)
 
     assert isinstance(decision, ControlDecision)
+    assert decision.diagnostics.solver_wall_seconds is not None
+    assert np.isfinite(decision.diagnostics.solver_wall_seconds)
+    assert decision.diagnostics.solver_wall_seconds >= 0.0
+    assert mpc.settings.nlpsol_opts["record_time"] is True
     required_statistics = (
         "success",
         "return_status",

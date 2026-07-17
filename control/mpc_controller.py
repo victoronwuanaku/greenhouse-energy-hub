@@ -470,6 +470,7 @@ def build_mpc(
             "t_wall_total",
         ],
         nlpsol_opts={
+            "record_time": True,
             "ipopt.print_level": 0,
             "ipopt.sb": "yes",
             "print_time": 0,
