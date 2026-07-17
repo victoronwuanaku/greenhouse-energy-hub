@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -270,7 +272,6 @@ def _write_handcrafted_bundle(
     return bundle_path, bundle_id
 
 
-@pytest.mark.xfail(strict=True, reason="PF-04: README calls a limited-capability Controller fair")
 def test_readme_names_the_baseline_as_limited_capability_not_unqualified_fair():
     readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
 
@@ -296,7 +297,6 @@ def test_every_baseline_run_manifest_contains_the_exact_capability_policy():
         assert manifest["controller"]["capability_policy"] == BASELINE_CAPABILITY_POLICY
 
 
-@pytest.mark.xfail(strict=True, reason="PF-04: causal claims do not cite ablation Run Bundles")
 def test_each_causal_claim_cites_its_corresponding_ablation_bundle():
     publication = json.loads(
         (ROOT / "results" / "publication_manifest.json").read_text(encoding="utf-8")
@@ -581,3 +581,190 @@ def test_generated_bundle_full_scope_evidence():
             re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in provenance["executable_path_hashes"].values()
         ), key
+
+
+def test_publisher_builds_the_exact_verified_full_id_recipe():
+    from experiments.publish_results import build_publication_manifest
+
+    candidates = _generated_publication_candidates()
+    publication = build_publication_manifest(
+        CANDIDATE_INDEX,
+        runs_root=RUNS,
+        repository_root=ROOT,
+    )
+
+    assert publication == {
+        "schema_version": "publication-manifest-v1",
+        "comparisons": {
+            "winter": {
+                "baseline_bundle_id": candidates["winter-baseline"],
+                "mpc_bundle_id": candidates["winter-mpc"],
+            },
+            "summer": {
+                "baseline_bundle_id": candidates["summer-baseline"],
+                "mpc_bundle_id": candidates["summer-mpc"],
+            },
+        },
+        "ablations": {
+            "full": candidates["ablation-full"],
+            "no-h2": candidates["ablation-no-h2"],
+            "no-tes": candidates["ablation-no-tes"],
+            "one-step": candidates["ablation-one-step"],
+        },
+        "figures": {
+            "fig1_cumulative_cost.png": [
+                candidates["winter-baseline"],
+                candidates["winter-mpc"],
+            ],
+            "fig2_grid_vs_price.png": [candidates["winter-mpc"]],
+            "fig3_soc_trajectories.png": [
+                candidates["winter-baseline"],
+                candidates["winter-mpc"],
+            ],
+            "fig4_temperature.png": [
+                candidates["winter-baseline"],
+                candidates["winter-mpc"],
+            ],
+            "fig5_heat_shifting.png": [candidates["winter-mpc"]],
+            "fig6_ablation.png": [
+                candidates["ablation-full"],
+                candidates["ablation-no-h2"],
+                candidates["ablation-no-tes"],
+                candidates["ablation-one-step"],
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("candidate_key", "candidate_value"),
+    [
+        ("unexpected", "0" * 64),
+        ("winter-mpc", "a" * 12),
+    ],
+)
+def test_publisher_rejects_extra_candidate_keys_and_identifier_prefixes(
+    tmp_path,
+    candidate_key,
+    candidate_value,
+):
+    from experiments.publish_results import build_publication_manifest
+
+    candidates = _generated_publication_candidates()
+    candidates[candidate_key] = candidate_value
+    candidate_index = tmp_path / "publication-candidates.json"
+    candidate_index.write_text(json.dumps(candidates), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        build_publication_manifest(
+            candidate_index,
+            runs_root=RUNS,
+            repository_root=ROOT,
+        )
+
+
+def test_publisher_rejects_dirty_provenance_and_policy_mismatch():
+    from experiments.publish_results import validate_publication_bundles
+    from greenhouse_energy_hub.evaluation import load_run_bundle
+
+    candidates = _generated_publication_candidates()
+    baseline = load_run_bundle(
+        RUNS,
+        candidates["winter-baseline"],
+        repository_root=ROOT,
+    )
+    mpc = load_run_bundle(
+        RUNS,
+        candidates["winter-mpc"],
+        repository_root=ROOT,
+    )
+
+    dirty_baseline = type(baseline)(
+        identifier=baseline.identifier,
+        specification_identifier=baseline.specification_identifier,
+        path=baseline.path,
+        manifest={
+            **baseline.manifest,
+            "code_provenance": {
+                **baseline.manifest["code_provenance"],
+                "publication_eligible": False,
+                "dirty_executable_paths": [
+                    "src/greenhouse_energy_hub/controllers/baseline.py"
+                ],
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="dirty|eligible"):
+        validate_publication_bundles(
+            {"winter-baseline": dirty_baseline, "winter-mpc": mpc}
+        )
+
+    mismatched_mpc = type(mpc)(
+        identifier=mpc.identifier,
+        specification_identifier=mpc.specification_identifier,
+        path=mpc.path,
+        manifest={
+            **mpc.manifest,
+            "evaluation_policy": {
+                **mpc.manifest["evaluation_policy"],
+                "version": "forged-policy-version",
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="Evaluation Policies"):
+        validate_publication_bundles(
+            {"winter-baseline": baseline, "winter-mpc": mismatched_mpc}
+        )
+
+
+def test_publication_manifest_retains_each_resolvable_bundle_in_the_proposed_commit():
+    from experiments.publish_results import (
+        publication_bundle_ids,
+        validate_committed_publication_bundles,
+    )
+    from greenhouse_energy_hub.evaluation import load_run_bundle
+
+    publication = json.loads(
+        (ROOT / "results" / "publication_manifest.json").read_text(encoding="utf-8")
+    )
+    identifiers = publication_bundle_ids(publication)
+
+    assert len(identifiers) == len(EXPECTED_PUBLICATION_CANDIDATE_KEYS)
+    validate_committed_publication_bundles(
+        publication,
+        runs_root=RUNS,
+        repository_root=ROOT,
+    )
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files", "--cached", "results/runs"],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+    )
+    assert {
+        f"results/runs/{bundle.path.name}/manifest.json"
+        for bundle in (
+            load_run_bundle(RUNS, identifier, repository_root=ROOT)
+            for identifier in identifiers
+        )
+    } <= tracked
+
+
+def test_publication_renderer_forces_a_noninteractive_backend():
+    rendered_backend = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import matplotlib; import experiments.publish_results; "
+            "print(matplotlib.get_backend())",
+        ],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip().casefold()
+
+    assert rendered_backend == "agg"

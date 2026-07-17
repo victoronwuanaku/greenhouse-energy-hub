@@ -1,0 +1,45 @@
+{
+  "schema_version": "publication-manifest-v1",
+  "comparisons": {
+    "winter": {
+      "baseline_bundle_id": "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
+      "mpc_bundle_id": "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    },
+    "summer": {
+      "baseline_bundle_id": "8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2",
+      "mpc_bundle_id": "5975dafc40c7bb296fa8861eb1e78b2afc21ff4eeff14ed3e2575b77768cecb1"
+    }
+  },
+  "ablations": {
+    "full": "9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a",
+    "no-h2": "9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97",
+    "no-tes": "787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de",
+    "one-step": "df487e8da6980b2d87c7629ee276d92952630f0feebfb6962d2b291838edc5ac"
+  },
+  "figures": {
+    "fig1_cumulative_cost.png": [
+      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
+      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    ],
+    "fig2_grid_vs_price.png": [
+      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    ],
+    "fig3_soc_trajectories.png": [
+      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
+      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    ],
+    "fig4_temperature.png": [
+      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
+      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    ],
+    "fig5_heat_shifting.png": [
+      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+    ],
+    "fig6_ablation.png": [
+      "9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a",
+      "9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97",
+      "787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de",
+      "df487e8da6980b2d87c7629ee276d92952630f0feebfb6962d2b291838edc5ac"
+    ]
+  }
+}
