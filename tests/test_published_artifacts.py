@@ -294,7 +294,11 @@ def test_bundle_verification_rejects_a_failed_validation_report(tmp_path):
         },
     )
     with pytest.raises(ValueError):
-        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+        verify_run_bundle(
+            bundle_path,
+            expected_identifier=bundle_id,
+            repository_root=ROOT,
+        )
 
 
 def test_bundle_verification_rejects_missing_solver_status(tmp_path):
@@ -308,7 +312,11 @@ def test_bundle_verification_rejects_missing_solver_status(tmp_path):
         ),
     )
     with pytest.raises(ValueError):
-        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+        verify_run_bundle(
+            bundle_path,
+            expected_identifier=bundle_id,
+            repository_root=ROOT,
+        )
 
 
 def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
@@ -319,7 +327,11 @@ def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
         publication_eligible=False,
     )
     with pytest.raises(ValueError):
-        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+        verify_run_bundle(
+            bundle_path,
+            expected_identifier=bundle_id,
+            repository_root=ROOT,
+        )
 
 
 def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
@@ -332,7 +344,11 @@ def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
     trajectory.write_bytes(bytes(changed))
 
     with pytest.raises(ValueError):
-        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+        verify_run_bundle(
+            bundle_path,
+            expected_identifier=bundle_id,
+            repository_root=ROOT,
+        )
 
 
 def test_bundle_verification_rejects_non_full_input_hashes(tmp_path):
@@ -347,7 +363,11 @@ def test_bundle_verification_rejects_non_full_input_hashes(tmp_path):
         },
     )
     with pytest.raises(ValueError, match="full lowercase SHA-256"):
-        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+        verify_run_bundle(
+            bundle_path,
+            expected_identifier=bundle_id,
+            repository_root=ROOT,
+        )
 
 
 @pytest.mark.parametrize("identifier_kind", ["shortened", "unknown"])
@@ -358,4 +378,4 @@ def test_publication_lookup_requires_a_known_full_bundle_identifier(tmp_path, id
     requested = bundle_id[:12] if identifier_kind == "shortened" else "f" * 64
 
     with pytest.raises((KeyError, ValueError, FileNotFoundError)):
-        load_run_bundle(tmp_path, requested)
+        load_run_bundle(tmp_path, requested, repository_root=ROOT)

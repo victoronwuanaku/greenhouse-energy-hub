@@ -714,6 +714,69 @@ def collect_code_provenance(
     }
 
 
+def _repository_relative_selector(value: object, description: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{description} must be a nonempty repository-relative path")
+    selector = Path(value)
+    if (
+        selector.is_absolute()
+        or ".." in selector.parts
+        or selector.as_posix() != value
+        or not selector.parts
+    ):
+        raise ValueError(f"{description} must be an exact repository-relative path")
+    return value
+
+
+def _git_object_bytes(
+    repository_root: str | Path,
+    revision: str,
+    relative_path: str,
+    description: str,
+) -> bytes:
+    _require_full_git_revision(revision, "recorded Git revision")
+    selector = _repository_relative_selector(relative_path, description)
+    root = Path(repository_root).resolve(strict=True)
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{selector}"],
+        cwd=root,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            f"recorded Git revision lacks authoritative {description}: {selector}"
+        )
+    return result.stdout
+
+
+def _require_full_git_revision(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ValueError(f"{field_name} must be a full 40-character object ID")
+    return value
+
+
+def _verify_git_hash_map(
+    repository_root: str | Path,
+    revision: str,
+    hashes: Mapping[str, str],
+    description: str,
+) -> None:
+    for relative_path, expected_hash in hashes.items():
+        committed_bytes = _git_object_bytes(
+            repository_root,
+            revision,
+            relative_path,
+            description,
+        )
+        if sha256_bytes(committed_bytes) != expected_hash:
+            raise ValueError(
+                f"authoritative Git {description} bytes do not match recorded hash: "
+                f"{relative_path}"
+            )
+
+
 @dataclass(frozen=True)
 class _PublicationContext:
     executable_paths: tuple[str, ...]
@@ -1595,7 +1658,10 @@ def _policy_from_manifest(value: object) -> EvaluationPolicy:
     return policy
 
 
-def _validate_identity_graph(manifest: dict[str, JSONValue]) -> tuple[
+def _validate_identity_graph(
+    manifest: dict[str, JSONValue],
+    repository_root: str | Path,
+) -> tuple[
     Scenario,
     HubConfiguration,
     EvaluationPolicy,
@@ -1640,9 +1706,9 @@ def _validate_identity_graph(manifest: dict[str, JSONValue]) -> tuple[
         or code["untracked_executable_paths"] != []
     ):
         raise ValueError("Run Bundle executable source is not publication-eligible")
-    revision = code["git_revision"]
-    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-        raise ValueError("Run Bundle Git revision must be a full object ID")
+    revision = _require_full_git_revision(
+        code["git_revision"], "Run Bundle Git revision"
+    )
     executable_hashes = _require_hash_mapping(
         code["executable_path_hashes"], "executable_path_hashes"
     )
@@ -1653,9 +1719,10 @@ def _validate_identity_graph(manifest: dict[str, JSONValue]) -> tuple[
     if executable_hashes != committed_hashes:
         raise ValueError("Run Bundle executable bytes differ from committed bytes")
     for path in executable_hashes:
-        selector = Path(path)
-        if selector.is_absolute() or ".." in selector.parts or selector.as_posix() != path:
-            raise ValueError("Run Bundle executable path selectors must be repository-relative")
+        _repository_relative_selector(
+            path,
+            "Run Bundle executable path selector",
+        )
     aggregate = sha256_bytes(canonical_json_bytes(executable_hashes))
     if code["executable_source_tree_sha256"] != aggregate:
         raise ValueError("Run Bundle executable source aggregate digest is invalid")
@@ -1681,6 +1748,30 @@ def _validate_identity_graph(manifest: dict[str, JSONValue]) -> tuple[
     expected_inputs = _scenario_input_hashes(_scenario_content(scenario))
     if input_hashes != expected_inputs:
         raise ValueError("Run Bundle scenario provenance/input hash graph is invalid")
+    source_hashes = _require_hash_mapping(
+        input_hashes["sources"], "input_hashes.sources"
+    )
+    sidecar_hashes = _require_hash_mapping(
+        input_hashes["sidecars"], "input_hashes.sidecars"
+    )
+    _verify_git_hash_map(
+        repository_root,
+        revision,
+        executable_hashes,
+        "executable/configuration input",
+    )
+    _verify_git_hash_map(
+        repository_root,
+        revision,
+        source_hashes,
+        "Scenario source input",
+    )
+    _verify_git_hash_map(
+        repository_root,
+        revision,
+        sidecar_hashes,
+        "Scenario sidecar input",
+    )
 
     specification_content: dict[str, JSONValue] = {
         "schema_version": RUN_SPECIFICATION_SCHEMA_VERSION,
@@ -1708,6 +1799,7 @@ def _verify_bundle_directory(
     expected_identifier: str | None,
     *,
     enforce_path_identifier: bool,
+    repository_root: str | Path,
 ) -> RunBundle:
     from control.rolling_horizon import (
         DecisionDiagnostics,
@@ -1796,7 +1888,8 @@ def _verify_bundle_directory(
             "input_hashes.scenario",
         )
     scenario, hub_configuration, policy, controller = _validate_identity_graph(
-        manifest
+        manifest,
+        repository_root,
     )
 
     validation = _read_canonical_json(
@@ -1999,10 +2092,13 @@ def _verify_bundle_directory(
     _validate_publication_run_evidence(reconstructed)
     _validate_record_sequence(reconstructed)
     expected_validation = _validation_content(reconstructed)
-    if validation != expected_validation:
+    expected_validation_bytes = canonical_json_bytes(
+        _to_json_primitives(expected_validation, "recomputed validation")
+    )
+    if (bundle_path / "validation.json").read_bytes() != expected_validation_bytes:
         raise ValueError(
-            "Run Bundle validation/physics/control/flow evidence is not derived "
-            "from records"
+            "Run Bundle validation types/evidence are not canonical bytes derived "
+            "from records and physics"
         )
 
     for expected, (stored_step, diagnostics) in enumerate(
@@ -2035,8 +2131,13 @@ def _verify_bundle_directory(
         _summary_content(evaluate_run(reconstructed, policy)),
         "summary",
     )
-    if summary != expected_summary:
-        raise ValueError("Run Bundle summary does not match recomputed EvaluationReport")
+    if (bundle_path / "summary.json").read_bytes() != canonical_json_bytes(
+        expected_summary
+    ):
+        raise ValueError(
+            "Run Bundle summary types/content do not match canonical recomputed "
+            "EvaluationReport bytes"
+        )
     return RunBundle(
         identifier=bundle_identifier,
         specification_identifier=specification_identifier,
@@ -2048,12 +2149,15 @@ def _verify_bundle_directory(
 def verify_run_bundle(
     bundle_path: str | Path,
     expected_identifier: str | None = None,
+    *,
+    repository_root: str | Path,
 ) -> RunBundle:
     """Verify an authoritative full-ID Run Bundle and return immutable metadata."""
     return _verify_bundle_directory(
         Path(bundle_path),
         expected_identifier,
         enforce_path_identifier=True,
+        repository_root=repository_root,
     )
 
 
@@ -2134,13 +2238,11 @@ def _remove_owned_temporary(path: Path) -> None:
 
 def _assert_fresh_publication_inputs(
     specification: RunSpecification,
-    repository_root: str | Path | None,
+    repository_root: str | Path,
 ) -> None:
     actual_runtime = _actual_runtime_manifest()
     if _to_json_primitives(specification.runtime) != actual_runtime:
         raise ValueError("Run Specification runtime does not match the actual runtime")
-    if repository_root is None:
-        return
     recorded = _to_json_primitives(specification.code_provenance)
     assert isinstance(recorded, dict)
     path_hashes = recorded.get("executable_path_hashes")
@@ -2154,19 +2256,62 @@ def _assert_fresh_publication_inputs(
         raise ValueError(
             "Run Specification executable source changed or became dirty after capture"
         )
+    revision = _require_full_git_revision(
+        recorded.get("git_revision"),
+        "Run Specification Git revision",
+    )
+    input_hashes = _to_json_primitives(specification.input_hashes)
+    if not isinstance(input_hashes, dict):
+        raise ValueError("Run Specification input hashes are incomplete")
+    for field_name, description in (
+        ("sources", "Scenario source input"),
+        ("sidecars", "Scenario sidecar input"),
+    ):
+        hashes = _require_hash_mapping(
+            input_hashes.get(field_name),
+            f"input_hashes.{field_name}",
+        )
+        for relative_path, expected_hash in hashes.items():
+            normalized = _repository_relative_path(
+                relative_path,
+                Path(repository_root),
+            )
+            if normalized != relative_path:
+                raise ValueError(f"{description} path selector is not exact")
+            working_bytes = (Path(repository_root).resolve() / relative_path).read_bytes()
+            committed_bytes = _git_object_bytes(
+                repository_root,
+                revision,
+                relative_path,
+                description,
+            )
+            if (
+                sha256_bytes(working_bytes) != expected_hash
+                or sha256_bytes(committed_bytes) != expected_hash
+                or working_bytes != committed_bytes
+            ):
+                raise ValueError(
+                    f"{description} changed or became dirty after capture: "
+                    f"{relative_path}"
+                )
 
 
 def _verified_collision_winner(
     destination: Path,
     bundle_identifier: str,
     all_bytes: Mapping[str, bytes],
+    repository_root: str | Path,
 ) -> RunBundle:
     if destination.is_symlink() or not destination.is_dir():
         raise BundleCollisionError(
             f"Run Bundle destination is claimed by a non-bundle entry: {destination}"
         )
     try:
-        existing = verify_run_bundle(destination, bundle_identifier)
+        existing = verify_run_bundle(
+            destination,
+            bundle_identifier,
+            repository_root=repository_root,
+        )
     except (OSError, ValueError) as exc:
         raise BundleCollisionError(
             f"existing Run Bundle {bundle_identifier} failed verification"
@@ -2221,7 +2366,7 @@ def create_run_bundle(
     specification: RunSpecification,
     target_root: str | Path,
     *,
-    repository_root: str | Path | None = None,
+    repository_root: str | Path,
 ) -> RunBundle:
     """Persist one verified Valid Run through an owned atomic temporary directory."""
     from control.rolling_horizon import ValidRun
@@ -2284,6 +2429,7 @@ def create_run_bundle(
             temporary,
             bundle_identifier,
             enforce_path_identifier=False,
+            repository_root=repository_root,
         )
         assert candidate.identifier == bundle_identifier
 
@@ -2292,6 +2438,7 @@ def create_run_bundle(
                 destination,
                 bundle_identifier,
                 all_bytes,
+                repository_root,
             )
 
         try:
@@ -2303,14 +2450,24 @@ def create_run_bundle(
                 destination,
                 bundle_identifier,
                 all_bytes,
+                repository_root,
             )
         _fsync_directory(root)
-        return verify_run_bundle(destination, bundle_identifier)
+        return verify_run_bundle(
+            destination,
+            bundle_identifier,
+            repository_root=repository_root,
+        )
     finally:
         _remove_owned_temporary(temporary)
 
 
-def load_run_bundle(target_root: str | Path, identifier: str) -> RunBundle:
+def load_run_bundle(
+    target_root: str | Path,
+    identifier: str,
+    *,
+    repository_root: str | Path,
+) -> RunBundle:
     """Resolve only one exact full authoritative Run Bundle identifier."""
     _require_full_sha256(identifier, "requested Run Bundle identifier")
     root = Path(target_root)
@@ -2328,7 +2485,11 @@ def load_run_bundle(target_root: str | Path, identifier: str) -> RunBundle:
         raise BundleCollisionError(
             f"multiple Run Bundle directories claim identifier {identifier}"
         )
-    return verify_run_bundle(candidates[0], identifier)
+    return verify_run_bundle(
+        candidates[0],
+        identifier,
+        repository_root=repository_root,
+    )
 
 
 def write_failure_diagnostics(

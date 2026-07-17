@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import asdict, fields, replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,11 @@ BASELINE_CAPABILITY_POLICY = {
     "grid_battery_charging": False,
     "battery_discharge_price_threshold_eur_per_kwh": 0.12,
 }
+
+TEST_SOURCE_BYTES = b"timestamp,value\n2023-01-02T00:00:00Z,1.0\n"
+TEST_SIDECAR_BYTES = b'{"fixture":"sidecar"}\n'
+TEST_SOURCE_SHA256 = hashlib.sha256(TEST_SOURCE_BYTES).hexdigest()
+TEST_SIDECAR_SHA256 = hashlib.sha256(TEST_SIDECAR_BYTES).hexdigest()
 
 
 def _two_step_valid_run(
@@ -153,10 +159,10 @@ def _publication_ready_run(**run_options):
     provenance = SourceProvenance(
         source_name="test-source",
         source_path="data/test-source.csv",
-        sha256="1" * 64,
+        sha256=TEST_SOURCE_SHA256,
         acquisition_parameters={
             "sidecar_path": "data/test-source.provenance.json",
-            "sidecar_sha256": "2" * 64,
+            "sidecar_sha256": TEST_SIDECAR_SHA256,
             "parameters": {"fixture": "two-step"},
         },
         original_timezone="UTC",
@@ -220,8 +226,13 @@ def _committed_executable_repository(tmp_path: Path) -> Path:
         encoding="utf-8",
         newline="\n",
     )
+    (repository / "data").mkdir()
+    (repository / "data" / "test-source.csv").write_bytes(TEST_SOURCE_BYTES)
+    (repository / "data" / "test-source.provenance.json").write_bytes(
+        TEST_SIDECAR_BYTES
+    )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    subprocess.run(["git", "add", "runner.py"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(
         [
             "git",
@@ -267,6 +278,33 @@ def _rehash_bundle(bundle_path: Path) -> Path:
     return renamed
 
 
+def _rehash_specification_and_bundle(bundle_path: Path) -> Path:
+    """Recompute both public identities after an internally consistent forgery."""
+    from accounting import canonical_json_bytes, run_specification_identifier
+
+    manifest_path = bundle_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    specification_content = {
+        "schema_version": "run-specification-v1",
+        "canonicalization_version": "canonical-json-v1",
+        "scenario": manifest["scenario"],
+        "controller": manifest["controller"],
+        "asset_capabilities": manifest["asset_capabilities"],
+        "hub_configuration": {
+            "capabilities": manifest["asset_capabilities"],
+        },
+        "evaluation_policy": manifest["evaluation_policy"],
+        "code_provenance": manifest["code_provenance"],
+        "runtime": manifest["runtime"],
+        "input_hashes": manifest["input_hashes"],
+    }
+    manifest["run_specification_identifier"] = run_specification_identifier(
+        specification_content
+    )
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    return _rehash_bundle(bundle_path)
+
+
 def _rewrite_csv(path: Path, mutate) -> None:
     rows = list(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8"))))
     fieldnames = list(rows[0])
@@ -302,6 +340,7 @@ def _created_test_bundle(tmp_path: Path, *, controller_name: str = "baseline"):
         report,
         specification,
         tmp_path / "results" / "runs",
+        repository_root=repository,
     )
     return repository, run, report, specification, bundle
 
@@ -847,8 +886,10 @@ def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axi
     assert code_specification.publication_eligible is False
     assert base.input_hashes == {
         "scenario": base.input_hashes["scenario"],
-        "sources": {"data/test-source.csv": "1" * 64},
-        "sidecars": {"data/test-source.provenance.json": "2" * 64},
+        "sources": {"data/test-source.csv": TEST_SOURCE_SHA256},
+        "sidecars": {
+            "data/test-source.provenance.json": TEST_SIDECAR_SHA256
+        },
     }
     assert re.fullmatch(r"[0-9a-f]{64}", base.input_hashes["scenario"])
     assert set(base.runtime) == {
@@ -1071,7 +1112,7 @@ def test_valid_run_serialization_is_fixed_finite_utc_and_one_row_per_step():
 def test_bundle_verification_requires_exact_ordered_csv_headers(tmp_path, member):
     from accounting import verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
 
     def truncate(fieldnames, rows):
         removed = fieldnames.pop()
@@ -1081,7 +1122,7 @@ def test_bundle_verification_requires_exact_ordered_csv_headers(tmp_path, member
     _rewrite_csv(bundle.path / member, truncate)
     mutated = _rehash_bundle(bundle.path)
     with pytest.raises(ValueError, match="schema|header|columns"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 @pytest.mark.parametrize(
@@ -1108,7 +1149,7 @@ def test_bundle_verification_rejects_internally_rehashed_semantic_json_mutations
 ):
     from accounting import canonical_json_bytes, verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     path = bundle.path / member
     content = json.loads(path.read_text(encoding="utf-8"))
     mutation(content)
@@ -1116,7 +1157,7 @@ def test_bundle_verification_rejects_internally_rehashed_semantic_json_mutations
     mutated = _rehash_bundle(bundle.path)
 
     with pytest.raises(ValueError, match="summary|validation|evidence|schema"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 @pytest.mark.parametrize(
@@ -1137,7 +1178,7 @@ def test_bundle_verification_binds_controller_and_solver_semantics(
 ):
     from accounting import verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(
+    repository, _, _, _, bundle = _created_test_bundle(
         tmp_path,
         controller_name=controller_name,
     )
@@ -1148,7 +1189,7 @@ def test_bundle_verification_binds_controller_and_solver_semantics(
     _rewrite_csv(bundle.path / "controller_diagnostics.csv", contradict)
     mutated = _rehash_bundle(bundle.path)
     with pytest.raises(ValueError, match="controller|diagnostic|solver|status|adapter"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 @pytest.mark.parametrize(
@@ -1167,7 +1208,7 @@ def test_bundle_verification_recomputes_physics_and_record_continuity(
 ):
     from accounting import verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
 
     def change_physics(_fieldnames, rows):
         rows[0][column] = str(float(rows[0][column]) + 1.0)
@@ -1175,7 +1216,7 @@ def test_bundle_verification_recomputes_physics_and_record_continuity(
     _rewrite_csv(bundle.path / "trajectory.csv", change_physics)
     mutated = _rehash_bundle(bundle.path)
     with pytest.raises(ValueError, match="physics|flow|state|control|Scenario|continuity"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 @pytest.mark.parametrize(
@@ -1204,7 +1245,7 @@ def test_bundle_verification_reconstructs_the_complete_specification_identity_gr
 ):
     from accounting import canonical_json_bytes, verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     mutation(manifest)
@@ -1212,7 +1253,7 @@ def test_bundle_verification_reconstructs_the_complete_specification_identity_gr
     mutated = _rehash_bundle(bundle.path)
 
     with pytest.raises(ValueError, match="Specification|scenario|provenance|source|digest|input"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 @pytest.mark.parametrize(
@@ -1233,7 +1274,7 @@ def test_bundle_verification_rejects_unknown_nested_identity_fields(
 ):
     from accounting import canonical_json_bytes, verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest[section]["unknown_field"] = "forged"
@@ -1241,13 +1282,13 @@ def test_bundle_verification_rejects_unknown_nested_identity_fields(
     mutated = _rehash_bundle(bundle.path)
 
     with pytest.raises(ValueError, match="schema|unknown|incomplete|Specification"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
 
 
 def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_path):
     from accounting import canonical_json_bytes, verify_run_bundle
 
-    _, _, _, _, bundle = _created_test_bundle(tmp_path)
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["runtime"]["python"] = "forged-runtime"
@@ -1255,7 +1296,191 @@ def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_p
     mutated = _rehash_bundle(bundle.path)
 
     with pytest.raises(ValueError, match="runtime"):
-        verify_run_bundle(mutated)
+        verify_run_bundle(mutated, repository_root=repository)
+
+
+def test_create_run_bundle_requires_explicit_repository_authority(tmp_path):
+    import inspect
+
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run()
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    parameter = inspect.signature(create_run_bundle).parameters["repository_root"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError, match="repository_root"):
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            tmp_path / "results" / "runs",
+        )
+
+
+def test_verify_and_load_require_explicit_repository_authority(tmp_path):
+    import inspect
+
+    from accounting import load_run_bundle, verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    for function in (verify_run_bundle, load_run_bundle):
+        parameter = inspect.signature(function).parameters["repository_root"]
+        assert parameter.default is inspect.Parameter.empty
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError, match="repository_root"):
+        verify_run_bundle(bundle.path)
+    with pytest.raises(TypeError, match="repository_root"):
+        load_run_bundle(bundle.path.parent, bundle.identifier)
+
+
+@pytest.mark.parametrize(
+    ("member", "mutate"),
+    [
+        (
+            "summary.json",
+            lambda value: value["nominal"].update(
+                {"battery_wear_eur": False}
+            ),
+        ),
+        (
+            "validation.json",
+            lambda value: value["steps"][0].update({"control_valid": 1}),
+        ),
+    ],
+)
+def test_bundle_verification_is_type_exact_for_recomputed_members(
+    tmp_path,
+    member,
+    mutate,
+):
+    from accounting import canonical_json_bytes, verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    path = bundle.path / member
+    content = json.loads(path.read_text(encoding="utf-8"))
+    mutate(content)
+    path.write_bytes(canonical_json_bytes(content))
+    mutated = _rehash_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="summary|validation|type|canonical"):
+        verify_run_bundle(mutated, repository_root=repository)
+
+
+def test_authoritative_git_rejects_fully_rehashed_executable_map_forgery(tmp_path):
+    from accounting import canonical_json_bytes, sha256_bytes, verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged_map = {"missing/runner.py": "f" * 64}
+    manifest["code_provenance"].update(
+        {
+            "executable_path_hashes": forged_map,
+            "committed_executable_path_hashes": forged_map,
+            "executable_source_tree_sha256": sha256_bytes(
+                canonical_json_bytes(forged_map)
+            ),
+        }
+    )
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    mutated = _rehash_specification_and_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="Git|revision|executable|missing"):
+        verify_run_bundle(mutated, repository_root=repository)
+
+
+def test_authoritative_git_rejects_fully_rehashed_scenario_input_forgery(tmp_path):
+    from accounting import canonical_json_bytes, sha256_bytes, verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    provenance = manifest["scenario"]["provenance"][0]
+    provenance["sha256"] = "e" * 64
+    provenance["acquisition_parameters"]["sidecar_sha256"] = "f" * 64
+    manifest["input_hashes"] = {
+        "scenario": sha256_bytes(canonical_json_bytes(manifest["scenario"])),
+        "sources": {provenance["source_path"]: "e" * 64},
+        "sidecars": {
+            provenance["acquisition_parameters"]["sidecar_path"]: "f" * 64
+        },
+    }
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    mutated = _rehash_specification_and_bundle(bundle.path)
+
+    with pytest.raises(ValueError, match="Git|source|sidecar|provenance|input"):
+        verify_run_bundle(mutated, repository_root=repository)
+
+
+def test_historical_bundle_verification_uses_recorded_revision_not_current_head(
+    tmp_path,
+):
+    from accounting import verify_run_bundle
+
+    repository, _, _, _, bundle = _created_test_bundle(tmp_path)
+    (repository / "runner.py").write_text(
+        "def run():\n    return 'new-head'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    subprocess.run(["git", "add", "runner.py"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task 7 Test",
+            "-c",
+            "user.email=task7@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "new head",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    verified = verify_run_bundle(bundle.path, repository_root=repository)
+    assert verified.identifier == bundle.identifier
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["data/test-source.csv", "data/test-source.provenance.json"],
+)
+def test_creation_revalidates_scenario_source_bytes_after_capture(
+    tmp_path,
+    relative_path,
+):
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run()
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    (repository / relative_path).write_bytes(b"dirtied after capture\n")
+
+    with pytest.raises(ValueError, match="source|sidecar|input|changed|dirty"):
+        create_run_bundle(
+            run,
+            report,
+            specification,
+            tmp_path / "results" / "runs",
+            repository_root=repository,
+        )
 
 
 def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, monkeypatch):
@@ -1285,9 +1510,13 @@ def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, mon
         return real_fsync(descriptor)
 
     monkeypatch.setattr(accounting.os, "fsync", recording_fsync)
-    first = create_run_bundle(run, report, specification, runs_root)
+    first = create_run_bundle(
+        run, report, specification, runs_root, repository_root=repository
+    )
     inode = first.path.stat().st_ino
-    second = create_run_bundle(run, report, specification, runs_root)
+    second = create_run_bundle(
+        run, report, specification, runs_root, repository_root=repository
+    )
 
     assert first == second
     assert second.path.stat().st_ino == inode
@@ -1298,7 +1527,9 @@ def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, mon
 
     (first.path / "summary.json").write_bytes(b"{}")
     with pytest.raises(BundleCollisionError):
-        create_run_bundle(run, report, specification, runs_root)
+        create_run_bundle(
+            run, report, specification, runs_root, repository_root=repository
+        )
 
 
 @pytest.mark.parametrize("claimant_kind", ["empty-directory", "file", "broken-symlink"])
@@ -1540,8 +1771,16 @@ def test_one_specification_retains_divergent_valid_outputs(tmp_path):
     divergent_run = replace(run, controller_diagnostics=changed_diagnostics)
     runs_root = tmp_path / "results" / "runs"
 
-    first = create_run_bundle(run, report, specification, runs_root)
-    second = create_run_bundle(divergent_run, report, specification, runs_root)
+    first = create_run_bundle(
+        run, report, specification, runs_root, repository_root=repository
+    )
+    second = create_run_bundle(
+        divergent_run,
+        report,
+        specification,
+        runs_root,
+        repository_root=repository,
+    )
 
     assert first.specification_identifier == second.specification_identifier
     assert first.identifier != second.identifier
@@ -1646,7 +1885,7 @@ def test_invalid_run_writes_separate_non_bundle_diagnostics(tmp_path):
     assert (path / "controller_diagnostics.csv").is_file()
     assert not (path / "manifest.json").exists()
     with pytest.raises(ValueError, match="Run Bundle|manifest"):
-        verify_run_bundle(path)
+        verify_run_bundle(path, repository_root=repository)
 
 
 @pytest.mark.parametrize(
