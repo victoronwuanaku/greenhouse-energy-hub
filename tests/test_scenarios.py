@@ -23,6 +23,63 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _write_source_bundle(
+    repository_root: Path,
+    *,
+    include_sidecar: bool = True,
+) -> tuple[Path, Path, dict[str, object]]:
+    data_dir = repository_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    source_path = data_dir / "replacement.csv"
+    frame = pd.DataFrame(
+        {"value": [1.0, 2.0]},
+        index=pd.date_range("2023-01-01", periods=2, freq="h", tz="UTC"),
+    )
+    frame.index.name = "timestamp"
+    frame.to_csv(source_path)
+    sidecar_path = source_path.with_suffix(".provenance.json")
+    sidecar: dict[str, object] = {
+        "schema_version": "source-provenance-v1",
+        "provenance_status": "legacy-import",
+        "historic_acquisition_time": None,
+        "source": {
+            "name": "Replacement Test Source",
+            "url": "https://replacement.invalid/hourly",
+        },
+        "parameters": {"dataset": "replacement", "revision": 7},
+        "original_timezone": "UTC",
+        "units": {"value": "kW"},
+        "transformations": ["parse_replacement_utc_timestamps"],
+        "row_count": 2,
+        "utc_coverage": {
+            "start": "2023-01-01T00:00:00+00:00",
+            "end": "2023-01-01T01:00:00+00:00",
+            "step": "PT1H",
+            "row_count": 2,
+        },
+        "output": {
+            "path": "data/replacement.csv",
+            "sha256": _sha256(source_path),
+        },
+    }
+    if include_sidecar:
+        sidecar_path.write_text(
+            json.dumps(sidecar, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return source_path, sidecar_path, sidecar
+
+
+def _thaw(value):
+    from collections.abc import Mapping
+
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
 def test_scenario_stable_interface_has_exact_fields():
     from scenarios import Scenario, ScenarioPoint, SourceProvenance
 
@@ -354,6 +411,218 @@ def test_source_provenance_is_complete_repo_relative_and_deeply_immutable():
         item for item in scenario.provenance if item.source_path.endswith("pv_profile.csv")
     )
     assert "source_utc_calendar_transplant" in pv_provenance.transformations
+
+
+def test_source_resolving_outside_repository_is_rejected(tmp_path):
+    from scenarios import ScenarioValidationError, _load_source_bundle
+
+    source_path, _, _ = _write_source_bundle(tmp_path)
+
+    with pytest.raises(ScenarioValidationError, match="outside repository"):
+        _load_source_bundle(
+            source_path,
+            "replacement source",
+            ("value",),
+            repository_root=ROOT,
+        )
+
+
+def test_missing_companion_provenance_sidecar_is_rejected(tmp_path):
+    from scenarios import ScenarioValidationError, _load_source_bundle
+
+    source_path, sidecar_path, _ = _write_source_bundle(
+        tmp_path, include_sidecar=False
+    )
+
+    with pytest.raises(ScenarioValidationError, match=sidecar_path.name):
+        _load_source_bundle(
+            source_path,
+            "replacement source",
+            ("value",),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "output_path",
+        "output_digest",
+        "row_count",
+        "coverage_row_count",
+        "coverage_start",
+        "coverage_end",
+        "coverage_step",
+        "legacy_timestamp",
+    ],
+)
+def test_source_sidecar_must_match_validated_bytes_and_coverage(tmp_path, mutation):
+    from scenarios import ScenarioValidationError, _load_source_bundle
+
+    source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
+    if mutation == "output_path":
+        sidecar["output"]["path"] = "data/not-the-source.csv"
+    elif mutation == "output_digest":
+        sidecar["output"]["sha256"] = "0" * 64
+    elif mutation == "row_count":
+        sidecar["row_count"] = 3
+    elif mutation == "coverage_row_count":
+        sidecar["utc_coverage"]["row_count"] = 3
+    elif mutation == "coverage_start":
+        sidecar["utc_coverage"]["start"] = "2022-12-31T23:00:00+00:00"
+    elif mutation == "coverage_end":
+        sidecar["utc_coverage"]["end"] = "2023-01-01T02:00:00+00:00"
+    elif mutation == "coverage_step":
+        sidecar["utc_coverage"]["step"] = "PT30M"
+    elif mutation == "legacy_timestamp":
+        sidecar["historic_acquisition_time"] = "2023-01-01T00:00:00+00:00"
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ScenarioValidationError):
+        _load_source_bundle(
+            source_path,
+            "replacement source",
+            ("value",),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["source_name", "source_url", "parameters", "timezone", "units", "transforms"],
+)
+def test_source_sidecar_requires_typed_acquisition_metadata(tmp_path, mutation):
+    from scenarios import ScenarioValidationError, _load_source_bundle
+
+    source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
+    if mutation == "source_name":
+        sidecar["source"]["name"] = ""
+    elif mutation == "source_url":
+        sidecar["source"]["url"] = None
+    elif mutation == "parameters":
+        sidecar["parameters"] = ["not", "a", "mapping"]
+    elif mutation == "timezone":
+        sidecar["original_timezone"] = ""
+    elif mutation == "units":
+        sidecar["units"] = {"other": "kW"}
+    elif mutation == "transforms":
+        sidecar["transformations"] = []
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ScenarioValidationError):
+        _load_source_bundle(
+            source_path,
+            "replacement source",
+            ("value",),
+            repository_root=tmp_path,
+        )
+
+
+def test_replacement_source_identity_and_metadata_come_only_from_sidecar(tmp_path):
+    from scenarios import _load_source_bundle, _source_provenance_from_bundle
+
+    source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
+    bundle = _load_source_bundle(
+        source_path,
+        "replacement source",
+        ("value",),
+        repository_root=tmp_path,
+    )
+    context = {
+        "requested_operating_window": {"start_utc": "2023-01-01T00:00:00+00:00"},
+        "forecast_coverage": {"horizon_capacity_steps": 0},
+        "target_utc_coverage": sidecar["utc_coverage"],
+    }
+    provenance = _source_provenance_from_bundle(
+        bundle,
+        scenario_metadata=context,
+        scenario_transformations=("replacement_alignment",),
+    )
+
+    assert provenance.source_name == "Replacement Test Source"
+    assert provenance.source_path == "data/replacement.csv"
+    assert provenance.sha256 == _sha256(source_path)
+    assert provenance.original_timezone == "UTC"
+    assert provenance.units == {"value": "kW"}
+    assert provenance.transformations == (
+        "parse_replacement_utc_timestamps",
+        "replacement_alignment",
+    )
+    assert provenance.acquisition_parameters["source_url"] == (
+        "https://replacement.invalid/hourly"
+    )
+    assert _thaw(provenance.acquisition_parameters["parameters"]) == {
+        "dataset": "replacement",
+        "revision": 7,
+    }
+    assert provenance.acquisition_parameters["sidecar_path"] == (
+        "data/replacement.provenance.json"
+    )
+    assert provenance.acquisition_parameters["sidecar_sha256"] == _sha256(
+        sidecar_path
+    )
+
+    first_sidecar_digest = provenance.acquisition_parameters["sidecar_sha256"]
+    sidecar["parameters"]["revision"] = 8
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    changed_bundle = _load_source_bundle(
+        source_path,
+        "replacement source",
+        ("value",),
+        repository_root=tmp_path,
+    )
+    changed = _source_provenance_from_bundle(
+        changed_bundle,
+        scenario_metadata=context,
+        scenario_transformations=("replacement_alignment",),
+    )
+    assert changed.sha256 == provenance.sha256
+    assert changed.acquisition_parameters["sidecar_sha256"] != first_sidecar_digest
+    assert changed.acquisition_parameters != provenance.acquisition_parameters
+
+
+def test_normal_scenario_provenance_is_anchored_to_validated_sidecars():
+    from control.rolling_horizon import load_data
+
+    scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
+    expected_alignment = {
+        "data/grid_price_signal.csv": ("direct_utc_instant_mapping",),
+        "data/pv_profile.csv": (
+            "source_utc_calendar_transplant",
+            "scale_pv_1_kwp_to_500_kwp",
+            "derive_electrical_demand_on_target_clock",
+        ),
+    }
+    for provenance in scenario.provenance:
+        source_path = ROOT / provenance.source_path
+        sidecar_path = source_path.with_suffix(".provenance.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        acquisition_transforms = tuple(sidecar["transformations"])
+
+        assert provenance.source_name == sidecar["source"]["name"]
+        assert provenance.original_timezone == sidecar["original_timezone"]
+        assert _thaw(provenance.units) == sidecar["units"]
+        assert provenance.transformations == (
+            acquisition_transforms + expected_alignment[provenance.source_path]
+        )
+        assert provenance.acquisition_parameters["source_url"] == (
+            sidecar["source"]["url"]
+        )
+        assert _thaw(provenance.acquisition_parameters["parameters"]) == (
+            sidecar["parameters"]
+        )
+        assert provenance.acquisition_parameters["sidecar_path"] == (
+            sidecar_path.relative_to(ROOT).as_posix()
+        )
+        assert provenance.acquisition_parameters["sidecar_sha256"] == _sha256(
+            sidecar_path
+        )
 
 
 def test_provenance_sidecars_match_exact_materialized_bytes_and_schema():

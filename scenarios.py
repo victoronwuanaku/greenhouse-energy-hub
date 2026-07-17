@@ -11,12 +11,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 import hashlib
+import json
 import math
 from numbers import Integral, Real
 from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import TypeAlias
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -167,6 +169,18 @@ class SourceProvenance:
         )
         if not self.transformations or any(not item for item in self.transformations):
             raise ScenarioValidationError("transformations must be nonempty strings")
+
+
+@dataclass(frozen=True)
+class _ValidatedSourceBundle:
+    frame: pd.DataFrame
+    source_path: Path
+    source_relative_path: str
+    source_sha256: str
+    sidecar_path: Path
+    sidecar_relative_path: str
+    sidecar_sha256: str
+    metadata: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -407,6 +421,220 @@ def _read_validated_source(
     return _validate_source_frame(frame, source_name, required_columns)
 
 
+def _resolved_repo_file(
+    path: str | Path,
+    repository_root: str | Path,
+    description: str,
+) -> tuple[Path, str]:
+    root = Path(repository_root).resolve()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        relative = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ScenarioValidationError(
+            f"{description} resolves outside repository: {resolved}"
+        ) from exc
+    if not resolved.is_file():
+        raise ScenarioValidationError(f"{description} not found: {resolved}")
+    return resolved, relative
+
+
+def _sidecar_mapping(
+    value: object,
+    field_name: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise ScenarioValidationError(
+            f"source provenance {field_name} must be an object"
+        )
+    return value
+
+
+def _sidecar_nonempty_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ScenarioValidationError(
+            f"source provenance {field_name} must be a nonempty string"
+        )
+    return value
+
+
+def _load_source_bundle(
+    path: str | Path,
+    source_name: str,
+    required_columns: Sequence[str],
+    *,
+    repository_root: str | Path = ROOT,
+) -> _ValidatedSourceBundle:
+    """Load and cross-check one acquired source and its provenance sidecar."""
+    source_path, source_relative = _resolved_repo_file(
+        path, repository_root, f"{source_name} file"
+    )
+    sidecar_candidate = source_path.with_suffix(".provenance.json")
+    sidecar_path, sidecar_relative = _resolved_repo_file(
+        sidecar_candidate,
+        repository_root,
+        f"{source_name} companion {sidecar_candidate.name}",
+    )
+    frame = _read_validated_source(source_path, source_name, required_columns)
+    source_digest = sha256_file(source_path)
+    sidecar_digest = sha256_file(sidecar_path)
+    try:
+        parsed = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ScenarioValidationError(
+            f"{source_name} provenance sidecar is not valid UTF-8 JSON"
+        ) from exc
+    metadata = _sidecar_mapping(parsed, "root")
+
+    if metadata.get("schema_version") != "source-provenance-v1":
+        raise ScenarioValidationError(
+            f"{source_name} provenance has an unsupported schema_version"
+        )
+    status = _sidecar_nonempty_string(
+        metadata.get("provenance_status"), "provenance_status"
+    )
+    historic_time = metadata.get("historic_acquisition_time")
+    if historic_time is not None and not isinstance(historic_time, str):
+        raise ScenarioValidationError(
+            f"{source_name} historic_acquisition_time must be a string or null"
+        )
+    if status == "legacy-import" and historic_time is not None:
+        raise ScenarioValidationError(
+            f"{source_name} legacy-import must have null historic_acquisition_time"
+        )
+
+    source_metadata = _sidecar_mapping(metadata.get("source"), "source")
+    _sidecar_nonempty_string(source_metadata.get("name"), "source.name")
+    _sidecar_nonempty_string(source_metadata.get("url"), "source.url")
+    parameters = _sidecar_mapping(metadata.get("parameters"), "parameters")
+    try:
+        _freeze_json(parameters)
+    except TypeError as exc:
+        raise ScenarioValidationError(
+            f"{source_name} parameters must contain finite JSON values"
+        ) from exc
+
+    original_timezone = _sidecar_nonempty_string(
+        metadata.get("original_timezone"), "original_timezone"
+    )
+    try:
+        ZoneInfo(original_timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ScenarioValidationError(
+            f"{source_name} original_timezone is not a recognized timezone"
+        ) from exc
+
+    units = _sidecar_mapping(metadata.get("units"), "units")
+    if any(
+        column not in units
+        or not isinstance(units[column], str)
+        or not units[column]
+        for column in required_columns
+    ):
+        raise ScenarioValidationError(
+            f"{source_name} units must describe every required column"
+        )
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, str)
+        or not value
+        for key, value in units.items()
+    ):
+        raise ScenarioValidationError(
+            f"{source_name} units must map nonempty strings to strings"
+        )
+
+    transformations = metadata.get("transformations")
+    if not isinstance(transformations, list) or not transformations or any(
+        not isinstance(item, str) or not item for item in transformations
+    ):
+        raise ScenarioValidationError(
+            f"{source_name} transformations must be a nonempty string list"
+        )
+    row_count = metadata.get("row_count")
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count != len(frame)
+    ):
+        raise ScenarioValidationError(
+            f"{source_name} provenance row_count does not match source bytes"
+        )
+
+    coverage = _sidecar_mapping(metadata.get("utc_coverage"), "utc_coverage")
+    expected_coverage = _utc_coverage(frame.index)
+    for field_name in ("start", "end", "step", "row_count"):
+        if coverage.get(field_name) != expected_coverage[field_name]:
+            raise ScenarioValidationError(
+                f"{source_name} provenance UTC {field_name} does not match source bytes"
+            )
+
+    output = _sidecar_mapping(metadata.get("output"), "output")
+    if output.get("path") != source_relative:
+        raise ScenarioValidationError(
+            f"{source_name} provenance output.path does not match source path"
+        )
+    if output.get("sha256") != source_digest:
+        raise ScenarioValidationError(
+            f"{source_name} provenance output.sha256 does not match source bytes"
+        )
+
+    try:
+        frozen_metadata = _freeze_json(dict(metadata))
+    except TypeError as exc:
+        raise ScenarioValidationError(
+            f"{source_name} provenance contains non-JSON metadata"
+        ) from exc
+    return _ValidatedSourceBundle(
+        frame=frame,
+        source_path=source_path,
+        source_relative_path=source_relative,
+        source_sha256=source_digest,
+        sidecar_path=sidecar_path,
+        sidecar_relative_path=sidecar_relative,
+        sidecar_sha256=sidecar_digest,
+        metadata=frozen_metadata,
+    )
+
+
+def _source_provenance_from_bundle(
+    bundle: _ValidatedSourceBundle,
+    *,
+    scenario_metadata: Mapping[str, JSONValue],
+    scenario_transformations: tuple[str, ...],
+) -> SourceProvenance:
+    metadata = bundle.metadata
+    source_metadata = _sidecar_mapping(metadata["source"], "source")
+    acquisition_parameters: dict[str, object] = {
+        **dict(scenario_metadata),
+        "source_url": source_metadata["url"],
+        "parameters": metadata["parameters"],
+        "provenance_status": metadata["provenance_status"],
+        "historic_acquisition_time": metadata["historic_acquisition_time"],
+        "sidecar_schema_version": metadata["schema_version"],
+        "sidecar_path": bundle.sidecar_relative_path,
+        "sidecar_sha256": bundle.sidecar_sha256,
+        "row_count": metadata["row_count"],
+        "source_utc_coverage": metadata["utc_coverage"],
+    }
+    return SourceProvenance(
+        source_name=str(source_metadata["name"]),
+        source_path=bundle.source_relative_path,
+        sha256=bundle.source_sha256,
+        acquisition_parameters=acquisition_parameters,
+        original_timezone=str(metadata["original_timezone"]),
+        units=metadata["units"],
+        transformations=tuple(metadata["transformations"])
+        + tuple(scenario_transformations),
+    )
+
+
 def _missing_instants_message(
     source_name: str, missing: pd.DatetimeIndex
 ) -> str:
@@ -586,19 +814,10 @@ def _utc_coverage(index: pd.DatetimeIndex) -> dict[str, JSONValue]:
     }
 
 
-def _repo_relative(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(ROOT.resolve()).as_posix()
-    except ValueError:
-        return Path(path.name).as_posix()
-
-
 def _scenario_source_provenance(
     *,
-    price_path: Path,
-    pv_path: Path,
-    prices: pd.DataFrame,
-    pv: pd.DataFrame,
+    price_source: _ValidatedSourceBundle,
+    pv_source: _ValidatedSourceBundle,
     operating_start: pd.Timestamp,
     operating_end: pd.Timestamp,
     forecast_end: pd.Timestamp,
@@ -618,57 +837,20 @@ def _scenario_source_provenance(
         "last_point_utc": coverage_index[-1].isoformat(),
     }
     common: dict[str, JSONValue] = {
-        "provenance_status": "legacy-import",
-        "historic_acquisition_time": None,
         "requested_operating_window": requested_window,
         "forecast_coverage": forecast_coverage,
         "target_utc_coverage": _utc_coverage(coverage_index),
     }
     return (
-        SourceProvenance(
-            source_name="energy-charts.info NL day-ahead price",
-            source_path=_repo_relative(price_path),
-            sha256=sha256_file(price_path),
-            acquisition_parameters={
-                **common,
-                "source_url": "https://api.energy-charts.info/price",
-                "bidding_zone": "NL",
-                "source_year": 2023,
-                "row_count": len(prices),
-                "source_utc_coverage": _utc_coverage(prices.index),
-            },
-            original_timezone="UTC",
-            units={
-                "price_EUR_MWh": "EUR/MWh",
-                "price_EUR_kWh": "EUR/kWh",
-            },
-            transformations=("direct_utc_instant_mapping",),
+        _source_provenance_from_bundle(
+            price_source,
+            scenario_metadata=common,
+            scenario_transformations=("direct_utc_instant_mapping",),
         ),
-        SourceProvenance(
-            source_name="PVGIS Westland PV and weather profile",
-            source_path=_repo_relative(pv_path),
-            sha256=sha256_file(pv_path),
-            acquisition_parameters={
-                **common,
-                "source_url": "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc",
-                "latitude": 52.0,
-                "longitude": 4.25,
-                "source_year": 2020,
-                "peak_power_kwp": 1.0,
-                "tilt_degrees": 30,
-                "aspect_degrees": 0,
-                "system_loss_percent": 14,
-                "radiation_database": "PVGIS-SARAH2",
-                "row_count": len(pv),
-                "source_utc_coverage": _utc_coverage(pv.index),
-            },
-            original_timezone="UTC",
-            units={
-                "P_kW": "kW/kWp",
-                "G_Wm2": "W/m2",
-                "T2m_C": "degC",
-            },
-            transformations=(
+        _source_provenance_from_bundle(
+            pv_source,
+            scenario_metadata=common,
+            scenario_transformations=(
                 "source_utc_calendar_transplant",
                 "scale_pv_1_kwp_to_500_kwp",
                 "derive_electrical_demand_on_target_clock",
@@ -751,18 +933,18 @@ def build_scenario(
         inclusive="left",
     )
 
-    price_path = Path(price_path)
-    pv_path = Path(pv_path)
-    prices = _read_validated_source(
+    price_source = _load_source_bundle(
         price_path,
         "price source",
         ("price_EUR_MWh", "price_EUR_kWh"),
     )
-    pv = _read_validated_source(
+    pv_source = _load_source_bundle(
         pv_path,
         "PV/weather source",
         ("P_kW", "G_Wm2", "T2m_C"),
     )
+    prices = price_source.frame
+    pv = pv_source.frame
     aligned_prices = _direct_utc_mapping(
         prices,
         coverage_index,
@@ -792,10 +974,8 @@ def build_scenario(
         for position, timestamp in enumerate(coverage_index)
     )
     provenance = _scenario_source_provenance(
-        price_path=price_path,
-        pv_path=pv_path,
-        prices=prices,
-        pv=pv,
+        price_source=price_source,
+        pv_source=pv_source,
         operating_start=start,
         operating_end=end,
         forecast_end=forecast_end,
