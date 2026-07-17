@@ -158,14 +158,13 @@ def _uncited_causal_claims(
 
 
 def _generated_publication_candidates() -> dict[str, str]:
-    """Read the optional generated index, skipping only before generation begins."""
-    if not CANDIDATE_INDEX.exists() and not CANDIDATE_INDEX.is_symlink():
-        pytest.skip(
-            "Task 13 prerequisite: generated publication candidate index is absent"
-        )
+    """Prefer the ignored generator index, else reconstruct the committed recipe."""
+    from greenhouse_energy_hub.evaluation import read_publication_candidates
 
-    assert CANDIDATE_INDEX.is_file() and not CANDIDATE_INDEX.is_symlink()
-    candidates = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
+    candidates = read_publication_candidates(
+        CANDIDATE_INDEX,
+        manifest_path=ROOT / "results" / "publication_manifest.json",
+    )
     assert isinstance(candidates, dict)
     assert set(candidates) == EXPECTED_PUBLICATION_CANDIDATE_KEYS
     assert all(
@@ -175,6 +174,17 @@ def _generated_publication_candidates() -> dict[str, str]:
     )
     assert len(set(candidates.values())) == len(candidates)
     return candidates
+
+
+def test_candidates_fall_back_to_the_committed_manifest_when_index_is_missing(tmp_path):
+    from greenhouse_energy_hub.evaluation import read_publication_candidates
+
+    candidates = read_publication_candidates(
+        tmp_path / "publication-candidates.json",
+        manifest_path=ROOT / "results" / "publication_manifest.json",
+    )
+
+    assert candidates == _generated_publication_candidates()
 
 
 def _write_handcrafted_bundle(
@@ -465,10 +475,11 @@ def test_generated_bundle_full_scope_evidence():
     from greenhouse_energy_hub.evaluation import load_run_bundle, verify_run_bundle
 
     candidates = _generated_publication_candidates()
-    assert sorted(
-        path.relative_to(DIAGNOSTICS).as_posix()
-        for path in DIAGNOSTICS.rglob("*")
-    ) == ["publication-candidates.json"]
+    if DIAGNOSTICS.exists():
+        assert sorted(
+            path.relative_to(DIAGNOSTICS).as_posix()
+            for path in DIAGNOSTICS.rglob("*")
+        ) == ["publication-candidates.json"]
     verified_bundles = {}
     for key, identifier in candidates.items():
         resolved = load_run_bundle(RUNS, identifier, repository_root=ROOT)
@@ -584,7 +595,7 @@ def test_generated_bundle_full_scope_evidence():
 
 
 def test_publisher_builds_the_exact_verified_full_id_recipe():
-    from experiments.publish_results import build_publication_manifest
+    from greenhouse_energy_hub.evaluation import build_publication_manifest
 
     candidates = _generated_publication_candidates()
     publication = build_publication_manifest(
@@ -648,7 +659,7 @@ def test_publisher_rejects_extra_candidate_keys_and_identifier_prefixes(
     candidate_key,
     candidate_value,
 ):
-    from experiments.publish_results import build_publication_manifest
+    from greenhouse_energy_hub.evaluation import build_publication_manifest
 
     candidates = _generated_publication_candidates()
     candidates[candidate_key] = candidate_value
@@ -664,8 +675,10 @@ def test_publisher_rejects_extra_candidate_keys_and_identifier_prefixes(
 
 
 def test_publisher_rejects_dirty_provenance_and_policy_mismatch():
-    from experiments.publish_results import validate_publication_bundles
-    from greenhouse_energy_hub.evaluation import load_run_bundle
+    from greenhouse_energy_hub.evaluation import (
+        load_run_bundle,
+        validate_publication_bundles,
+    )
 
     candidates = _generated_publication_candidates()
     baseline = load_run_bundle(
@@ -718,7 +731,7 @@ def test_publisher_rejects_dirty_provenance_and_policy_mismatch():
 
 
 def test_publication_manifest_retains_each_resolvable_bundle_in_the_proposed_commit():
-    from experiments.publish_results import (
+    from greenhouse_energy_hub.evaluation import (
         publication_bundle_ids,
         validate_committed_publication_bundles,
     )
@@ -753,18 +766,96 @@ def test_publication_manifest_retains_each_resolvable_bundle_in_the_proposed_com
     } <= tracked
 
 
-def test_publication_renderer_forces_a_noninteractive_backend():
-    rendered_backend = subprocess.run(
+def test_publication_core_has_no_matplotlib_backend_import_side_effect():
+    rendered_backends = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import matplotlib; import experiments.publish_results; "
-            "print(matplotlib.get_backend())",
+            "import matplotlib; before = matplotlib.get_backend(); "
+            "import greenhouse_energy_hub.evaluation; "
+            "print(before); print(matplotlib.get_backend())",
         ],
         cwd=ROOT,
         check=True,
         text=True,
         capture_output=True,
-    ).stdout.strip().casefold()
+    ).stdout.strip().casefold().splitlines()
 
-    assert rendered_backend == "agg"
+    assert rendered_backends[0] == rendered_backends[1]
+
+
+def test_publication_rejects_missing_candidate_key_uppercase_and_non_string_identifiers(
+    tmp_path,
+):
+    from greenhouse_energy_hub.evaluation import build_publication_manifest
+
+    candidates = _generated_publication_candidates()
+    for name, invalid_candidates in {
+        "missing": {key: value for key, value in candidates.items() if key != "winter-mpc"},
+        "uppercase": {**candidates, "winter-mpc": candidates["winter-mpc"].upper()},
+        "non-string": {**candidates, "winter-mpc": 3},
+    }.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(invalid_candidates), encoding="utf-8")
+        with pytest.raises(ValueError):
+            build_publication_manifest(path, runs_root=RUNS, repository_root=ROOT)
+
+
+def test_publication_rejects_a_summary_without_all_required_sensitivities():
+    from greenhouse_energy_hub.evaluation import validate_publication_summary
+
+    candidates = _generated_publication_candidates()
+    bundle_path = RUNS / f"winter-2023-14d--mpc--{candidates['winter-mpc']}"
+    summary = json.loads((bundle_path / "summary.json").read_text(encoding="utf-8"))
+    summary["wear_sensitivities"].pop("2x")
+
+    with pytest.raises(ValueError, match="required 0x, 1x, and 2x sensitivities"):
+        validate_publication_summary(summary, identifier=candidates["winter-mpc"])
+
+
+def test_publication_rejects_malformed_manifest_mapping():
+    from greenhouse_energy_hub.evaluation import publication_bundle_ids
+
+    manifest = json.loads(
+        (ROOT / "results" / "publication_manifest.json").read_text(encoding="utf-8")
+    )
+    manifest["figures"] = {"fig1_cumulative_cost.png": []}
+
+    with pytest.raises(ValueError, match="figures are incomplete"):
+        publication_bundle_ids(manifest)
+
+
+def test_readme_rewrite_preserves_bytes_outside_generated_markers(tmp_path):
+    from greenhouse_energy_hub.evaluation import (
+        read_publication_manifest,
+        rewrite_publication_readme_block,
+        load_verified_publication_evidence,
+    )
+
+    readme = tmp_path / "README.md"
+    before = (ROOT / "README.md").read_bytes()
+    readme.write_bytes(before)
+    evidence = load_verified_publication_evidence(
+        read_publication_manifest(ROOT / "results" / "publication_manifest.json"),
+        runs_root=RUNS,
+        repository_root=ROOT,
+    )
+
+    rewrite_publication_readme_block(
+        readme,
+        candidates=evidence.candidates,
+        summaries=evidence.summaries,
+    )
+    after = readme.read_bytes()
+    begin = before.index(b"<!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->")
+    before_end = before.index(b"<!-- END GENERATED RESULTS -->")
+    after_end = after.index(b"<!-- END GENERATED RESULTS -->")
+    assert after[:begin] == before[:begin]
+    assert after[after_end:] == before[before_end:]
+
+
+def test_ablation_cost_difference_is_signed_from_full_to_variant():
+    from greenhouse_energy_hub.evaluation import publication_cost_difference_percent
+
+    assert publication_cost_difference_percent(100.0, 102.0) == pytest.approx(2.0)
+    assert publication_cost_difference_percent(100.0, 98.0) == pytest.approx(-2.0)

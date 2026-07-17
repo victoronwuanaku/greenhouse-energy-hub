@@ -21,7 +21,7 @@ This repo implements the **economic-dispatch layer**: a rolling-horizon MPC that
 
 ## Results
 
-14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline**: it cannot dispatch hydrogen (`9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97`), charge the thermal store (`787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de`), or charge the battery from the grid; it may discharge the battery only when the price is at least €0.12/kWh. It reactively holds the 16.5 °C lower comfort bound and has no look-ahead (`df487e8da6980b2d87c7629ee276d92952630f0feebfb6962d2b291838edc5ac`). Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
+14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline** in the pinned winter (`509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a`) and summer (`8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2`) bundles. Hydrogen dispatch, thermal-store charging, and grid-battery charging are disabled. Battery discharge requires a price of at least 0.12/kWh. The reactive temperature target is 16.5 °C; look-ahead is disabled. Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
 
 <!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->
 | Window | Baseline Inventory-Adjusted Cost | MPC Inventory-Adjusted Cost | Saving | Comfort Violation (baseline / MPC) |
@@ -35,12 +35,12 @@ Pinned Run Bundle IDs:
 - Summer baseline: `8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2`
 - Summer MPC: `5975dafc40c7bb296fa8861eb1e78b2afc21ff4eeff14ed3e2575b77768cecb1`
 
-| Winter ablation | Inventory-Adjusted Cost | Comfort Violation | Cost change vs full |
-|-----------------|--------------------------:|------------------:|:-------------------:|
+| Winter ablation | Inventory-Adjusted Cost | Comfort Violation | Cost difference vs full |
+|-----------------|--------------------------:|------------------:|:-----------------------:|
 | MPC (full) | €42,560 | 0.0 °C·h | +0.0 % |
-| no H₂ | €43,057 | 0.0 °C·h | -1.2 % |
-| no thermal store | €43,303 | 0.0 °C·h | -1.7 % |
-| one-step horizon | €41,082 | 2,826.4 °C·h | +3.5 % |
+| no H₂ | €43,057 | 0.0 °C·h | +1.2 % |
+| no thermal store | €43,303 | 0.0 °C·h | +1.7 % |
+| one-step horizon | €41,082 | 2,826.4 °C·h | -3.5 % |
 
 Removing hydrogen raises the winter inventory-adjusted cost relative to the full controller (`9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97` versus `9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a`).
 Removing the thermal store raises the winter inventory-adjusted cost relative to the full controller (`787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de` versus `9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a`).

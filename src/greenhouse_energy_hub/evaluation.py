@@ -2596,24 +2596,591 @@ def stored_equiv_from_row(
     )
 
 
-def _legacy_grid_inventory_adjusted_cost(
-    results_df: object,
-    init_equiv: float,
-    settle_price: float,
-    config: HubConfiguration = HubConfiguration(),
-) -> float:
-    """Characterize committed pre-migration grid-only artifact summaries.
+def saving_pct(baseline_cost: float, comparison_cost: float) -> float:
+    return saving_percent(baseline_cost, comparison_cost)
 
-    This private adapter is not a current evaluation API: it intentionally omits
-    policy wear so the old committed CSV/summary characterization remains readable.
-    Task 14 must delete it with that characterization when artifacts regenerate from
-    valid Run Bundles under ``evaluate_run``.
+
+# ---------------------------------------------------------------------------
+# Publication evidence
+# ---------------------------------------------------------------------------
+
+PUBLICATION_MANIFEST_SCHEMA_VERSION = "publication-manifest-v1"
+PUBLICATION_CANDIDATE_KEYS = frozenset(
+    {
+        "ablation-full",
+        "ablation-no-h2",
+        "ablation-no-tes",
+        "ablation-one-step",
+        "summer-baseline",
+        "summer-mpc",
+        "winter-baseline",
+        "winter-mpc",
+    }
+)
+PUBLICATION_REQUIRED_SENSITIVITIES = frozenset({"0x", "1x", "2x"})
+PUBLICATION_README_BEGIN = b"<!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->"
+PUBLICATION_README_END = b"<!-- END GENERATED RESULTS -->"
+PUBLICATION_FIGURE_FILENAMES = frozenset(
+    {
+        "fig1_cumulative_cost.png",
+        "fig2_grid_vs_price.png",
+        "fig3_soc_trajectories.png",
+        "fig4_temperature.png",
+        "fig5_heat_shifting.png",
+        "fig6_ablation.png",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PublicationEvidence:
+    """Verified bundles and immutable publication recipe inputs."""
+
+    candidates: Mapping[str, str]
+    bundles: Mapping[str, RunBundle]
+    summaries: Mapping[str, Mapping[str, object]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "candidates", MappingProxyType(dict(self.candidates)))
+        object.__setattr__(self, "bundles", MappingProxyType(dict(self.bundles)))
+        object.__setattr__(self, "summaries", MappingProxyType(dict(self.summaries)))
+
+
+def _require_publication_identifier(value: object, description: str) -> str:
+    if not isinstance(value, str) or HASH_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{description} must be a full lowercase SHA-256 identifier")
+    return value
+
+
+def _validated_publication_candidates(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != PUBLICATION_CANDIDATE_KEYS:
+        raise ValueError("publication candidates have missing or extra stable keys")
+    candidates = {
+        key: _require_publication_identifier(
+            value[key],
+            f"publication candidate {key!r}",
+        )
+        for key in PUBLICATION_CANDIDATE_KEYS
+    }
+    if len(set(candidates.values())) != len(candidates):
+        raise ValueError("publication candidates must pin distinct Run Bundle identifiers")
+    return candidates
+
+
+def _read_publication_candidate_index(candidate_index: str | Path) -> dict[str, str]:
+    path = Path(candidate_index)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("publication candidates must be a regular JSON file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("publication candidates must contain valid UTF-8 JSON") from exc
+    return _validated_publication_candidates(payload)
+
+
+def read_publication_candidates(
+    candidate_index: str | Path,
+    *,
+    manifest_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Read generated candidates or reconstruct them from a committed recipe.
+
+    Candidate indexes are intentionally ignored developer conveniences.  A clean
+    checkout instead derives their exact stable keys and full identifiers from the
+    tracked publication manifest.
     """
-    final_equiv = stored_equiv_from_row(results_df.iloc[-1], config)
-    return float(results_df["grid_cost_EUR"].sum()) + settle_price * (
-        init_equiv - final_equiv
+    path = Path(candidate_index)
+    if path.exists() or path.is_symlink():
+        return _read_publication_candidate_index(path)
+    if manifest_path is None:
+        raise ValueError("publication candidate index is absent and no manifest was supplied")
+    return publication_candidates_from_manifest(read_publication_manifest(manifest_path))
+
+
+def _publication_manifest_from_candidates(candidates: Mapping[str, str]) -> dict[str, object]:
+    validated = _validated_publication_candidates(candidates)
+    return {
+        "schema_version": PUBLICATION_MANIFEST_SCHEMA_VERSION,
+        "comparisons": {
+            "winter": {
+                "baseline_bundle_id": validated["winter-baseline"],
+                "mpc_bundle_id": validated["winter-mpc"],
+            },
+            "summer": {
+                "baseline_bundle_id": validated["summer-baseline"],
+                "mpc_bundle_id": validated["summer-mpc"],
+            },
+        },
+        "ablations": {
+            "full": validated["ablation-full"],
+            "no-h2": validated["ablation-no-h2"],
+            "no-tes": validated["ablation-no-tes"],
+            "one-step": validated["ablation-one-step"],
+        },
+        "figures": {
+            "fig1_cumulative_cost.png": [
+                validated["winter-baseline"],
+                validated["winter-mpc"],
+            ],
+            "fig2_grid_vs_price.png": [validated["winter-mpc"]],
+            "fig3_soc_trajectories.png": [
+                validated["winter-baseline"],
+                validated["winter-mpc"],
+            ],
+            "fig4_temperature.png": [
+                validated["winter-baseline"],
+                validated["winter-mpc"],
+            ],
+            "fig5_heat_shifting.png": [validated["winter-mpc"]],
+            "fig6_ablation.png": [
+                validated["ablation-full"],
+                validated["ablation-no-h2"],
+                validated["ablation-no-tes"],
+                validated["ablation-one-step"],
+            ],
+        },
+    }
+
+
+def publication_candidates_from_manifest(manifest: Mapping[str, object]) -> dict[str, str]:
+    """Validate the strict recipe and return its stable candidate mapping."""
+    if set(manifest) != {"schema_version", "comparisons", "ablations", "figures"}:
+        raise ValueError("publication manifest has missing or extra top-level fields")
+    if manifest["schema_version"] != PUBLICATION_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("publication manifest schema version is unsupported")
+    comparisons = manifest["comparisons"]
+    ablations = manifest["ablations"]
+    figures = manifest["figures"]
+    if not isinstance(comparisons, Mapping) or set(comparisons) != {"winter", "summer"}:
+        raise ValueError("publication manifest comparisons are incomplete")
+    if not isinstance(ablations, Mapping) or set(ablations) != {
+        "full",
+        "no-h2",
+        "no-tes",
+        "one-step",
+    }:
+        raise ValueError("publication manifest ablations are incomplete")
+    if not isinstance(figures, Mapping) or set(figures) != PUBLICATION_FIGURE_FILENAMES:
+        raise ValueError("publication manifest figures are incomplete")
+
+    candidates: dict[str, str] = {}
+    for season in ("winter", "summer"):
+        comparison = comparisons[season]
+        if not isinstance(comparison, Mapping) or set(comparison) != {
+            "baseline_bundle_id",
+            "mpc_bundle_id",
+        }:
+            raise ValueError(f"publication manifest {season} comparison is incomplete")
+        candidates[f"{season}-baseline"] = _require_publication_identifier(
+            comparison["baseline_bundle_id"],
+            f"publication manifest {season} baseline",
+        )
+        candidates[f"{season}-mpc"] = _require_publication_identifier(
+            comparison["mpc_bundle_id"],
+            f"publication manifest {season} MPC",
+        )
+    for key in ("full", "no-h2", "no-tes", "one-step"):
+        candidates[f"ablation-{key}"] = _require_publication_identifier(
+            ablations[key],
+            f"publication manifest ablation {key}",
+        )
+
+    candidates = _validated_publication_candidates(candidates)
+    if dict(manifest) != _publication_manifest_from_candidates(candidates):
+        raise ValueError("publication manifest does not match its pinned recipe")
+    return candidates
+
+
+def read_publication_manifest(path: str | Path) -> dict[str, object]:
+    """Read a regular JSON manifest and validate its exact pinned recipe."""
+    manifest_path = Path(path)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("publication manifest must be a regular JSON file")
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("publication manifest must contain valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("publication manifest must be a JSON object")
+    publication_candidates_from_manifest(value)
+    return value
+
+
+def publication_bundle_ids(manifest: Mapping[str, object]) -> tuple[str, ...]:
+    """Return each full bundle ID once, in recipe order, after validation."""
+    return tuple(dict.fromkeys(publication_candidates_from_manifest(manifest).values()))
+
+
+def validate_publication_summary(
+    summary: Mapping[str, object],
+    *,
+    identifier: str,
+) -> Mapping[str, object]:
+    """Require nominal metrics plus the three policy wear sensitivities."""
+    _require_publication_identifier(identifier, "Run Bundle")
+    if not isinstance(summary.get("nominal"), Mapping):
+        raise ValueError(f"Run Bundle {identifier} summary is missing nominal values")
+    sensitivities = summary.get("wear_sensitivities")
+    if not isinstance(sensitivities, Mapping) or set(sensitivities) != PUBLICATION_REQUIRED_SENSITIVITIES:
+        raise ValueError(
+            f"Run Bundle {identifier} is missing required 0x, 1x, and 2x sensitivities"
+        )
+    return summary
+
+
+def _publication_summary_for(bundle: RunBundle) -> Mapping[str, object]:
+    try:
+        summary = json.loads((bundle.path / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Run Bundle {bundle.identifier} has no readable summary") from exc
+    if not isinstance(summary, dict):
+        raise ValueError(f"Run Bundle {bundle.identifier} summary must be an object")
+    return validate_publication_summary(summary, identifier=bundle.identifier)
+
+
+def _publication_policy_for(bundle: RunBundle) -> Mapping[str, object]:
+    policy = bundle.manifest.get("evaluation_policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError(f"Run Bundle {bundle.identifier} has no Evaluation Policy")
+    return policy
+
+
+def validate_publication_bundles(bundles: Mapping[str, RunBundle]) -> None:
+    """Check publication-specific provenance, sensitivity, and policy gates."""
+    if not bundles:
+        raise ValueError("publication requires at least one verified Run Bundle")
+    policies: list[Mapping[str, object]] = []
+    for key, bundle in bundles.items():
+        _require_publication_identifier(bundle.identifier, f"Run Bundle for {key!r}")
+        provenance = bundle.manifest.get("code_provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError(f"Run Bundle {bundle.identifier} has no provenance")
+        if provenance.get("publication_eligible") is not True:
+            raise ValueError(f"Run Bundle {bundle.identifier} is not publication-eligible")
+        if provenance.get("dirty_executable_paths") or provenance.get(
+            "untracked_executable_paths"
+        ):
+            raise ValueError(f"Run Bundle {bundle.identifier} has dirty provenance")
+        if bundle.manifest.get("valid") is not True:
+            raise ValueError(f"Run Bundle {bundle.identifier} did not pass validation")
+        _publication_summary_for(bundle)
+        policies.append(_publication_policy_for(bundle))
+    if any(policy != policies[0] for policy in policies[1:]):
+        raise ValueError("publication comparisons use different Evaluation Policies")
+
+
+def _load_verified_publication_candidates(
+    candidates: Mapping[str, str],
+    *,
+    runs_root: str | Path,
+    repository_root: str | Path,
+) -> dict[str, RunBundle]:
+    bundles: dict[str, RunBundle] = {}
+    for key, identifier in _validated_publication_candidates(candidates).items():
+        loaded = load_run_bundle(runs_root, identifier, repository_root=repository_root)
+        verified = verify_run_bundle(
+            loaded.path,
+            expected_identifier=identifier,
+            repository_root=repository_root,
+        )
+        if verified.identifier != identifier:
+            raise ValueError(f"Run Bundle for {key!r} did not retain its requested ID")
+        bundles[key] = verified
+    validate_publication_bundles(bundles)
+    return bundles
+
+
+def build_publication_manifest(
+    candidate_index: str | Path,
+    *,
+    runs_root: str | Path,
+    repository_root: str | Path,
+) -> dict[str, object]:
+    """Build a recipe only after every candidate verifies as a Run Bundle."""
+    candidates = _read_publication_candidate_index(candidate_index)
+    _load_verified_publication_candidates(
+        candidates,
+        runs_root=runs_root,
+        repository_root=repository_root,
+    )
+    return _publication_manifest_from_candidates(candidates)
+
+
+def load_verified_publication_evidence(
+    manifest: Mapping[str, object],
+    *,
+    runs_root: str | Path,
+    repository_root: str | Path,
+) -> PublicationEvidence:
+    """Validate the recipe before reading and verifying each pinned bundle."""
+    candidates = publication_candidates_from_manifest(manifest)
+    bundles = _load_verified_publication_candidates(
+        candidates,
+        runs_root=runs_root,
+        repository_root=repository_root,
+    )
+    return PublicationEvidence(
+        candidates=candidates,
+        bundles=bundles,
+        summaries={key: _publication_summary_for(bundle) for key, bundle in bundles.items()},
     )
 
 
-def saving_pct(baseline_cost: float, comparison_cost: float) -> float:
-    return saving_percent(baseline_cost, comparison_cost)
+def validate_committed_publication_bundles(
+    manifest: Mapping[str, object],
+    *,
+    runs_root: str | Path,
+    repository_root: str | Path,
+) -> None:
+    """Require every member of every pinned Run Bundle in the proposed commit."""
+    evidence = load_verified_publication_evidence(
+        manifest,
+        runs_root=runs_root,
+        repository_root=repository_root,
+    )
+    repository = Path(repository_root)
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files", "--cached"],
+            cwd=repository,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+    )
+    required = {
+        member.relative_to(repository).as_posix()
+        for bundle in evidence.bundles.values()
+        for member in bundle.path.iterdir()
+    }
+    missing = sorted(required - tracked)
+    if missing:
+        raise ValueError(
+            "publication manifest references Run Bundles absent from the proposed commit: "
+            + ", ".join(missing)
+        )
+
+
+def publication_metric(summary: Mapping[str, object], key: str) -> float:
+    """Return a finite nominal metric after strict publication-summary validation."""
+    nominal = summary.get("nominal")
+    if not isinstance(nominal, Mapping):
+        raise ValueError("summary is missing nominal values")
+    value = nominal.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"summary metric {key!r} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"summary metric {key!r} must be finite")
+    return result
+
+
+def publication_cost_difference_percent(full_cost: float, variant_cost: float) -> float:
+    """Signed cost difference from full MPC to a variant: (variant-full)/full."""
+    if not math.isfinite(full_cost) or not math.isfinite(variant_cost):
+        raise ValueError("publication costs must be finite")
+    return 100.0 * (variant_cost - full_cost) / abs(full_cost) if full_cost else 0.0
+
+
+def publication_comparison_rows(
+    summaries: Mapping[str, Mapping[str, object]],
+) -> tuple[dict[str, float | str], ...]:
+    """Compute cost-saving and comfort rows for the seasonal controller comparison."""
+    rows: list[dict[str, float | str]] = []
+    for label, baseline_key, mpc_key in (
+        ("Winter", "winter-baseline", "winter-mpc"),
+        ("Summer", "summer-baseline", "summer-mpc"),
+    ):
+        baseline = summaries[baseline_key]
+        mpc = summaries[mpc_key]
+        baseline_cost = publication_metric(baseline, "inventory_adjusted_cost_eur")
+        mpc_cost = publication_metric(mpc, "inventory_adjusted_cost_eur")
+        rows.append(
+            {
+                "window": label,
+                "baseline_inventory_adjusted_cost_eur": baseline_cost,
+                "mpc_inventory_adjusted_cost_eur": mpc_cost,
+                "saving_percent": saving_percent(baseline_cost, mpc_cost),
+                "baseline_comfort_violation_c_h": publication_metric(
+                    baseline, "comfort_violation_c_h"
+                ),
+                "mpc_comfort_violation_c_h": publication_metric(
+                    mpc, "comfort_violation_c_h"
+                ),
+            }
+        )
+    return tuple(rows)
+
+
+def publication_ablation_rows(
+    summaries: Mapping[str, Mapping[str, object]],
+) -> tuple[dict[str, float | str], ...]:
+    """Compute signed ablation cost deltas and separate comfort evidence."""
+    full_cost = publication_metric(summaries["ablation-full"], "inventory_adjusted_cost_eur")
+    rows: list[dict[str, float | str]] = []
+    for label, key in (
+        ("MPC (full)", "ablation-full"),
+        ("no H₂", "ablation-no-h2"),
+        ("no thermal store", "ablation-no-tes"),
+        ("one-step horizon", "ablation-one-step"),
+    ):
+        summary = summaries[key]
+        cost = publication_metric(summary, "inventory_adjusted_cost_eur")
+        rows.append(
+            {
+                "variant": label,
+                "candidate_key": key,
+                "inventory_adjusted_cost_eur": cost,
+                "comfort_violation_c_h": publication_metric(
+                    summary, "comfort_violation_c_h"
+                ),
+                "cost_difference_vs_full_percent": publication_cost_difference_percent(
+                    full_cost, cost
+                ),
+            }
+        )
+    return tuple(rows)
+
+
+def rewrite_publication_readme_block(
+    readme_path: str | Path,
+    *,
+    candidates: Mapping[str, str],
+    summaries: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Rewrite precisely the generated body, preserving every other README byte."""
+    validated = _validated_publication_candidates(candidates)
+    rows = publication_comparison_rows(summaries)
+    ablations = publication_ablation_rows(summaries)
+    comparison_lines = [
+        "| Window | Baseline Inventory-Adjusted Cost | MPC Inventory-Adjusted Cost | Saving | Comfort Violation (baseline / MPC) |",
+        "|--------|----------------------------------:|-----------------------------:|:------:|:-----------------------------------:|",
+        *[
+            f"| **{row['window']}** | €{row['baseline_inventory_adjusted_cost_eur']:,.0f} | "
+            f"€{row['mpc_inventory_adjusted_cost_eur']:,.0f} | {row['saving_percent']:+.1f} % | "
+            f"{row['baseline_comfort_violation_c_h']:.1f} / "
+            f"{row['mpc_comfort_violation_c_h']:.1f} °C·h |"
+            for row in rows
+        ],
+        "",
+        "Pinned Run Bundle IDs:",
+        f"- Winter baseline: `{validated['winter-baseline']}`",
+        f"- Winter MPC: `{validated['winter-mpc']}`",
+        f"- Summer baseline: `{validated['summer-baseline']}`",
+        f"- Summer MPC: `{validated['summer-mpc']}`",
+        "",
+        "| Winter ablation | Inventory-Adjusted Cost | Comfort Violation | Cost difference vs full |",
+        "|-----------------|--------------------------:|------------------:|:-----------------------:|",
+        *[
+            f"| {row['variant']} | €{row['inventory_adjusted_cost_eur']:,.0f} | "
+            f"{row['comfort_violation_c_h']:,.1f} °C·h | "
+            f"{row['cost_difference_vs_full_percent']:+.1f} % |"
+            for row in ablations
+        ],
+        "",
+        f"Removing hydrogen raises the winter inventory-adjusted cost relative to the full controller (`{validated['ablation-no-h2']}` versus `{validated['ablation-full']}`).",
+        f"Removing the thermal store raises the winter inventory-adjusted cost relative to the full controller (`{validated['ablation-no-tes']}` versus `{validated['ablation-full']}`).",
+        f"A one-step horizon has substantial comfort violation in this winter run (`{validated['ablation-one-step']}` versus `{validated['ablation-full']}`).",
+    ]
+    path = Path(readme_path)
+    original = path.read_bytes()
+    if original.count(PUBLICATION_README_BEGIN) != 1 or original.count(PUBLICATION_README_END) != 1:
+        raise ValueError("README must contain exactly one generated-results marker pair")
+    begin = original.index(PUBLICATION_README_BEGIN) + len(PUBLICATION_README_BEGIN)
+    end = original.index(PUBLICATION_README_END)
+    if end < begin:
+        raise ValueError("README generated-results markers are out of order")
+    replacement = ("\n" + "\n".join(comparison_lines) + "\n").encode("utf-8")
+    path.write_bytes(original[:begin] + replacement + original[end:])
+
+
+def load_publication_trajectory(bundle: RunBundle) -> object:
+    """Load a verified trajectory lazily for a renderer or analysis notebook."""
+    import pandas as pd
+
+    return pd.read_csv(bundle.path / "trajectory.csv", parse_dates=["timestamp_utc"]).set_index(
+        "timestamp_utc"
+    )
+
+
+def render_publication_figures(
+    bundles: Mapping[str, RunBundle],
+    *,
+    figures_root: str | Path,
+) -> None:
+    """Render the six figures from verified publication evidence on demand only."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    validate_publication_bundles(bundles)
+    figures = Path(figures_root)
+    figures.mkdir(parents=True, exist_ok=True)
+    trajectories = {key: load_publication_trajectory(bundle) for key, bundle in bundles.items()}
+    summaries = {key: _publication_summary_for(bundle) for key, bundle in bundles.items()}
+    baseline = trajectories["winter-baseline"]
+    mpc = trajectories["winter-mpc"]
+    plt.rcParams.update({"figure.dpi": 110, "savefig.dpi": 130, "axes.grid": True, "grid.alpha": 0.3, "font.size": 10})
+
+    baseline_costs = pd.DataFrame(summaries["winter-baseline"]["step_line_items"])
+    mpc_costs = pd.DataFrame(summaries["winter-mpc"]["step_line_items"])
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(baseline.index, baseline_costs["grid_cost_eur"].cumsum(), label="Baseline", lw=2, color="#b2182b")
+    ax.plot(mpc.index, mpc_costs["grid_cost_eur"].cumsum(), label="MPC", lw=2, color="#2166ac")
+    ax.set(ylabel="Cumulative grid cost [EUR]", title="Winter cumulative grid cost")
+    ax.legend(); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(figures / "fig1_cumulative_cost.png"); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(mpc.index, mpc["grid_kw"], color="#2166ac", lw=1.2, label="MPC grid power [kW]")
+    ax.axhline(0, color="black", lw=0.7); ax.set_ylabel("Grid power [kW]")
+    price_axis = ax.twinx(); price_axis.plot(mpc.index, mpc["price_eur_per_kwh"] * 100, color="#fdae61", alpha=0.75, label="Day-ahead price [ct/kWh]")
+    price_axis.set_ylabel("Price [ct/kWh]"); ax.set_title("MPC grid exchange and day-ahead price")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d")); fig.tight_layout(); fig.savefig(figures / "fig2_grid_vs_price.png"); plt.close(fig)
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 7), sharex=True)
+    for axis, column, label in zip(axes, ("reached_soc_battery_kwh", "reached_soc_hydrogen_kg", "reached_soc_thermal_kwh"), ("Battery SOC [kWh]", "Hydrogen inventory [kg]", "Thermal-store SOC [kWh]"), strict=True):
+        axis.plot(baseline.index, baseline[column], color="#b2182b", alpha=0.7, label="Baseline")
+        axis.plot(mpc.index, mpc[column], color="#2166ac", label="MPC"); axis.set_ylabel(label); axis.legend(loc="best")
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %d")); fig.suptitle("Winter storage trajectories"); fig.tight_layout(); fig.savefig(figures / "fig3_soc_trajectories.png"); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.axhspan(16, 24, color="#1a9850", alpha=0.08, label="Comfort band")
+    ax.plot(mpc.index, mpc["reached_indoor_temperature_c"], color="#2166ac", lw=1.3, label="MPC indoor")
+    ax.plot(baseline.index, baseline["reached_indoor_temperature_c"], color="#b2182b", lw=1.0, alpha=0.7, label="Baseline indoor")
+    ax.plot(mpc.index, mpc["outdoor_temperature_c"], color="grey", lw=0.9, alpha=0.7, label="Outdoor")
+    ax.set(ylabel="Temperature [°C]", title="Winter greenhouse temperature"); ax.legend(loc="best"); ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d")); fig.tight_layout(); fig.savefig(figures / "fig4_temperature.png"); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(mpc.index, mpc["electric_boiler_kw"], color="#d73027", lw=1.2, label="Electric boiler [kW]")
+    ax.plot(mpc.index, mpc["thermal_charge_kw"], color="#1a9850", lw=1.1, label="Thermal-store charge [kWth]")
+    ax.set(ylabel="Power [kW]", title="MPC power-to-heat operation"); ax.legend(loc="upper left"); ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d")); fig.tight_layout(); fig.savefig(figures / "fig5_heat_shifting.png"); plt.close(fig)
+
+    ablations = publication_ablation_rows(summaries)
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    bars = ax.bar([str(row["variant"]).replace(" horizon", "") for row in ablations], [float(row["cost_difference_vs_full_percent"]) for row in ablations], color=["#2166ac", "#7fb3d5", "#7fb3d5", "#7fb3d5"])
+    ax.axhline(0, color="black", lw=0.7); ax.set_ylabel("Inventory-adjusted cost difference vs full [%]"); ax.set_title("Winter ablation comparison")
+    for bar, row in zip(bars, ablations, strict=True):
+        value = float(row["cost_difference_vs_full_percent"])
+        ax.text(bar.get_x() + bar.get_width() / 2, value + (0.35 if value >= 0 else -1.0), f"{value:+.1f}%", ha="center", va="bottom" if value >= 0 else "top", fontsize=9)
+    fig.tight_layout(); fig.savefig(figures / "fig6_ablation.png"); plt.close(fig)
+
+
+def regenerate_publication_artifacts(
+    *,
+    candidate_index: str | Path,
+    manifest_path: str | Path,
+    repository_root: str | Path,
+    runs_root: str | Path,
+    figures_root: str | Path,
+    readme_path: str | Path,
+) -> dict[str, object]:
+    """Write a verified recipe, figures, and marker-limited README evidence."""
+    manifest = build_publication_manifest(candidate_index, runs_root=runs_root, repository_root=repository_root)
+    Path(manifest_path).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    evidence = load_verified_publication_evidence(manifest, runs_root=runs_root, repository_root=repository_root)
+    render_publication_figures(evidence.bundles, figures_root=figures_root)
+    rewrite_publication_readme_block(readme_path, candidates=evidence.candidates, summaries=evidence.summaries)
+    return manifest
