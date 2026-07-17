@@ -107,6 +107,7 @@ def _write_handcrafted_bundle(
     validation: dict[str, object] | None = None,
     diagnostics_csv: bytes | None = None,
     publication_eligible: bool = True,
+    input_hashes: dict[str, object] | None = None,
 ) -> tuple[Path, str]:
     """Write internally hash-consistent bytes so each rejection isolates one gate."""
     validation = validation or {
@@ -118,14 +119,25 @@ def _write_handcrafted_bundle(
                 "operating_step": 0,
                 "solver_success": True,
                 "solver_return_status": "Solve_Succeeded",
+                "control_valid": True,
+                "flows_valid": True,
+                "successor_valid": True,
                 "physical_invariants_valid": True,
             }
         ],
     }
     diagnostics_csv = diagnostics_csv or (
-        b"operating_step,decision_status,solver_success,solver_return_status\n"
-        b"0,success,true,Solve_Succeeded\n"
+        b"operating_step,adapter,decision_status,solver_success,solver_return_status,"
+        b"solver_iterations,solver_wall_seconds,forecast_start_utc,forecast_end_utc,"
+        b"terminal_electric_value_eur_per_kwh,terminal_heat_value_eur_per_kwhth\n"
+        b"0,mpc,success,true,Solve_Succeeded,3,0.01,2023-01-02T00:00:00Z,"
+        b"2023-01-02T00:00:00Z,0.1,0.02\n"
     )
+    input_hashes = input_hashes or {
+        "scenario": "5" * 64,
+        "sources": {"data/source.csv": "6" * 64},
+        "sidecars": {"data/source.provenance.json": "7" * 64},
+    }
     members = {
         "trajectory.csv": (
             b"operating_step,timestamp_utc,grid_kw\n"
@@ -155,11 +167,22 @@ def _write_handcrafted_bundle(
             "git_revision": "2" * 40,
             "executable_source_tree_sha256": "3" * 64,
             "executable_path_hashes": {"control/mpc_controller.py": "4" * 64},
+            "committed_executable_path_hashes": {
+                "control/mpc_controller.py": "4" * 64
+            },
             "publication_eligible": publication_eligible,
             "dirty_executable_paths": [] if publication_eligible else ["control/mpc_controller.py"],
+            "untracked_executable_paths": [],
         },
-        "runtime": {"python": "3.11", "do_mpc": "5.1", "casadi": "3.7"},
-        "input_hashes": {"scenario": "5" * 64},
+        "runtime": {
+            "python": "3.11",
+            "platform": "test-platform",
+            "do_mpc": "5.1",
+            "casadi": "3.7",
+            "numpy": "2.0",
+            "pandas": "2.0",
+        },
+        "input_hashes": input_hashes,
         "member_hashes": {name: _sha256(data) for name, data in members.items()},
         "valid": True,
     }
@@ -258,7 +281,6 @@ def test_causal_claim_scan_allows_genuinely_noncausal_method_description():
     assert _uncited_causal_claims(readme, ablations) == []
 
 
-@pytest.mark.xfail(strict=True, reason="PF-06: publication accepts failed validation evidence")
 def test_bundle_verification_rejects_a_failed_validation_report(tmp_path):
     from accounting import verify_run_bundle
 
@@ -275,7 +297,6 @@ def test_bundle_verification_rejects_a_failed_validation_report(tmp_path):
         verify_run_bundle(bundle_path, expected_identifier=bundle_id)
 
 
-@pytest.mark.xfail(strict=True, reason="PF-06: publication accepts missing solver status")
 def test_bundle_verification_rejects_missing_solver_status(tmp_path):
     from accounting import verify_run_bundle
 
@@ -290,7 +311,6 @@ def test_bundle_verification_rejects_missing_solver_status(tmp_path):
         verify_run_bundle(bundle_path, expected_identifier=bundle_id)
 
 
-@pytest.mark.xfail(strict=True, reason="PF-06: publication accepts dirty executable source")
 def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
     from accounting import verify_run_bundle
 
@@ -302,7 +322,6 @@ def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
         verify_run_bundle(bundle_path, expected_identifier=bundle_id)
 
 
-@pytest.mark.xfail(strict=True, reason="PF-06/ADR-0007: changed member bytes are accepted")
 def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
     from accounting import verify_run_bundle
 
@@ -316,7 +335,21 @@ def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
         verify_run_bundle(bundle_path, expected_identifier=bundle_id)
 
 
-@pytest.mark.xfail(strict=True, reason="PF-06/ADR-0007: publication lookup accepts non-authoritative IDs")
+def test_bundle_verification_rejects_non_full_input_hashes(tmp_path):
+    from accounting import verify_run_bundle
+
+    bundle_path, bundle_id = _write_handcrafted_bundle(
+        tmp_path,
+        input_hashes={
+            "scenario": "5" * 12,
+            "sources": {"data/source.csv": "6" * 64},
+            "sidecars": {"data/source.provenance.json": "7" * 64},
+        },
+    )
+    with pytest.raises(ValueError, match="full lowercase SHA-256"):
+        verify_run_bundle(bundle_path, expected_identifier=bundle_id)
+
+
 @pytest.mark.parametrize("identifier_kind", ["shortened", "unknown"])
 def test_publication_lookup_requires_a_known_full_bundle_identifier(tmp_path, identifier_kind):
     from accounting import load_run_bundle

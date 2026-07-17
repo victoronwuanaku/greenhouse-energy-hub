@@ -11,7 +11,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,10 +19,16 @@ sys.path.insert(0, str(ROOT))
 from accounting import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationReport,
+    RunBundle,
     evaluate_run,
     saving_percent,
 )
-from control.rolling_horizon import ValidRun, load_data, run_simulation
+from control.rolling_horizon import (
+    ValidRun,
+    _persist_outcome,
+    load_data,
+    run_simulation,
+)
 from models.hub_model import AssetCapabilities, HubConfiguration
 
 
@@ -97,12 +102,27 @@ def main() -> None:
         hub_config=HubConfiguration(),
         evaluation_policy=EVALUATION_POLICY,
     )
+    baseline_artifact = _persist_outcome(
+        baseline_outcome,
+        EVALUATION_POLICY,
+        results_root=ROOT / "results",
+        executable_paths=(
+            "accounting.py",
+            "scenarios.py",
+            "models/hub_model.py",
+            "control/rolling_horizon.py",
+            "experiments/ablations.py",
+        ),
+    )
     if not isinstance(baseline_outcome, ValidRun):
         print(
             f"INVALID baseline Run at step {baseline_outcome.failed_step}: "
             f"{baseline_outcome.failure_code}: {baseline_outcome.message}"
         )
+        print(f"Diagnostics -> {baseline_artifact}")
         return
+    assert isinstance(baseline_artifact, RunBundle)
+    print(f"Verified Run Bundle -> {baseline_artifact.path}")
     baseline_report = evaluate_run(baseline_outcome, EVALUATION_POLICY)
 
     rows: list[dict[str, object]] = []
@@ -117,12 +137,28 @@ def main() -> None:
             evaluation_policy=EVALUATION_POLICY,
             **mpc_options,
         )
+        artifact = _persist_outcome(
+            outcome,
+            EVALUATION_POLICY,
+            results_root=ROOT / "results",
+            executable_paths=(
+                "accounting.py",
+                "scenarios.py",
+                "models/hub_model.py",
+                "control/rolling_horizon.py",
+                "control/mpc_controller.py",
+                "experiments/ablations.py",
+            ),
+        )
         if not isinstance(outcome, ValidRun):
             print(
                 f"INVALID {name} Run at step {outcome.failed_step}: "
                 f"{outcome.failure_code}: {outcome.message}"
             )
+            print(f"Diagnostics -> {artifact}")
             return
+        assert isinstance(artifact, RunBundle)
+        print(f"Verified Run Bundle -> {artifact.path}")
         rows.append(
             _scorecard_row(
                 name,
@@ -132,11 +168,6 @@ def main() -> None:
         )
 
     table = pd.DataFrame(rows)
-    scenario_directory = ROOT / "results" / "scenarios"
-    figure_directory = ROOT / "results" / "figures"
-    scenario_directory.mkdir(parents=True, exist_ok=True)
-    figure_directory.mkdir(parents=True, exist_ok=True)
-    table.to_csv(scenario_directory / "ablations.csv", index=False)
 
     baseline = baseline_report.nominal
     print("\n" + "=" * 78)
@@ -148,27 +179,7 @@ def main() -> None:
     print("=" * 78)
     print(table.to_string(index=False))
 
-    saving_column = "Inventory-Adjusted Saving vs Baseline [%]"
-    fig, axis = plt.subplots(figsize=(7.5, 4))
-    colors = ["#2166ac"] + ["#7fb3d5"] * (len(table) - 1)
-    bars = axis.bar(table["Variant"], table[saving_column], color=colors)
-    axis.axhline(0, color="k", lw=0.6)
-    axis.set_ylabel("Inventory-Adjusted saving vs Baseline [%]")
-    axis.set_title("Winter ablation under one Evaluation Policy")
-    for bar, value in zip(bars, table[saving_column], strict=True):
-        axis.text(
-            bar.get_x() + bar.get_width() / 2,
-            value + (0.4 if value >= 0 else -1.2),
-            f"{value:.1f}%",
-            ha="center",
-            fontsize=9,
-        )
-    fig.tight_layout()
-    figure_path = figure_directory / "fig6_ablation.png"
-    fig.savefig(figure_path, bbox_inches="tight")
-    print(
-        f"\nSaved {scenario_directory / 'ablations.csv'} and {figure_path}"
-    )
+    print("\nEvery row above is backed by the verified full-ID Run Bundle printed above.")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .worktrees/
+results/runs/.tmp-*/
+results/diagnostics/
 
 # OS
 .DS_Store

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict, fields, replace
 from datetime import datetime, timedelta, timezone
+import io
 import json
+import os
+from pathlib import Path
+import re
+import subprocess
 
 import pytest
 
@@ -129,6 +135,58 @@ def _policy():
             fuel_cell_eur_per_kwh=0.002,
         )
     )
+
+
+def _publication_ready_run(**run_options):
+    """Attach source and sidecar provenance to the compact evaluation fixture."""
+    from scenarios import SourceProvenance
+
+    run = _two_step_valid_run(**run_options)
+    provenance = SourceProvenance(
+        source_name="test-source",
+        source_path="data/test-source.csv",
+        sha256="1" * 64,
+        acquisition_parameters={
+            "sidecar_path": "data/test-source.provenance.json",
+            "sidecar_sha256": "2" * 64,
+            "parameters": {"fixture": "two-step"},
+        },
+        original_timezone="UTC",
+        units={"value": "kW"},
+        transformations=("test-fixture",),
+    )
+    return replace(
+        run,
+        scenario=replace(run.scenario, provenance=(provenance,)),
+    )
+
+
+def _committed_executable_repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "executable-repository"
+    repository.mkdir(parents=True)
+    (repository / "runner.py").write_text(
+        "def run():\n    return 'committed'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "runner.py"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task 7 Test",
+            "-c",
+            "user.email=task7@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    return repository
 
 
 def test_evaluation_stable_interfaces_have_exact_fields():
@@ -546,3 +604,490 @@ def test_ablation_variants_use_hub_configuration_and_publish_separate_scorecard(
         "effective" in column.casefold() or "comfort cost" in column.casefold()
         for column in row
     )
+
+
+def test_run_identity_interfaces_and_canonical_json_are_exact_and_finite():
+    from accounting import (
+        RunBundle,
+        RunSpecification,
+        canonical_json_bytes,
+        sha256_bytes,
+    )
+
+    assert [field.name for field in fields(RunSpecification)] == [
+        "identifier",
+        "canonical_content",
+        "publication_eligible",
+    ]
+    assert [field.name for field in fields(RunBundle)] == [
+        "identifier",
+        "specification_identifier",
+        "path",
+        "manifest",
+    ]
+    left = {"z": ["é", 1.0], "a": {"b": True}}
+    right = {"a": {"b": True}, "z": ["é", 1.0]}
+    expected = b'{"a":{"b":true},"z":["\xc3\xa9",1.0]}'
+
+    assert canonical_json_bytes(left) == expected
+    assert canonical_json_bytes(right) == expected
+    assert re.fullmatch(r"[0-9a-f]{64}", sha256_bytes(expected))
+    with pytest.raises(ValueError):
+        canonical_json_bytes({"not_finite": float("nan")})
+
+
+def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axis(
+    tmp_path,
+):
+    from accounting import build_run_specification
+    from scenarios import ScenarioPoint
+
+    repository = _committed_executable_repository(tmp_path)
+    run = _publication_ready_run(
+        controller_configuration={"horizon_steps": 0},
+        capability_policy=BASELINE_CAPABILITY_POLICY,
+    )
+    base = build_run_specification(
+        run,
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    source = run.scenario.provenance[0]
+    changed_source = replace(source, sha256="3" * 64)
+    source_specification = build_run_specification(
+        replace(run, scenario=replace(run.scenario, provenance=(changed_source,))),
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    first_point = run.scenario.points[0]
+    changed_point = ScenarioPoint(
+        first_point.timestamp_utc,
+        first_point.price_eur_per_kwh + 0.001,
+        first_point.pv_kw,
+        first_point.electric_load_kw,
+        first_point.outdoor_temperature_c,
+        first_point.irradiance_w_per_m2,
+    )
+    input_specification = build_run_specification(
+        replace(
+            run,
+            scenario=replace(
+                run.scenario,
+                points=(changed_point, *run.scenario.points[1:]),
+            ),
+        ),
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    configuration_specification = build_run_specification(
+        replace(run, controller_configuration={"horizon_steps": 1}),
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    changed_runtime = dict(base.runtime)
+    changed_runtime["platform"] = f"{changed_runtime['platform']}-changed"
+    runtime_specification = build_run_specification(
+        run,
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+        runtime=changed_runtime,
+    )
+    (repository / "runner.py").write_text(
+        "def run():\n    return 'dirty-working-bytes'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    code_specification = build_run_specification(
+        run,
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+
+    specifications = (
+        base,
+        source_specification,
+        input_specification,
+        configuration_specification,
+        runtime_specification,
+        code_specification,
+    )
+    assert len({item.identifier for item in specifications}) == len(specifications)
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item.identifier) for item in specifications)
+    assert base.publication_eligible is True
+    assert code_specification.publication_eligible is False
+    assert base.input_hashes == {
+        "scenario": base.input_hashes["scenario"],
+        "sources": {"data/test-source.csv": "1" * 64},
+        "sidecars": {"data/test-source.provenance.json": "2" * 64},
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", base.input_hashes["scenario"])
+    assert set(base.runtime) == {
+        "python",
+        "platform",
+        "do_mpc",
+        "casadi",
+        "numpy",
+        "pandas",
+    }
+    assert base.code_provenance["executable_path_hashes"] == {
+        "runner.py": base.code_provenance["executable_path_hashes"]["runner.py"]
+    }
+    assert re.fullmatch(
+        r"[0-9a-f]{64}",
+        base.code_provenance["executable_source_tree_sha256"],
+    )
+
+
+def test_code_provenance_scopes_dirty_checks_to_explicit_executables(tmp_path):
+    from accounting import collect_code_provenance
+
+    repository = _committed_executable_repository(tmp_path)
+    (repository / "REVIEW_RESPONSE.md").write_text("unrelated\n", encoding="utf-8")
+    clean = collect_code_provenance(
+        ("runner.py",), repository_root=repository
+    )
+    (repository / "generated.py").write_text("untracked executable\n", encoding="utf-8")
+    untracked = collect_code_provenance(
+        ("runner.py", "generated.py"), repository_root=repository
+    )
+
+    assert clean["publication_eligible"] is True
+    assert clean["dirty_executable_paths"] == []
+    assert clean["untracked_executable_paths"] == []
+    assert "REVIEW_RESPONSE.md" not in clean["executable_path_hashes"]
+    assert untracked["publication_eligible"] is False
+    assert untracked["untracked_executable_paths"] == ["generated.py"]
+
+
+def test_run_specification_rejects_nonfinite_missing_provenance_and_bad_mpc_evidence(
+    tmp_path,
+):
+    from accounting import build_run_specification
+
+    repository = _committed_executable_repository(tmp_path)
+    with pytest.raises(ValueError, match="provenance"):
+        build_run_specification(
+            _two_step_valid_run(),
+            _policy(),
+            executable_paths=("runner.py",),
+            repository_root=repository,
+        )
+
+    finite_run = _publication_ready_run()
+    with pytest.raises((TypeError, ValueError), match="finite|JSON"):
+        build_run_specification(
+            replace(finite_run, controller_configuration={"weight": float("inf")}),
+            _policy(),
+            executable_paths=("runner.py",),
+            repository_root=repository,
+        )
+
+    mpc_run = _publication_ready_run(controller_name="mpc")
+    bad_diagnostics = replace(
+        mpc_run.controller_diagnostics[0], solver_return_status=None
+    )
+    with pytest.raises(ValueError, match="solver.*evidence|return status"):
+        build_run_specification(
+            replace(
+                mpc_run,
+                controller_diagnostics=(
+                    bad_diagnostics,
+                    *mpc_run.controller_diagnostics[1:],
+                ),
+            ),
+            _policy(),
+            executable_paths=("runner.py",),
+            repository_root=repository,
+        )
+
+
+def test_valid_run_serialization_is_fixed_finite_utc_and_one_row_per_step():
+    from accounting import evaluate_run, serialize_valid_run
+
+    run = _publication_ready_run(capability_policy=BASELINE_CAPABILITY_POLICY)
+    report = evaluate_run(run, _policy())
+    members = serialize_valid_run(run, report)
+
+    assert tuple(members) == (
+        "trajectory.csv",
+        "controller_diagnostics.csv",
+        "summary.json",
+        "validation.json",
+    )
+    assert all(data.endswith(b"\n") for name, data in members.items() if name.endswith(".csv"))
+    assert b"\r\n" not in members["trajectory.csv"]
+    trajectory_rows = list(
+        csv.DictReader(io.StringIO(members["trajectory.csv"].decode("utf-8")))
+    )
+    diagnostics_rows = list(
+        csv.DictReader(
+            io.StringIO(members["controller_diagnostics.csv"].decode("utf-8"))
+        )
+    )
+    assert list(trajectory_rows[0]) == [
+        "operating_step",
+        "timestamp_utc",
+        "start_soc_battery_kwh",
+        "start_soc_hydrogen_kg",
+        "start_soc_thermal_kwh",
+        "start_indoor_temperature_c",
+        "battery_charge_kw",
+        "battery_discharge_kw",
+        "electrolyser_kw",
+        "fuel_cell_kw",
+        "heat_pump_kw",
+        "electric_boiler_kw",
+        "thermal_charge_kw",
+        "thermal_discharge_kw",
+        "ventilation_fraction",
+        "pv_kw",
+        "electric_load_kw",
+        "price_eur_per_kwh",
+        "outdoor_temperature_c",
+        "irradiance_w_per_m2",
+        "reached_soc_battery_kwh",
+        "reached_soc_hydrogen_kg",
+        "reached_soc_thermal_kwh",
+        "reached_indoor_temperature_c",
+        "grid_kw",
+        "generated_heat_kw",
+        "heat_to_air_kw",
+        "thermal_charge_margin_kw",
+        "hydrogen_production_kg_per_h",
+        "hydrogen_consumption_kg_per_h",
+    ]
+    assert list(diagnostics_rows[0]) == [
+        "operating_step",
+        "adapter",
+        "decision_status",
+        "solver_success",
+        "solver_return_status",
+        "solver_iterations",
+        "solver_wall_seconds",
+        "forecast_start_utc",
+        "forecast_end_utc",
+        "terminal_electric_value_eur_per_kwh",
+        "terminal_heat_value_eur_per_kwhth",
+    ]
+    assert len(trajectory_rows) == len(diagnostics_rows) == run.scenario.operating_step_count
+    assert all(row["timestamp_utc"].endswith("Z") for row in trajectory_rows)
+    summary = json.loads(members["summary.json"])
+    validation = json.loads(members["validation.json"])
+    assert summary["policy"] == report.policy.to_serializable_metadata()
+    assert summary["nominal"] == asdict(report.nominal)
+    assert len(summary["step_line_items"]) == run.scenario.operating_step_count
+    assert validation["complete"] is validation["valid"] is True
+    assert validation["checked_operating_steps"] == run.scenario.operating_step_count
+    assert len(validation["steps"]) == run.scenario.operating_step_count
+    assert all(step["physical_invariants_valid"] for step in validation["steps"])
+
+
+def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, monkeypatch):
+    import accounting
+    from accounting import (
+        BundleCollisionError,
+        build_run_specification,
+        create_run_bundle,
+        evaluate_run,
+    )
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run(capability_policy=BASELINE_CAPABILITY_POLICY)
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    runs_root = tmp_path / "results" / "runs"
+    fsync_calls: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor):
+        fsync_calls.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(accounting.os, "fsync", recording_fsync)
+    first = create_run_bundle(run, report, specification, runs_root)
+    inode = first.path.stat().st_ino
+    second = create_run_bundle(run, report, specification, runs_root)
+
+    assert first == second
+    assert second.path.stat().st_ino == inode
+    assert first.path.name.endswith(first.identifier)
+    assert re.fullmatch(r"[0-9a-f]{64}", first.identifier)
+    assert len(fsync_calls) >= 7
+    assert not list(runs_root.glob(".tmp-*"))
+
+    (first.path / "summary.json").write_bytes(b"{}")
+    with pytest.raises(BundleCollisionError):
+        create_run_bundle(run, report, specification, runs_root)
+
+
+def test_one_specification_retains_divergent_valid_outputs(tmp_path):
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run(controller_name="mpc")
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    changed_diagnostics = (
+        replace(run.controller_diagnostics[0], solver_wall_seconds=0.02),
+        *run.controller_diagnostics[1:],
+    )
+    divergent_run = replace(run, controller_diagnostics=changed_diagnostics)
+    runs_root = tmp_path / "results" / "runs"
+
+    first = create_run_bundle(run, report, specification, runs_root)
+    second = create_run_bundle(divergent_run, report, specification, runs_root)
+
+    assert first.specification_identifier == second.specification_identifier
+    assert first.identifier != second.identifier
+    assert first.path.exists() and second.path.exists()
+
+
+def test_interrupted_bundle_write_removes_only_its_owned_temporary_directory(
+    tmp_path,
+    monkeypatch,
+):
+    import accounting
+    from accounting import build_run_specification, create_run_bundle, evaluate_run
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    run = _publication_ready_run()
+    report = evaluate_run(run, _policy())
+    specification = build_run_specification(
+        run,
+        report.policy,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    runs_root = tmp_path / "results" / "runs"
+    runs_root.mkdir(parents=True)
+    unrelated = runs_root / ".tmp-unrelated-owner"
+    unrelated.mkdir()
+
+    def interrupt_replace(_source, _destination):
+        raise KeyboardInterrupt("simulated interruption")
+
+    monkeypatch.setattr(accounting.os, "replace", interrupt_replace)
+    with pytest.raises(KeyboardInterrupt):
+        create_run_bundle(run, report, specification, runs_root)
+
+    assert unrelated.is_dir()
+    assert sorted(path.name for path in runs_root.glob(".tmp-*")) == [
+        ".tmp-unrelated-owner"
+    ]
+    assert not list(runs_root.glob(f"*--{specification.identifier}"))
+
+
+def test_invalid_run_writes_separate_non_bundle_diagnostics(tmp_path):
+    from accounting import (
+        build_run_specification,
+        verify_run_bundle,
+        write_failure_diagnostics,
+    )
+    from control.rolling_horizon import InvalidRun
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    valid = _publication_ready_run()
+    invalid = InvalidRun(
+        scenario=valid.scenario,
+        controller_name=valid.controller_name,
+        controller_configuration=valid.controller_configuration,
+        capability_policy=valid.capability_policy,
+        hub_configuration=valid.hub_configuration,
+        failed_step=1,
+        failure_code="forced_failure",
+        message="diagnostic evidence only",
+        partial_records=valid.records[:1],
+        controller_diagnostics=valid.controller_diagnostics[:1],
+    )
+    specification = build_run_specification(
+        invalid,
+        _policy(),
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    diagnostics_root = tmp_path / "results" / "diagnostics"
+
+    path = write_failure_diagnostics(invalid, specification, diagnostics_root)
+
+    assert path.parent.name == specification.identifier
+    assert path.is_relative_to(diagnostics_root)
+    assert (path / "failure.json").is_file()
+    assert (path / "controller_diagnostics.csv").is_file()
+    assert not (path / "manifest.json").exists()
+    with pytest.raises(ValueError, match="Run Bundle|manifest"):
+        verify_run_bundle(path)
+
+
+def test_legacy_entry_point_persists_valid_bundles_and_invalid_diagnostics(tmp_path):
+    from accounting import RunBundle
+    from control.rolling_horizon import InvalidRun, _persist_outcome
+
+    repository = _committed_executable_repository(tmp_path / "repo-fixture")
+    valid = _publication_ready_run()
+    policy = _policy()
+    results_root = tmp_path / "results"
+
+    valid_artifact = _persist_outcome(
+        valid,
+        policy,
+        results_root=results_root,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+    invalid = InvalidRun(
+        scenario=valid.scenario,
+        controller_name=valid.controller_name,
+        controller_configuration=valid.controller_configuration,
+        capability_policy=valid.capability_policy,
+        hub_configuration=valid.hub_configuration,
+        failed_step=0,
+        failure_code="forced_failure",
+        message="failure path",
+        partial_records=(),
+        controller_diagnostics=(),
+    )
+    invalid_artifact = _persist_outcome(
+        invalid,
+        policy,
+        results_root=results_root,
+        executable_paths=("runner.py",),
+        repository_root=repository,
+    )
+
+    assert isinstance(valid_artifact, RunBundle)
+    assert valid_artifact.path.is_relative_to(results_root / "runs")
+    assert invalid_artifact.is_relative_to(results_root / "diagnostics")
+    assert not (invalid_artifact / "manifest.json").exists()
+
+
+def test_legacy_entry_points_no_longer_write_mutable_csv_or_figure_artifacts():
+    import inspect
+
+    from control import rolling_horizon
+    from experiments import ablations
+
+    rolling_source = inspect.getsource(rolling_horizon.main)
+    ablation_source = inspect.getsource(ablations.main)
+    assert ".to_csv(" not in rolling_source
+    assert "baseline_results.csv" not in rolling_source
+    assert "mpc_results.csv" not in rolling_source
+    assert "summary.csv" not in rolling_source
+    assert ".to_csv(" not in ablation_source
+    assert "ablations.csv" not in ablation_source
+    assert ".savefig(" not in ablation_source

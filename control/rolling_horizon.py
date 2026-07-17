@@ -68,9 +68,13 @@ from models.hub_model import (
 from accounting import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationPolicy,
+    RunBundle,
+    build_run_specification,
+    create_run_bundle,
     evaluate_run,
     evaluate_step,
     saving_percent,
+    write_failure_diagnostics,
 )
 from scenarios import (
     Scenario,
@@ -1203,6 +1207,37 @@ def run_simulation(
     return simulate_run(scenario, controller, hub_config)
 
 
+def _persist_outcome(
+    outcome: ValidRun | InvalidRun,
+    evaluation_policy: EvaluationPolicy,
+    *,
+    results_root: str | Path,
+    executable_paths: tuple[str | Path, ...],
+    repository_root: str | Path = ROOT,
+) -> RunBundle | Path:
+    """Route valid evidence to Runs and failed evidence to diagnostics."""
+    specification = build_run_specification(
+        outcome,
+        evaluation_policy,
+        executable_paths=executable_paths,
+        repository_root=repository_root,
+    )
+    root = Path(results_root)
+    if isinstance(outcome, ValidRun):
+        report = evaluate_run(outcome, evaluation_policy)
+        return create_run_bundle(
+            outcome,
+            report,
+            specification,
+            root / "runs",
+        )
+    return write_failure_diagnostics(
+        outcome,
+        specification,
+        root / "diagnostics",
+    )
+
+
 def scenario_tag(start_month: int, n_days: int) -> str:
     """Human-readable scenario label, e.g. 'winter_m01_14d'."""
     season = {12: "winter", 1: "winter", 2: "winter",
@@ -1246,8 +1281,6 @@ def main():
     )
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    scen_dir = RESULTS_DIR / "scenarios"
-    scen_dir.mkdir(exist_ok=True)
     tag = scenario_tag(args.start_month, args.days)
 
     print("=" * 65)
@@ -1268,16 +1301,39 @@ def main():
             hub_config=hub_config,
             evaluation_policy=DEFAULT_EVALUATION_POLICY,
         )
+        executable_paths: tuple[str | Path, ...] = (
+            "accounting.py",
+            "scenarios.py",
+            "models/hub_model.py",
+            "control/rolling_horizon.py",
+        )
+        if mode == "mpc":
+            executable_paths += ("control/mpc_controller.py",)
+        artifact: RunBundle | Path | None = None
+        if isinstance(outcome, (ValidRun, InvalidRun)):
+            try:
+                artifact = _persist_outcome(
+                    outcome,
+                    DEFAULT_EVALUATION_POLICY,
+                    results_root=RESULTS_DIR,
+                    executable_paths=executable_paths,
+                )
+            except ValueError as exc:
+                # Compatibility-frame Runs deliberately lack source provenance and
+                # therefore cannot cross the Task 7 publication boundary.
+                print(f"  ARTIFACT REJECTED: {exc}")
         if not isinstance(outcome, ValidRun):
             print(
                 f"  INVALID RUN at step {outcome.failed_step}: "
                 f"{outcome.failure_code}: {outcome.message}"
             )
+            if artifact is not None:
+                print(f"  Diagnostics -> {artifact}")
             continue
-        res = outcome.to_frame()
         runs[mode] = outcome
-        res.to_csv(RESULTS_DIR / f"{mode}_results.csv")          # canonical (latest run)
-        res.to_csv(scen_dir / f"{tag}_{mode}.csv")               # scenario archive
+        if artifact is not None:
+            assert isinstance(artifact, RunBundle)
+            print(f"  Verified Run Bundle -> {artifact.path}")
 
     if "baseline" in runs and "mpc" in runs:
         baseline_report = evaluate_run(
@@ -1313,59 +1369,7 @@ def main():
         )
         print("=" * 65)
 
-        update_summary(scen_dir / "summary.csv", {
-            "scenario": tag,
-            "window_start": str(pd.Timestamp(scenario.operating_start).date()),
-            "days": args.days,
-            "baseline_grid_eur": round(baseline.grid_cost_eur, 1),
-            "mpc_grid_eur": round(mpc.grid_cost_eur, 1),
-            "baseline_operating_eur": round(baseline.operating_cost_eur, 1),
-            "mpc_operating_eur": round(mpc.operating_cost_eur, 1),
-            "baseline_inventory_adjusted_eur": round(
-                baseline.inventory_adjusted_cost_eur, 1
-            ),
-            "mpc_inventory_adjusted_eur": round(
-                mpc.inventory_adjusted_cost_eur, 1
-            ),
-            "inventory_adjusted_saving_pct": round(
-                saving_percent(
-                    baseline.inventory_adjusted_cost_eur,
-                    mpc.inventory_adjusted_cost_eur,
-                ),
-                2,
-            ),
-            "baseline_comfort_violation_Ch": round(
-                baseline.comfort_violation_c_h, 1
-            ),
-            "mpc_comfort_violation_Ch": round(
-                mpc.comfort_violation_c_h, 1
-            ),
-            "baseline_wear_0x_inventory_adjusted_eur": round(
-                baseline_report.wear_sensitivities[
-                    "0x"
-                ].inventory_adjusted_cost_eur,
-                1,
-            ),
-            "baseline_wear_2x_inventory_adjusted_eur": round(
-                baseline_report.wear_sensitivities[
-                    "2x"
-                ].inventory_adjusted_cost_eur,
-                1,
-            ),
-            "mpc_wear_0x_inventory_adjusted_eur": round(
-                mpc_report.wear_sensitivities[
-                    "0x"
-                ].inventory_adjusted_cost_eur,
-                1,
-            ),
-            "mpc_wear_2x_inventory_adjusted_eur": round(
-                mpc_report.wear_sensitivities[
-                    "2x"
-                ].inventory_adjusted_cost_eur,
-                1,
-            ),
-        })
-        print(f"  Scenario archive -> {scen_dir}/{tag}_*.csv  | summary -> {scen_dir}/summary.csv")
+        print("  Published inputs are the verified full-ID Run Bundles above.")
 
 
 if __name__ == "__main__":
