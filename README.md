@@ -116,28 +116,33 @@ subject to
 
 ```
 greenhouse-energy-hub-mpc/
+├── src/greenhouse_energy_hub/
+│   ├── hub.py               # shared numerical/symbolic physics and capabilities
+│   ├── simulation.py        # validated rolling-horizon execution
+│   ├── scenarios.py         # time semantics, retained inputs, and provenance
+│   ├── evaluation.py        # scorecards, Run Bundles, verification, publication
+│   └── controllers/
+│       ├── baseline.py      # characterized limited-capability baseline policy
+│       └── mpc.py           # do-mpc/CasADi controller Adapter
+├── scripts/
+│   ├── fetch_pvgis.py       # optional PV/weather network acquisition
+│   ├── fetch_prices.py      # optional price network acquisition
+│   └── generate_demand.py   # deterministic derived-demand materialization
 ├── data/
-│   ├── fetch_pvgis.py        # PVGIS API — Westland NL solar + weather
-│   ├── fetch_prices.py       # energy-charts.info — NL day-ahead prices
-│   ├── generate_demand.py    # synthetic greenhouse ELECTRICITY load (WUR params)
-│   └── *.csv                 # generated inputs (hourly UTC)
-├── models/
-│   └── hub_model.py          # assets, bounds, plant dynamics (Geidl–Andersson hub)
-├── control/
-│   ├── mpc_controller.py     # do-mpc symbolic MPC (CasADi / IPOPT)
-│   └── rolling_horizon.py    # data alignment, simulation loop, limited-capability baseline, CLI
-├── accounting.py             # shared cost/saving calc (CLI, notebook, tests agree)
+│   ├── source/              # retained acquired CSV bytes and provenance sidecars
+│   └── derived/             # reproducible demand view and provenance sidecar
 ├── experiments/
-│   └── ablations.py          # winter ablation study (no-H2 / no-TES / myopic)
-├── tests/
-│   └── test_hub.py           # physical + control invariants & integration (pytest)
+│   ├── run_scenario.py      # validated Baseline/MPC Run entry point
+│   ├── ablations.py         # full/no-H₂/no-TES/one-step study
+│   └── publish_results.py   # verified manifest/README/figure regeneration
+├── tests/                   # physics, Scenario, simulation, evaluation, publication
 ├── notebooks/
-│   └── results_analysis.ipynb
-├── pyproject.toml            # metadata, Python ≥3.11, pytest config
+│   └── results_analysis.ipynb  # shared committed-manifest consumer
+├── pyproject.toml           # installable src-layout package and test configuration
 └── results/
-    ├── runs/                 # content-addressed verified Run Bundles
-    ├── publication_manifest.json  # pinned publication recipe
-    └── figures/              # regenerated fig1–fig6 used by the README
+    ├── runs/                # immutable full-ID Run Bundles
+    ├── publication_manifest.json  # tracked exact publication recipe
+    └── figures/             # regenerated fig1–fig6 used by the README
 ```
 
 ---
@@ -147,20 +152,78 @@ greenhouse-energy-hub-mpc/
 ```bash
 git clone https://github.com/victoronwuanaku/greenhouse-energy-hub-mpc
 cd greenhouse-energy-hub-mpc
-pip install -r requirements.txt      # or: pip install -e ".[dev]"
+python -m pip install -e '.[dev]'
+```
 
-# Generate inputs (PV/weather + NL prices, then the electrical load)
-python3 data/fetch_pvgis.py
-python3 data/fetch_prices.py
-python3 data/generate_demand.py
+The committed files in `data/source/` (and their provenance sidecars) are the
+retained reproduction inputs. Reproducing the published evidence does not need a
+network refresh or the ignored diagnostics candidate index:
 
-# Generate verified candidate Run Bundles, then publish the pinned recipe
-python3 experiments/run_scenario.py --name winter-2023-14d --start 2023-01-01T00:00:00+01:00 --days 14 --controller baseline --candidate-key winter-baseline
-python3 experiments/publish_results.py --candidates results/diagnostics/publication-candidates.json --manifest results/publication_manifest.json
+```bash
+python experiments/publish_results.py \
+    --manifest results/publication_manifest.json
+python -m pytest -o addopts='' -q -ra tests/test_published_artifacts.py
+git diff --exit-code -- README.md results/publication_manifest.json results/figures
+```
 
-# Tests and analysis
-python3 -m pytest tests/ -q
-jupyter nbconvert --to notebook --execute --inplace notebooks/results_analysis.ipynb
+The publisher reconstructs all eight exact stable candidate roles from the tracked
+manifest when `results/diagnostics/publication-candidates.json` is absent, verifies
+every full-ID Run Bundle and its causal semantics, and then regenerates only the
+pinned manifest, six figures, and marked README result block. The final `git diff`
+checks that committed publication bytes remain unchanged.
+
+### Optional input refresh
+
+These commands deliberately perform network acquisition and replace retained input
+bytes. They are for creating a new study, not reproducing the committed publication;
+new source hashes necessarily produce new Run Specification and Run Bundle IDs.
+
+```bash
+python scripts/fetch_pvgis.py
+python scripts/fetch_prices.py
+python scripts/generate_demand.py --target-year 2023
+```
+
+### Full publication Run generation
+
+To generate a fresh Task 13 candidate index, run the exact approved 14-local-day
+windows below. The shared Scenario always carries 24 forecast-coverage steps; the
+Baseline uses horizon zero, the full MPC uses horizon 24, and only the one-step
+ablation changes controller horizon.
+
+```bash
+python experiments/run_scenario.py \
+    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
+    --days 14 --controller baseline --scenario-max-horizon 24 \
+    --candidate-key winter-baseline
+python experiments/run_scenario.py \
+    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
+    --days 14 --controller mpc --horizon 24 --scenario-max-horizon 24 \
+    --candidate-key winter-mpc
+python experiments/run_scenario.py \
+    --name summer-2023-14d --start 2023-06-01T00:00:00+02:00 \
+    --days 14 --controller baseline --scenario-max-horizon 24 \
+    --candidate-key summer-baseline
+python experiments/run_scenario.py \
+    --name summer-2023-14d --start 2023-06-01T00:00:00+02:00 \
+    --days 14 --controller mpc --horizon 24 --scenario-max-horizon 24 \
+    --candidate-key summer-mpc
+python experiments/ablations.py \
+    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
+    --days 14 --scenario-max-horizon 24 \
+    --candidate-index results/diagnostics/publication-candidates.json
+```
+
+The ablation command records `ablation-full`, `ablation-no-h2`,
+`ablation-no-tes`, and `ablation-one-step`; together with the four explicit
+comparison keys above, the candidate index has exactly the required eight roles.
+Publish that newly generated index with:
+
+```bash
+python experiments/publish_results.py \
+    --candidates results/diagnostics/publication-candidates.json \
+    --manifest results/publication_manifest.json
+python -m pytest -o addopts='' -q -ra
 ```
 
 ---
@@ -173,7 +236,11 @@ jupyter nbconvert --to notebook --execute --inplace notebooks/results_analysis.i
 | NL day-ahead prices | energy-charts.info (Fraunhofer ISE / ENTSO-E) | 2023, hourly |
 | Greenhouse electrical load | Synthetic, WUR-parameterised (Warmenhoven et al. 2023) | hourly |
 
-PV/weather (2020) and prices (2023) come from different years; `load_data` aligns them **explicitly by (month, day, hour)** after flooring the PVGIS `:11` solar-time stamps to the hour (Feb 29 has no non-leap-year price counterpart and is dropped by the key join). This is a deliberate simplification for a synthetic study — switch the PVGIS database to ERA5/2023 for a fully single-year dataset. Heat demand is **not** prescribed: it is implicit in the greenhouse temperature ODE.
+PV/weather (2020) and prices (2023) come from different years. The Scenario Module
+validates exact hourly UTC source coverage and explicitly transplants PV/weather by
+calendar instant onto each 2023 Operating Window; operating-clock schedules use
+`Europe/Amsterdam`. This is a deliberate synthetic-study simplification. Heat demand
+is **not** prescribed: it is implicit in the greenhouse temperature ODE.
 
 ---
 
@@ -204,7 +271,7 @@ PV/weather (2020) and prices (2023) come from different years; `load_data` align
 
 1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278* — recent work combining reinforcement learning with predictive control for greenhouse climate management.
 2. **Fiedler, F. et al. (2023).** do-mpc: Towards FAIR nonlinear and robust MPC. *Control Engineering Practice, 140*, 105676.
-3. **Geidl, M. & Andersson, G. (2007).** Optimal power flow of multiple energy carriers. *IEEE Trans. Power Syst. 22*(1), 145–155 — the energy-hub framework used in `hub_model.py`.
+3. **Geidl, M. & Andersson, G. (2007).** Optimal power flow of multiple energy carriers. *IEEE Trans. Power Syst. 22*(1), 145–155 — the energy-hub framework used in `src/greenhouse_energy_hub/hub.py`.
 4. **Coordinated distributed MPC for multi-energy carrier systems** (2024). *Scientific Reports.*
 5. **Andersson, J.A.E. et al. (2019).** CasADi: a software framework for nonlinear optimization and optimal control. *Math. Prog. Computation, 11*(1), 1–36.
 
