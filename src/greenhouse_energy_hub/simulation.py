@@ -34,7 +34,7 @@ aggregations should filter `is_terminal == False`.
 
 Usage
 -----
-    python3 control/rolling_horizon.py [--days 14] [--start-month 6] [--mode both]
+    python3 src/greenhouse_energy_hub/simulation.py [--days 14] [--start-month 6] [--mode both]
     # winter fortnight: --start-month 1 ;  summer fortnight: --start-month 6
 """
 
@@ -51,10 +51,10 @@ from typing import Protocol, TypeAlias
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from models.hub_model import (
+from greenhouse_energy_hub.hub import (
     AssetCapabilities, ExogenousInputs, HubConfiguration, HubControl, HubFlows,
     HubState, HubStep, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
     initial_state, normalize_control, state_bounds, validate_control, validate_flows,
@@ -65,7 +65,7 @@ from models.hub_model import (
     C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
     Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
-from accounting import (
+from greenhouse_energy_hub.evaluation import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationPolicy,
     RunBundle,
@@ -78,7 +78,7 @@ from accounting import (
     saving_percent,
     write_failure_diagnostics,
 )
-from scenarios import (
+from greenhouse_energy_hub.scenarios import (
     Scenario,
     ScenarioCoverageError,
     ScenarioPoint,
@@ -1135,7 +1135,7 @@ def run_simulation(
             raise TypeError("data must be a Scenario or DataFrame")
         return simulate_run(scenario, controller, hub_config)
 
-    from control.mpc_controller import (
+    from greenhouse_energy_hub.controllers.mpc import (
         MpcConfiguration,
         MpcControllerAdapter,
         N_HORIZON,
@@ -1302,13 +1302,13 @@ def main():
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
         executable_paths: tuple[str | Path, ...] = (
-            "accounting.py",
-            "scenarios.py",
-            "models/hub_model.py",
-            "control/rolling_horizon.py",
+            "src/greenhouse_energy_hub/evaluation.py",
+            "src/greenhouse_energy_hub/scenarios.py",
+            "src/greenhouse_energy_hub/hub.py",
+            "src/greenhouse_energy_hub/simulation.py",
         )
         if mode == "mpc":
-            executable_paths += ("control/mpc_controller.py",)
+            executable_paths += ("src/greenhouse_energy_hub/controllers/mpc.py",)
         publication_context = _capture_publication_context(
             executable_paths,
             repository_root=ROOT,

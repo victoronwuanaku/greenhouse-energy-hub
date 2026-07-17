@@ -6,8 +6,8 @@ Location:  Representative Dutch (Westland) greenhouse, Netherlands (1 ha high-te
 
 This module defines the physical plant: asset sizing, control/state bounds, and the
 discrete-time state-transition function used by both the MPC internal model
-(`control/mpc_controller.py`, CasADi adapter) and the rolling-horizon numerical
-simulation (`control/rolling_horizon.py`).
+(`src/greenhouse_energy_hub/controllers/mpc.py`, CasADi adapter) and the rolling-horizon numerical
+simulation (`src/greenhouse_energy_hub/simulation.py`).
 
 Energy carriers
 ---------------

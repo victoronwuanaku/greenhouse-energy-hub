@@ -55,14 +55,14 @@ import numpy as np
 import do_mpc
 from casadi import DM, sqrt
 
-from accounting import EvaluationPolicy
-from control.rolling_horizon import (
+from greenhouse_energy_hub.evaluation import EvaluationPolicy
+from greenhouse_energy_hub.simulation import (
     ControlDecision,
     ControllerFailure,
     DecisionDiagnostics,
     JSONValue,
 )
-from models.hub_model import (
+from greenhouse_energy_hub.hub import (
     ExogenousInputs, HubConfiguration, HubControl, HubState,
     hub_control_from_array, hub_state_array, hub_step_expressions,
     BAT_P_MAX_KW, ETA_BAT_DIS,

@@ -35,20 +35,20 @@ def _two_step_valid_run(
     capability_policy: dict[str, object] | None = None,
 ):
     """An exact, hand-built two-step Run with deliberately varied line items."""
-    from control.rolling_horizon import (
+    from greenhouse_energy_hub.simulation import (
         DecisionDiagnostics,
         OperatingRecord,
         ValidRun,
         ValidationReport,
     )
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         ExogenousInputs,
         HubConfiguration,
         HubControl,
         HubFlows,
         HubState,
     )
-    from scenarios import Scenario, ScenarioPoint
+    from greenhouse_energy_hub.scenarios import Scenario, ScenarioPoint
 
     start = datetime(2023, 1, 2, tzinfo=timezone.utc)
     points = (
@@ -132,7 +132,7 @@ def _two_step_valid_run(
 
 
 def _policy():
-    from accounting import EvaluationPolicy, WearCoefficients
+    from greenhouse_energy_hub.evaluation import EvaluationPolicy, WearCoefficients
 
     return EvaluationPolicy(
         wear=WearCoefficients(
@@ -146,14 +146,14 @@ def _policy():
 
 def _publication_ready_run(**run_options):
     """Build a compact, provenance-backed Run whose records obey shared physics."""
-    from control.rolling_horizon import OperatingRecord
-    from models.hub_model import (
+    from greenhouse_energy_hub.simulation import OperatingRecord
+    from greenhouse_energy_hub.hub import (
         ExogenousInputs,
         HubControl,
         advance_hub,
         initial_state,
     )
-    from scenarios import ScenarioPoint, SourceProvenance
+    from greenhouse_energy_hub.scenarios import ScenarioPoint, SourceProvenance
 
     run = _two_step_valid_run(**run_options)
     provenance = SourceProvenance(
@@ -253,7 +253,7 @@ def _committed_executable_repository(tmp_path: Path) -> Path:
 
 def _rehash_bundle(bundle_path: Path) -> Path:
     """Rehash an adversarially edited bundle without fixing its semantics."""
-    from accounting import canonical_json_bytes, sha256_bytes
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, sha256_bytes
 
     manifest_path = bundle_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -280,7 +280,7 @@ def _rehash_bundle(bundle_path: Path) -> Path:
 
 def _rehash_specification_and_bundle(bundle_path: Path) -> Path:
     """Recompute both public identities after an internally consistent forgery."""
-    from accounting import canonical_json_bytes, run_specification_identifier
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, run_specification_identifier
 
     manifest_path = bundle_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -317,7 +317,7 @@ def _rewrite_csv(path: Path, mutate) -> None:
 
 
 def _created_test_bundle(tmp_path: Path, *, controller_name: str = "baseline"):
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run(
@@ -346,7 +346,7 @@ def _created_test_bundle(tmp_path: Path, *, controller_name: str = "baseline"):
 
 
 def test_evaluation_stable_interfaces_have_exact_fields():
-    from accounting import (
+    from greenhouse_energy_hub.evaluation import (
         CostSummary,
         EvaluationPolicy,
         EvaluationReport,
@@ -397,7 +397,7 @@ def test_evaluation_stable_interfaces_have_exact_fields():
 
 
 def test_two_step_grid_and_each_wear_term_use_exact_policy_formulas():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
 
     first, second = evaluate_run(
         _two_step_valid_run(), _policy()
@@ -416,7 +416,7 @@ def test_two_step_grid_and_each_wear_term_use_exact_policy_formulas():
 
 
 def test_two_step_operating_cost_is_grid_plus_four_wear_terms():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
 
     report = evaluate_run(_two_step_valid_run(), _policy())
     first, second = report.step_line_items
@@ -432,7 +432,7 @@ def test_two_step_operating_cost_is_grid_plus_four_wear_terms():
 
 
 def test_two_step_inventory_uses_mean_operating_price_and_terminal_state():
-    from accounting import evaluate_run, recoverable_inventory_kwh
+    from greenhouse_energy_hub.evaluation import evaluate_run, recoverable_inventory_kwh
 
     run = _two_step_valid_run()
     report = evaluate_run(run, _policy())
@@ -455,7 +455,7 @@ def test_two_step_inventory_uses_mean_operating_price_and_terminal_state():
 
 
 def test_two_step_comfort_uses_reached_state_and_is_never_monetized():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
 
     report = evaluate_run(_two_step_valid_run(), _policy())
     first, second = report.step_line_items
@@ -469,7 +469,7 @@ def test_two_step_comfort_uses_reached_state_and_is_never_monetized():
 
 
 def test_wear_sensitivities_reuse_records_at_zero_one_and_two_times():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
 
     run = _two_step_valid_run()
     records_before = run.records
@@ -506,14 +506,14 @@ def test_wear_sensitivities_reuse_records_at_zero_one_and_two_times():
 def test_evaluation_policy_requires_zero_nominal_and_double_wear_evidence(
     multipliers,
 ):
-    from accounting import EvaluationPolicy
+    from greenhouse_energy_hub.evaluation import EvaluationPolicy
 
     with pytest.raises(ValueError, match="0x, 1x, and 2x"):
         EvaluationPolicy(sensitivity_multipliers=multipliers)
 
 
 def test_evaluation_policy_allows_additional_unique_nonnegative_sensitivities():
-    from accounting import EvaluationPolicy, evaluate_run
+    from greenhouse_energy_hub.evaluation import EvaluationPolicy, evaluate_run
 
     policy = EvaluationPolicy(
         sensitivity_multipliers=(0.0, 0.5, 1.0, 2.0, 3.0)
@@ -591,8 +591,8 @@ def test_serialized_policy_metadata_labels_provisional_coefficients_and_is_immut
 
 @pytest.mark.parametrize("capability", ["battery", "hydrogen", "thermal_store"])
 def test_disabled_asset_recoverable_inventory_is_exactly_zero(capability):
-    from accounting import recoverable_inventory_kwh
-    from models.hub_model import AssetCapabilities, HubConfiguration, HubState
+    from greenhouse_energy_hub.evaluation import recoverable_inventory_kwh
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration, HubState
 
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
@@ -607,8 +607,8 @@ def test_disabled_asset_recoverable_inventory_is_exactly_zero(capability):
 
 
 def test_evaluate_run_rejects_invalid_incomplete_and_wrong_record_count():
-    from accounting import evaluate_run
-    from control.rolling_horizon import InvalidRun, ValidationReport
+    from greenhouse_energy_hub.evaluation import evaluate_run
+    from greenhouse_energy_hub.simulation import InvalidRun, ValidationReport
 
     run = _two_step_valid_run()
     invalid = InvalidRun(
@@ -646,8 +646,8 @@ def test_evaluate_run_rejects_invalid_incomplete_and_wrong_record_count():
 def test_evaluate_run_recomputes_from_records_without_serialized_cost_columns(
     monkeypatch,
 ):
-    from accounting import evaluate_run
-    from control.rolling_horizon import ValidRun
+    from greenhouse_energy_hub.evaluation import evaluate_run
+    from greenhouse_energy_hub.simulation import ValidRun
 
     def serialized_columns_must_not_be_read(_run):
         raise AssertionError("evaluate_run trusted serialized/precomputed columns")
@@ -661,7 +661,7 @@ def test_evaluate_run_recomputes_from_records_without_serialized_cost_columns(
 
 
 def test_baseline_and_mpc_use_same_policy_without_changing_baseline_capabilities():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
 
     policy = _policy()
     baseline = _two_step_valid_run(
@@ -687,8 +687,8 @@ def test_baseline_and_mpc_use_same_policy_without_changing_baseline_capabilities
 
 
 def test_solver_only_configuration_changes_do_not_change_evaluation():
-    from accounting import evaluate_run
-    from control.mpc_controller import MpcConfiguration
+    from greenhouse_energy_hub.evaluation import evaluate_run
+    from greenhouse_energy_hub.controllers.mpc import MpcConfiguration
 
     policy = _policy()
     first_config = MpcConfiguration.from_evaluation_policy(policy)
@@ -716,9 +716,9 @@ def test_solver_only_configuration_changes_do_not_change_evaluation():
 
 
 def test_ablation_variants_use_hub_configuration_and_publish_separate_scorecard():
-    from accounting import evaluate_run
+    from greenhouse_energy_hub.evaluation import evaluate_run
     from experiments import ablations
-    from models.hub_model import HubConfiguration
+    from greenhouse_energy_hub.hub import HubConfiguration
 
     assert not hasattr(ablations, "effective_cost")
     assert not hasattr(ablations, "COMFORT_PENALTY_EUR_PER_CH")
@@ -763,7 +763,7 @@ def test_ablation_variants_use_hub_configuration_and_publish_separate_scorecard(
 
 
 def test_run_identity_interfaces_and_canonical_json_are_exact_and_finite():
-    from accounting import (
+    from greenhouse_energy_hub.evaluation import (
         RunBundle,
         RunSpecification,
         canonical_json_bytes,
@@ -796,9 +796,9 @@ def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axi
     tmp_path,
     monkeypatch,
 ):
-    import accounting
-    from accounting import build_run_specification
-    from scenarios import ScenarioPoint
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import build_run_specification
+    from greenhouse_energy_hub.scenarios import ScenarioPoint
 
     repository = _committed_executable_repository(tmp_path)
     run = _publication_ready_run(
@@ -912,7 +912,7 @@ def test_run_specification_hashes_all_inputs_and_changes_with_every_identity_axi
 def test_run_specification_runtime_is_actual_and_not_publicly_overrideable(tmp_path):
     import inspect
 
-    from accounting import build_run_specification
+    from greenhouse_energy_hub.evaluation import build_run_specification
 
     repository = _committed_executable_repository(tmp_path)
     assert "runtime" not in inspect.signature(build_run_specification).parameters
@@ -927,7 +927,7 @@ def test_run_specification_runtime_is_actual_and_not_publicly_overrideable(tmp_p
 
 
 def test_code_provenance_scopes_dirty_checks_to_explicit_executables(tmp_path):
-    from accounting import collect_code_provenance
+    from greenhouse_energy_hub.evaluation import collect_code_provenance
 
     repository = _committed_executable_repository(tmp_path)
     (repository / "REVIEW_RESPONSE.md").write_text("unrelated\n", encoding="utf-8")
@@ -952,7 +952,7 @@ def test_code_provenance_rejects_symlinked_executable_selectors(
     tmp_path,
     symlink_component,
 ):
-    from accounting import collect_code_provenance
+    from greenhouse_energy_hub.evaluation import collect_code_provenance
 
     repository = _committed_executable_repository(tmp_path)
     if symlink_component:
@@ -971,7 +971,7 @@ def test_code_provenance_rejects_symlinked_executable_selectors(
 def test_run_specification_rejects_nonfinite_missing_provenance_and_bad_mpc_evidence(
     tmp_path,
 ):
-    from accounting import build_run_specification
+    from greenhouse_energy_hub.evaluation import build_run_specification
 
     repository = _committed_executable_repository(tmp_path)
     with pytest.raises(ValueError, match="provenance"):
@@ -1011,7 +1011,7 @@ def test_run_specification_rejects_nonfinite_missing_provenance_and_bad_mpc_evid
 
 
 def test_valid_run_serialization_is_fixed_finite_utc_and_one_row_per_step():
-    from accounting import evaluate_run, serialize_valid_run
+    from greenhouse_energy_hub.evaluation import evaluate_run, serialize_valid_run
 
     run = _publication_ready_run(capability_policy=BASELINE_CAPABILITY_POLICY)
     report = evaluate_run(run, _policy())
@@ -1110,7 +1110,7 @@ def test_valid_run_serialization_is_fixed_finite_utc_and_one_row_per_step():
 
 @pytest.mark.parametrize("member", ["trajectory.csv", "controller_diagnostics.csv"])
 def test_bundle_verification_requires_exact_ordered_csv_headers(tmp_path, member):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
 
@@ -1147,7 +1147,7 @@ def test_bundle_verification_rejects_internally_rehashed_semantic_json_mutations
     member,
     mutation,
 ):
-    from accounting import canonical_json_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     path = bundle.path / member
@@ -1176,7 +1176,7 @@ def test_bundle_verification_binds_controller_and_solver_semantics(
     column,
     value,
 ):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(
         tmp_path,
@@ -1206,7 +1206,7 @@ def test_bundle_verification_recomputes_physics_and_record_continuity(
     tmp_path,
     column,
 ):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
 
@@ -1243,7 +1243,7 @@ def test_bundle_verification_reconstructs_the_complete_specification_identity_gr
     tmp_path,
     mutation,
 ):
-    from accounting import canonical_json_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
@@ -1272,7 +1272,7 @@ def test_bundle_verification_rejects_unknown_nested_identity_fields(
     tmp_path,
     section,
 ):
-    from accounting import canonical_json_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
@@ -1286,7 +1286,7 @@ def test_bundle_verification_rejects_unknown_nested_identity_fields(
 
 
 def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_path):
-    from accounting import canonical_json_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
@@ -1302,7 +1302,7 @@ def test_bundle_verification_rejects_an_internally_rehashed_forged_runtime(tmp_p
 def test_create_run_bundle_requires_explicit_repository_authority(tmp_path):
     import inspect
 
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run()
@@ -1328,7 +1328,7 @@ def test_create_run_bundle_requires_explicit_repository_authority(tmp_path):
 def test_verify_and_load_require_explicit_repository_authority(tmp_path):
     import inspect
 
-    from accounting import load_run_bundle, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import load_run_bundle, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     for function in (verify_run_bundle, load_run_bundle):
@@ -1361,7 +1361,7 @@ def test_bundle_verification_is_type_exact_for_recomputed_members(
     member,
     mutate,
 ):
-    from accounting import canonical_json_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     path = bundle.path / member
@@ -1375,7 +1375,7 @@ def test_bundle_verification_is_type_exact_for_recomputed_members(
 
 
 def test_authoritative_git_rejects_fully_rehashed_executable_map_forgery(tmp_path):
-    from accounting import canonical_json_bytes, sha256_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, sha256_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
@@ -1398,7 +1398,7 @@ def test_authoritative_git_rejects_fully_rehashed_executable_map_forgery(tmp_pat
 
 
 def test_authoritative_git_rejects_fully_rehashed_scenario_input_forgery(tmp_path):
-    from accounting import canonical_json_bytes, sha256_bytes, verify_run_bundle
+    from greenhouse_energy_hub.evaluation import canonical_json_bytes, sha256_bytes, verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     manifest_path = bundle.path / "manifest.json"
@@ -1423,7 +1423,7 @@ def test_authoritative_git_rejects_fully_rehashed_scenario_input_forgery(tmp_pat
 def test_historical_bundle_verification_uses_recorded_revision_not_current_head(
     tmp_path,
 ):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     repository, _, _, _, bundle = _created_test_bundle(tmp_path)
     (repository / "runner.py").write_text(
@@ -1460,7 +1460,7 @@ def test_creation_revalidates_scenario_source_bytes_after_capture(
     tmp_path,
     relative_path,
 ):
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run()
@@ -1484,8 +1484,8 @@ def test_creation_revalidates_scenario_source_bytes_after_capture(
 
 
 def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, monkeypatch):
-    import accounting
-    from accounting import (
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import (
         BundleCollisionError,
         build_run_specification,
         create_run_bundle,
@@ -1538,8 +1538,8 @@ def test_atomic_publication_never_clobbers_a_racing_claimant(
     monkeypatch,
     claimant_kind,
 ):
-    import accounting
-    from accounting import (
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import (
         BundleCollisionError,
         build_run_specification,
         create_run_bundle,
@@ -1611,8 +1611,8 @@ def test_atomic_publication_verifies_a_cooperative_racing_winner(
     monkeypatch,
     winner_matches,
 ):
-    import accounting
-    from accounting import (
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import (
         BundleCollisionError,
         build_run_specification,
         create_run_bundle,
@@ -1669,7 +1669,7 @@ def test_atomic_publication_verifies_a_cooperative_racing_winner(
 
 
 def test_publication_revalidates_code_bytes_after_specification_capture(tmp_path):
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run()
@@ -1700,8 +1700,8 @@ def test_publication_revalidates_actual_runtime_after_specification_capture(
     tmp_path,
     monkeypatch,
 ):
-    import accounting
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run()
@@ -1729,7 +1729,7 @@ def test_publication_revalidates_actual_runtime_after_specification_capture(
 def test_entrypoints_capture_complete_publication_context_before_execution():
     import inspect
 
-    from control import rolling_horizon
+    import greenhouse_energy_hub.simulation as rolling_horizon
     from experiments import ablations
 
     rolling_source = inspect.getsource(rolling_horizon.main)
@@ -1740,20 +1740,20 @@ def test_entrypoints_capture_complete_publication_context_before_execution():
     assert rolling_source.index(marker) < rolling_source.index("run_simulation(")
     assert ablation_source.index(marker) < ablation_source.index("run_simulation(")
     for dependency in (
-        "accounting.py",
-        "scenarios.py",
-        "models/hub_model.py",
-        "control/rolling_horizon.py",
+        "src/greenhouse_energy_hub/evaluation.py",
+        "src/greenhouse_energy_hub/scenarios.py",
+        "src/greenhouse_energy_hub/hub.py",
+        "src/greenhouse_energy_hub/simulation.py",
     ):
         assert dependency in rolling_source
         assert dependency in ablation_source
-    assert "control/mpc_controller.py" in rolling_source
-    assert "control/mpc_controller.py" in ablation_source
+    assert "src/greenhouse_energy_hub/controllers/mpc.py" in rolling_source
+    assert "src/greenhouse_energy_hub/controllers/mpc.py" in ablation_source
     assert "experiments/ablations.py" in ablation_source
 
 
 def test_one_specification_retains_divergent_valid_outputs(tmp_path):
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run(controller_name="mpc")
@@ -1791,8 +1791,8 @@ def test_interrupted_bundle_write_removes_only_its_owned_temporary_directory(
     tmp_path,
     monkeypatch,
 ):
-    import accounting
-    from accounting import build_run_specification, create_run_bundle, evaluate_run
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import build_run_specification, create_run_bundle, evaluate_run
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     run = _publication_ready_run()
@@ -1835,12 +1835,12 @@ def test_interrupted_bundle_write_removes_only_its_owned_temporary_directory(
 
 
 def test_invalid_run_writes_separate_non_bundle_diagnostics(tmp_path):
-    from accounting import (
+    from greenhouse_energy_hub.evaluation import (
         build_run_specification,
         verify_run_bundle,
         write_failure_diagnostics,
     )
-    from control.rolling_horizon import InvalidRun
+    from greenhouse_energy_hub.simulation import InvalidRun
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     valid = _publication_ready_run()
@@ -1903,14 +1903,14 @@ def test_failure_diagnostics_binds_every_specification_identity_axis(
     tmp_path,
     identity_axis,
 ):
-    from accounting import (
+    from greenhouse_energy_hub.evaluation import (
         RunSpecification,
         build_run_specification,
         run_specification_identifier,
         write_failure_diagnostics,
     )
-    from control.rolling_horizon import InvalidRun
-    from models.hub_model import AssetCapabilities, HubConfiguration
+    from greenhouse_energy_hub.simulation import InvalidRun
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     valid = _publication_ready_run()
@@ -1978,8 +1978,8 @@ def test_failure_diagnostics_binds_every_specification_identity_axis(
 
 
 def test_legacy_entry_point_persists_valid_bundles_and_invalid_diagnostics(tmp_path):
-    from accounting import RunBundle
-    from control.rolling_horizon import InvalidRun, _persist_outcome
+    from greenhouse_energy_hub.evaluation import RunBundle
+    from greenhouse_energy_hub.simulation import InvalidRun, _persist_outcome
 
     repository = _committed_executable_repository(tmp_path / "repo-fixture")
     valid = _publication_ready_run()
@@ -2022,7 +2022,7 @@ def test_legacy_entry_point_persists_valid_bundles_and_invalid_diagnostics(tmp_p
 def test_legacy_entry_points_no_longer_write_mutable_csv_or_figure_artifacts():
     import inspect
 
-    from control import rolling_horizon
+    import greenhouse_energy_hub.simulation as rolling_horizon
     from experiments import ablations
 
     rolling_source = inspect.getsource(rolling_horizon.main)

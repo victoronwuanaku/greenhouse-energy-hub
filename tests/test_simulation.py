@@ -19,7 +19,7 @@ INPUT_NAMES = (
 
 
 def _test_diagnostics(forecast, **overrides):
-    from control.rolling_horizon import DecisionDiagnostics
+    from greenhouse_energy_hub.simulation import DecisionDiagnostics
 
     values = {
         "adapter": "baseline",
@@ -40,7 +40,7 @@ def _test_diagnostics(forecast, **overrides):
 
 
 def _zero_control():
-    from models.hub_model import HubControl
+    from greenhouse_energy_hub.hub import HubControl
 
     return HubControl(
         battery_charge_kw=0.0,
@@ -61,7 +61,7 @@ def _forecast_points(
     temperatures=None,
     start="2023-01-02 00:00:00+00:00",
 ):
-    from scenarios import ScenarioPoint
+    from greenhouse_energy_hub.scenarios import ScenarioPoint
 
     prices = tuple(float(price) for price in prices)
     if temperatures is None:
@@ -83,8 +83,8 @@ def _forecast_points(
 
 
 def test_one_step_mpc_keeps_every_reached_state_valid():
-    from control.rolling_horizon import ValidRun, load_data, run_simulation
-    from models.hub_model import state_bounds
+    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
+    from greenhouse_energy_hub.hub import state_bounds
 
     outcome = run_simulation(
         load_data(start_month=1, n_days=2, forecast_hours=1),
@@ -128,9 +128,9 @@ class _FailedMpc:
 
 
 def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch, hourly_frame):
-    import control.mpc_controller as mpc_controller
-    import control.rolling_horizon as rolling_horizon
-    import models.hub_model as hub_model
+    import greenhouse_energy_hub.controllers.mpc as mpc_controller
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    import greenhouse_energy_hub.hub as hub_model
 
     failed_mpc = _FailedMpc()
     monkeypatch.setattr(
@@ -164,7 +164,7 @@ def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch,
 
     # Keep the not-yet-existing outcome type inside the regression body so legacy
     # collection remains possible until the fail-closed simulation interface lands.
-    from control.rolling_horizon import InvalidRun
+    from greenhouse_energy_hub.simulation import InvalidRun
 
     assert isinstance(outcome, InvalidRun)
 
@@ -189,9 +189,9 @@ def test_malformed_success_diagnostics_fail_before_physics(
     from datetime import timedelta
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, InvalidRun
-    from models.hub_model import HubConfiguration
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, InvalidRun
+    from greenhouse_energy_hub.hub import HubConfiguration
 
     def decide(_state, forecast):
         if case == "wrong_schema":
@@ -259,9 +259,9 @@ def test_malformed_success_diagnostics_fail_before_physics(
 def test_controller_failure_requires_failure_diagnostics(monkeypatch, hourly_frame):
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControllerFailure, InvalidRun
-    from models.hub_model import HubConfiguration
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControllerFailure, InvalidRun
+    from greenhouse_energy_hub.hub import HubConfiguration
 
     def decide(_state, forecast):
         return ControllerFailure(
@@ -299,9 +299,9 @@ def test_controller_failure_requires_failure_diagnostics(monkeypatch, hourly_fra
 def test_baseline_success_requires_empty_solver_diagnostics(monkeypatch, hourly_frame):
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, InvalidRun
-    from models.hub_model import HubConfiguration
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, InvalidRun
+    from greenhouse_energy_hub.hub import HubConfiguration
 
     def decide(_state, forecast):
         return ControlDecision(
@@ -349,8 +349,8 @@ def test_baseline_success_requires_empty_solver_diagnostics(monkeypatch, hourly_
 def test_invalid_control_returns_invalid_run_without_applying_control(
     monkeypatch, hourly_frame, field, value
 ):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, InvalidRun
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, InvalidRun
 
     control = _zero_control()
     control = type(control)(**{**control.__dict__, field: value})
@@ -389,9 +389,9 @@ def test_invalid_control_returns_invalid_run_without_applying_control(
 def test_invalid_successor_or_flows_never_append_an_operating_record(
     monkeypatch, hourly_frame, invalid_step, failure_code
 ):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, InvalidRun
-    from models.hub_model import HubFlows, HubState, HubStep
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, InvalidRun
+    from greenhouse_energy_hub.hub import HubFlows, HubState, HubStep
 
     def decide(_self, _state, forecast):
         return ControlDecision(
@@ -447,9 +447,9 @@ def test_malformed_physics_schema_returns_invalid_run_without_record(
 ):
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, InvalidRun
-    from models.hub_model import HubState
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, InvalidRun
+    from greenhouse_energy_hub.hub import HubState
 
     def decide(_self, _state, forecast):
         return ControlDecision(
@@ -488,9 +488,9 @@ def test_malformed_physics_schema_returns_invalid_run_without_record(
 def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
     monkeypatch, hourly_frame
 ):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, ValidRun
-    from models.hub_model import ETA_BAT_CH, ETA_BAT_DIS
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, ValidRun
+    from greenhouse_energy_hub.hub import ETA_BAT_CH, ETA_BAT_DIS
 
     tiny_discharge_kw = 1e-5
     charge_to_operational_cap_kw = (
@@ -525,7 +525,7 @@ def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
 
 
 def test_run_configuration_mappings_are_read_only(hourly_frame):
-    from control.rolling_horizon import ValidRun, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun, run_simulation
 
     outcome = run_simulation(hourly_frame.iloc[:1], mode="baseline")
 
@@ -540,8 +540,8 @@ def test_valid_run_frame_uses_shared_evaluation_step_line_items(
     monkeypatch,
     hourly_frame,
 ):
-    from accounting import DEFAULT_EVALUATION_POLICY, StepLineItems
-    from control import rolling_horizon
+    from greenhouse_energy_hub.evaluation import DEFAULT_EVALUATION_POLICY, StepLineItems
+    import greenhouse_energy_hub.simulation as rolling_horizon
 
     outcome = rolling_horizon.run_simulation(
         hourly_frame.iloc[:1], mode="baseline"
@@ -573,7 +573,7 @@ def test_valid_run_frame_uses_shared_evaluation_step_line_items(
 
 
 def test_baseline_run_records_exact_capability_policy(hourly_frame):
-    from control.rolling_horizon import ValidRun, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun, run_simulation
 
     outcome = run_simulation(hourly_frame.iloc[:1], mode="baseline")
 
@@ -587,7 +587,7 @@ def test_baseline_run_records_exact_capability_policy(hourly_frame):
 
 
 def test_mpc_adapter_configuration_mappings_are_read_only_copies():
-    from control.mpc_controller import MpcControllerAdapter
+    from greenhouse_energy_hub.controllers.mpc import MpcControllerAdapter
 
     configuration = {"horizon_steps": 24}
     capability_policy = {"battery": True}
@@ -649,7 +649,7 @@ class _ForecastAwareMpc:
 
 
 def _mpc_adapter(mpc, horizon_steps):
-    from control.mpc_controller import MpcControllerAdapter
+    from greenhouse_energy_hub.controllers.mpc import MpcControllerAdapter
 
     return MpcControllerAdapter(
         mpc=mpc,
@@ -660,8 +660,8 @@ def _mpc_adapter(mpc, horizon_steps):
 
 
 def test_mpc_rejects_wrong_length_forecast_before_solver():
-    from control.rolling_horizon import ControllerFailure
-    from models.hub_model import initial_state
+    from greenhouse_energy_hub.simulation import ControllerFailure
+    from greenhouse_energy_hub.hub import initial_state
 
     mpc = _ForecastAwareMpc()
     adapter = _mpc_adapter(mpc, horizon_steps=2)
@@ -678,8 +678,8 @@ def test_mpc_rejects_wrong_length_forecast_before_solver():
 
 
 def test_terminal_coefficients_use_only_controlled_stage_points():
-    from control.rolling_horizon import ControlDecision
-    from models.hub_model import HP_COP, initial_state
+    from greenhouse_energy_hub.simulation import ControlDecision
+    from greenhouse_energy_hub.hub import HP_COP, initial_state
 
     mpc = _ForecastAwareMpc()
     adapter = _mpc_adapter(mpc, horizon_steps=2)
@@ -706,8 +706,8 @@ def test_terminal_coefficients_use_only_controlled_stage_points():
 
 
 def test_mpc_enables_operational_terminal_bounds():
-    from control.mpc_controller import MpcConfiguration, build_mpc
-    from models.hub_model import (
+    from greenhouse_energy_hub.controllers.mpc import MpcConfiguration, build_mpc
+    from greenhouse_energy_hub.hub import (
         HubConfiguration,
         STATE_MODEL_NAMES,
         operational_state_bounds,
@@ -725,8 +725,8 @@ def test_mpc_enables_operational_terminal_bounds():
 
 @pytest.mark.parametrize("capability", ["battery", "hydrogen", "thermal_store"])
 def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
-    from control.mpc_controller import MpcConfiguration, build_mpc
-    from models.hub_model import (
+    from greenhouse_energy_hub.controllers.mpc import MpcConfiguration, build_mpc
+    from greenhouse_energy_hub.hub import (
         INPUT_SCALE,
         STATE_SCALE,
         AssetCapabilities,
@@ -747,8 +747,8 @@ def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
 
 
 def test_load_data_returns_scenario_and_rejects_missing_coverage():
-    from control.rolling_horizon import load_data
-    from scenarios import Scenario, ScenarioCoverageError
+    from greenhouse_energy_hub.simulation import load_data
+    from greenhouse_energy_hub.scenarios import Scenario, ScenarioCoverageError
 
     scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
 
@@ -764,9 +764,9 @@ def test_load_data_returns_scenario_and_rejects_missing_coverage():
 
 
 def test_scenario_iterates_only_operating_window(monkeypatch, hourly_frame):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, ValidRun
-    from models.hub_model import HubFlows, HubStep
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, ValidRun
+    from greenhouse_energy_hub.hub import HubFlows, HubStep
 
     observed_forecasts = []
 
@@ -814,14 +814,14 @@ def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
     import json
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import (
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import (
         BaselineControllerAdapter,
         ControlDecision,
         DecisionDiagnostics,
         ValidRun,
     )
-    from models.hub_model import HubConfiguration, HubFlows, HubStep
+    from greenhouse_energy_hub.hub import HubConfiguration, HubFlows, HubStep
 
     scenario = rolling_horizon.load_data(
         start_month=1, n_days=1, forecast_hours=3
@@ -911,8 +911,8 @@ def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
 
 
 def test_missing_final_forecast_coverage_fails_before_run(hourly_frame):
-    import control.rolling_horizon as rolling_horizon
-    from scenarios import ScenarioCoverageError
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.scenarios import ScenarioCoverageError
 
     # Two operating steps with a two-stage controller require four points in total;
     # three points deliberately leave the final N+1 view one point short. Scenario
@@ -926,8 +926,8 @@ def test_missing_final_forecast_coverage_fails_before_run(hourly_frame):
 
 
 def test_cli_does_not_serialize_invalid_run(monkeypatch, tmp_path, hourly_frame):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControllerFailure, DecisionDiagnostics
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControllerFailure, DecisionDiagnostics
 
     def decide(_self, _state, forecast):
         diagnostics = DecisionDiagnostics(
@@ -968,7 +968,7 @@ def test_cli_constructs_one_asset_capability_configuration(
 ):
     from types import SimpleNamespace
 
-    import control.rolling_horizon as rolling_horizon
+    import greenhouse_energy_hub.simulation as rolling_horizon
 
     observed_configurations = []
 
@@ -1020,7 +1020,7 @@ def test_cli_constructs_one_asset_capability_configuration(
 def test_disabled_asset_configuration_is_exact_zero_capacity(
     capability, state_field, control_fields
 ):
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         AssetCapabilities,
         HubConfiguration,
         control_bounds,
@@ -1052,7 +1052,7 @@ def test_disabled_asset_configuration_is_exact_zero_capacity(
 def test_public_successor_validator_rejects_every_nonzero_disabled_state(
     capability, state_field, signed_value
 ):
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         AssetCapabilities,
         HubConfiguration,
         HubState,
@@ -1095,7 +1095,7 @@ def test_public_successor_validator_rejects_every_nonzero_disabled_state(
 def test_public_control_validator_rejects_every_nonzero_disabled_control(
     capability, control_field, signed_value
 ):
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         AssetCapabilities,
         HubConfiguration,
         HubControl,
@@ -1131,9 +1131,9 @@ def test_public_control_validator_rejects_every_nonzero_disabled_control(
 def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording(
     monkeypatch, hourly_frame, capability, control_field, signed_value
 ):
-    import control.rolling_horizon as rolling_horizon
-    from control.rolling_horizon import ControlDecision, ValidRun
-    from models.hub_model import AssetCapabilities, HubConfiguration, HubControl
+    import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import ControlDecision, ValidRun
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration, HubControl
 
     raw_control = HubControl(
         **{**_zero_control().__dict__, control_field: signed_value}
@@ -1186,7 +1186,7 @@ def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording
 def test_disabled_asset_dynamics_flows_and_validation_are_inert(
     capability, state_field, control_fields, disabled_commands
 ):
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         AssetCapabilities,
         ExogenousInputs,
         HubConfiguration,
@@ -1252,8 +1252,8 @@ def test_disabled_asset_dynamics_flows_and_validation_are_inert(
 def test_disabled_asset_recoverable_inventory_contribution_is_zero(
     capability, inventories
 ):
-    from accounting import stored_equiv_kwh
-    from models.hub_model import AssetCapabilities, HubConfiguration
+    from greenhouse_energy_hub.evaluation import stored_equiv_kwh
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
 
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
@@ -1282,8 +1282,8 @@ def test_disabled_asset_recoverable_inventory_contribution_is_zero(
 def test_two_day_winter_mpc_keeps_disabled_assets_exactly_zero(
     capability, disabled_state, disabled_controls, disabled_flows
 ):
-    from control.rolling_horizon import ValidRun, load_data, run_simulation
-    from models.hub_model import AssetCapabilities, HubConfiguration
+    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
 
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
@@ -1310,14 +1310,14 @@ def test_two_day_winter_mpc_keeps_disabled_assets_exactly_zero(
 def _first_mpc_control(prices: np.ndarray) -> np.ndarray:
     from datetime import timedelta
 
-    from control.mpc_controller import (
+    from greenhouse_energy_hub.controllers.mpc import (
         MpcConfiguration,
         MpcControllerAdapter,
         build_mpc,
     )
-    from control.rolling_horizon import ControlDecision
-    from models.hub_model import HubConfiguration, initial_state
-    from scenarios import Scenario
+    from greenhouse_energy_hub.simulation import ControlDecision
+    from greenhouse_energy_hub.hub import HubConfiguration, initial_state
+    from greenhouse_energy_hub.scenarios import Scenario
 
     points = _forecast_points(prices)
     step_duration = timedelta(hours=1)
@@ -1373,8 +1373,8 @@ def test_first_control_is_independent_of_out_of_horizon_prices():
 def test_mpc_configuration_has_exact_stable_fields_and_policy_separation():
     from dataclasses import fields
 
-    from accounting import EvaluationPolicy, WearCoefficients
-    from control.mpc_controller import MpcConfiguration
+    from greenhouse_energy_hub.evaluation import EvaluationPolicy, WearCoefficients
+    from greenhouse_energy_hub.controllers.mpc import MpcConfiguration
 
     assert [field.name for field in fields(MpcConfiguration)] == [
         "horizon_steps",
@@ -1428,8 +1428,9 @@ def test_run_simulation_threads_named_evaluation_policy_into_mpc_configuration(
     monkeypatch,
     hourly_frame,
 ):
-    from accounting import EvaluationPolicy, WearCoefficients
-    from control import mpc_controller, rolling_horizon
+    from greenhouse_energy_hub.evaluation import EvaluationPolicy, WearCoefficients
+    import greenhouse_energy_hub.controllers.mpc as mpc_controller
+    import greenhouse_energy_hub.simulation as rolling_horizon
 
     captured = {}
 

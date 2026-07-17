@@ -30,7 +30,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias
 import uuid
 
-from models.hub_model import (
+from greenhouse_energy_hub.hub import (
     BALANCE_STATE_TOLERANCE,
     E_H2_LHV_KWH_KG,
     ETA_BAT_DIS,
@@ -50,10 +50,10 @@ from models.hub_model import (
     validate_flows,
     validate_successor,
 )
-from scenarios import Scenario, ScenarioPoint, SourceProvenance
+from greenhouse_energy_hub.scenarios import Scenario, ScenarioPoint, SourceProvenance
 
 if TYPE_CHECKING:
-    from control.rolling_horizon import (
+    from greenhouse_energy_hub.simulation import (
         InvalidRun,
         OperatingRecord,
         ValidRun,
@@ -467,7 +467,7 @@ def evaluate_run(
     policy: EvaluationPolicy = DEFAULT_EVALUATION_POLICY,
 ) -> EvaluationReport:
     """Evaluate one complete ValidRun exclusively from immutable records."""
-    from control.rolling_horizon import ValidRun
+    from greenhouse_energy_hub.simulation import ValidRun
 
     if not isinstance(run, ValidRun):
         raise TypeError("evaluate_run accepts only a complete ValidRun")
@@ -652,7 +652,7 @@ def _repository_relative_path(path: str | Path, repository_root: Path) -> str:
 def collect_code_provenance(
     executable_paths: tuple[str | Path, ...],
     *,
-    repository_root: str | Path = Path(__file__).resolve().parent,
+    repository_root: str | Path = Path(__file__).resolve().parents[2],
 ) -> dict[str, JSONValue]:
     """Hash only the explicit executable/configuration inputs used by a Run."""
     if not isinstance(executable_paths, tuple) or not executable_paths:
@@ -804,7 +804,7 @@ class _PublicationContext:
 def _capture_publication_context(
     executable_paths: tuple[str | Path, ...],
     *,
-    repository_root: str | Path = Path(__file__).resolve().parent,
+    repository_root: str | Path = Path(__file__).resolve().parents[2],
 ) -> _PublicationContext:
     """Capture immutable identity inputs before a potentially long execution."""
     root = Path(repository_root).resolve()
@@ -898,7 +898,7 @@ def _scenario_input_hashes(
 
 
 def _validate_publication_run_evidence(run: object) -> None:
-    from control.rolling_horizon import InvalidRun, ValidRun
+    from greenhouse_energy_hub.simulation import InvalidRun, ValidRun
 
     if not isinstance(run, (ValidRun, InvalidRun)):
         raise TypeError("Run Specification requires a ValidRun or InvalidRun")
@@ -967,7 +967,7 @@ def build_run_specification(
     policy: EvaluationPolicy,
     *,
     executable_paths: tuple[str | Path, ...],
-    repository_root: str | Path = Path(__file__).resolve().parent,
+    repository_root: str | Path = Path(__file__).resolve().parents[2],
     _publication_context: _PublicationContext | None = None,
 ) -> RunSpecification:
     """Build the exact requested-input identity, independent of output bytes."""
@@ -1317,7 +1317,7 @@ def serialize_valid_run(
     report: EvaluationReport,
 ) -> dict[str, bytes]:
     """Serialize authoritative output members without a terminal pseudo-row."""
-    from control.rolling_horizon import ValidRun
+    from greenhouse_energy_hub.simulation import ValidRun
 
     if not isinstance(run, ValidRun):
         raise TypeError("serialize_valid_run accepts only ValidRun")
@@ -1801,7 +1801,7 @@ def _verify_bundle_directory(
     enforce_path_identifier: bool,
     repository_root: str | Path,
 ) -> RunBundle:
-    from control.rolling_horizon import (
+    from greenhouse_energy_hub.simulation import (
         DecisionDiagnostics,
         OperatingRecord,
         ValidRun,
@@ -2369,7 +2369,7 @@ def create_run_bundle(
     repository_root: str | Path,
 ) -> RunBundle:
     """Persist one verified Valid Run through an owned atomic temporary directory."""
-    from control.rolling_horizon import ValidRun
+    from greenhouse_energy_hub.simulation import ValidRun
 
     if not isinstance(run, ValidRun):
         raise TypeError("create_run_bundle accepts only ValidRun")
@@ -2500,7 +2500,7 @@ def write_failure_diagnostics(
     policy: EvaluationPolicy,
 ) -> Path:
     """Persist InvalidRun evidence outside the authoritative Run Bundle namespace."""
-    from control.rolling_horizon import InvalidRun
+    from greenhouse_energy_hub.simulation import InvalidRun
 
     if not isinstance(run, InvalidRun):
         raise TypeError("write_failure_diagnostics accepts only InvalidRun")

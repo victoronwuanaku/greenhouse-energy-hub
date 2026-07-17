@@ -16,7 +16,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from accounting import (
+from greenhouse_energy_hub.evaluation import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationReport,
     RunBundle,
@@ -24,13 +24,13 @@ from accounting import (
     evaluate_run,
     saving_percent,
 )
-from control.rolling_horizon import (
+from greenhouse_energy_hub.simulation import (
     ValidRun,
     _persist_outcome,
     load_data,
     run_simulation,
 )
-from models.hub_model import AssetCapabilities, HubConfiguration
+from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
 
 
 EVALUATION_POLICY = DEFAULT_EVALUATION_POLICY
@@ -98,10 +98,10 @@ def main() -> None:
 
     print("\nBaseline (limited-capability reference)...")
     baseline_executable_paths = (
-        "accounting.py",
-        "scenarios.py",
-        "models/hub_model.py",
-        "control/rolling_horizon.py",
+        "src/greenhouse_energy_hub/evaluation.py",
+        "src/greenhouse_energy_hub/scenarios.py",
+        "src/greenhouse_energy_hub/hub.py",
+        "src/greenhouse_energy_hub/simulation.py",
         "experiments/ablations.py",
     )
     baseline_publication_context = _capture_publication_context(
@@ -138,11 +138,11 @@ def main() -> None:
         mpc_options = variant["mpc_options"]
         print(f"\nMPC variant: {name} {mpc_options}")
         mpc_executable_paths = (
-            "accounting.py",
-            "scenarios.py",
-            "models/hub_model.py",
-            "control/rolling_horizon.py",
-            "control/mpc_controller.py",
+            "src/greenhouse_energy_hub/evaluation.py",
+            "src/greenhouse_energy_hub/scenarios.py",
+            "src/greenhouse_energy_hub/hub.py",
+            "src/greenhouse_energy_hub/simulation.py",
+            "src/greenhouse_energy_hub/controllers/mpc.py",
             "experiments/ablations.py",
         )
         mpc_publication_context = _capture_publication_context(

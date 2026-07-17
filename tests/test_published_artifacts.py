@@ -166,12 +166,12 @@ def _write_handcrafted_bundle(
         "code_provenance": {
             "git_revision": "2" * 40,
             "executable_source_tree_sha256": "3" * 64,
-            "executable_path_hashes": {"control/mpc_controller.py": "4" * 64},
+            "executable_path_hashes": {"src/greenhouse_energy_hub/controllers/mpc.py": "4" * 64},
             "committed_executable_path_hashes": {
-                "control/mpc_controller.py": "4" * 64
+                "src/greenhouse_energy_hub/controllers/mpc.py": "4" * 64
             },
             "publication_eligible": publication_eligible,
-            "dirty_executable_paths": [] if publication_eligible else ["control/mpc_controller.py"],
+            "dirty_executable_paths": [] if publication_eligible else ["src/greenhouse_energy_hub/controllers/mpc.py"],
             "untracked_executable_paths": [],
         },
         "runtime": {
@@ -282,7 +282,7 @@ def test_causal_claim_scan_allows_genuinely_noncausal_method_description():
 
 
 def test_bundle_verification_rejects_a_failed_validation_report(tmp_path):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     bundle_path, bundle_id = _write_handcrafted_bundle(
         tmp_path,
@@ -302,7 +302,7 @@ def test_bundle_verification_rejects_a_failed_validation_report(tmp_path):
 
 
 def test_bundle_verification_rejects_missing_solver_status(tmp_path):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     bundle_path, bundle_id = _write_handcrafted_bundle(
         tmp_path,
@@ -320,7 +320,7 @@ def test_bundle_verification_rejects_missing_solver_status(tmp_path):
 
 
 def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     bundle_path, bundle_id = _write_handcrafted_bundle(
         tmp_path,
@@ -335,7 +335,7 @@ def test_bundle_verification_rejects_dirty_executable_source(tmp_path):
 
 
 def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     bundle_path, bundle_id = _write_handcrafted_bundle(tmp_path)
     trajectory = bundle_path / "trajectory.csv"
@@ -352,7 +352,7 @@ def test_bundle_verification_rejects_a_changed_member_byte(tmp_path):
 
 
 def test_bundle_verification_rejects_non_full_input_hashes(tmp_path):
-    from accounting import verify_run_bundle
+    from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     bundle_path, bundle_id = _write_handcrafted_bundle(
         tmp_path,
@@ -372,7 +372,7 @@ def test_bundle_verification_rejects_non_full_input_hashes(tmp_path):
 
 @pytest.mark.parametrize("identifier_kind", ["shortened", "unknown"])
 def test_publication_lookup_requires_a_known_full_bundle_identifier(tmp_path, identifier_kind):
-    from accounting import load_run_bundle
+    from greenhouse_energy_hub.evaluation import load_run_bundle
 
     _bundle_path, bundle_id = _write_handcrafted_bundle(tmp_path)
     requested = bundle_id[:12] if identifier_kind == "shortened" else "f" * 64

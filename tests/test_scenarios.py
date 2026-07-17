@@ -81,7 +81,7 @@ def _thaw(value):
 
 
 def test_scenario_stable_interface_has_exact_fields():
-    from scenarios import Scenario, ScenarioPoint, SourceProvenance
+    from greenhouse_energy_hub.scenarios import Scenario, ScenarioPoint, SourceProvenance
 
     assert tuple(field.name for field in fields(ScenarioPoint)) == (
         "timestamp_utc",
@@ -120,8 +120,8 @@ def test_scenario_stable_interface_has_exact_fields():
 def test_winter_and_summer_fourteen_day_windows_are_exact(
     start_month, expected_season
 ):
-    from control.rolling_horizon import load_data
-    from scenarios import Scenario
+    from greenhouse_energy_hub.simulation import load_data
+    from greenhouse_energy_hub.scenarios import Scenario
 
     scenario = load_data(start_month=start_month, n_days=14, forecast_hours=24)
 
@@ -139,7 +139,7 @@ def test_winter_and_summer_fourteen_day_windows_are_exact(
 
 
 def test_december_window_with_available_forecast_coverage_is_complete():
-    from control.rolling_horizon import load_data
+    from greenhouse_energy_hub.simulation import load_data
 
     scenario = load_data(start_month=12, n_days=14, forecast_hours=24)
 
@@ -151,7 +151,7 @@ def test_december_window_with_available_forecast_coverage_is_complete():
 
 
 def test_cross_month_calendar_window_is_complete():
-    from scenarios import build_scenario
+    from greenhouse_energy_hub.scenarios import build_scenario
 
     scenario = build_scenario(
         name="cross-month",
@@ -168,7 +168,7 @@ def test_cross_month_calendar_window_is_complete():
 
 
 def test_january_first_local_is_rejected_but_first_complete_midnight_succeeds():
-    from scenarios import ScenarioCoverageError, build_scenario
+    from greenhouse_energy_hub.scenarios import ScenarioCoverageError, build_scenario
 
     with pytest.raises(ScenarioCoverageError, match="2022-12-31T23:00:00"):
         build_scenario(
@@ -194,8 +194,8 @@ def test_january_first_local_is_rejected_but_first_complete_midnight_succeeds():
 
 def test_known_good_winter_source_fixture_alignment_is_stable():
     """Keep acquired price/PV/weather bytes aligned while demand changes owner."""
-    from control.rolling_horizon import load_data
-    from scenarios import derive_electrical_demand
+    from greenhouse_energy_hub.simulation import load_data
+    from greenhouse_energy_hub.scenarios import derive_electrical_demand
 
     scenario = load_data(start_month=1, n_days=2, forecast_hours=24)
     points_by_time = {
@@ -215,7 +215,7 @@ def test_known_good_winter_source_fixture_alignment_is_stable():
 
 
 def test_december_window_without_final_forecast_coverage_fails_at_construction():
-    from scenarios import ScenarioCoverageError, build_scenario
+    from greenhouse_energy_hub.scenarios import ScenarioCoverageError, build_scenario
 
     with pytest.raises(ScenarioCoverageError, match="Forecast Coverage"):
         build_scenario(
@@ -233,7 +233,7 @@ def test_december_window_without_final_forecast_coverage_fails_at_construction()
     [("2023-03-26", 23), ("2023-10-29", 25)],
 )
 def test_dst_local_calendar_day_has_exact_operating_steps(date, expected_steps):
-    from scenarios import build_scenario
+    from greenhouse_energy_hub.scenarios import build_scenario
 
     scenario = build_scenario(
         name=f"dst-{date}",
@@ -257,7 +257,7 @@ def test_dst_local_calendar_day_has_exact_operating_steps(date, expected_steps):
 
 
 def test_lighting_turns_on_at_six_local_in_winter_and_summer():
-    from scenarios import lighting_schedule
+    from greenhouse_energy_hub.scenarios import lighting_schedule
 
     local_times = pd.DatetimeIndex(
         [
@@ -305,7 +305,7 @@ def _invalid_source_index(case: str) -> pd.DatetimeIndex:
 
 @pytest.mark.parametrize("case", ["missing", "duplicate", "naive", "off-grid"])
 def test_invalid_source_timestamps_raise_scenario_validation_error(case):
-    from scenarios import ScenarioValidationError, _validate_source_frame
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _validate_source_frame
 
     source = pd.DataFrame(
         {"value": [1.0, 2.0]}, index=_invalid_source_index(case)
@@ -315,7 +315,7 @@ def test_invalid_source_timestamps_raise_scenario_validation_error(case):
 
 
 def test_non_finite_required_source_value_is_rejected():
-    from scenarios import ScenarioValidationError, _validate_source_frame
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _validate_source_frame
 
     source = pd.DataFrame(
         {"value": [1.0, np.nan]},
@@ -364,7 +364,7 @@ def test_non_finite_required_source_value_is_rejected():
 def test_build_scenario_rejects_ambiguous_time_semantics(
     start, end, calendar_days, step
 ):
-    from scenarios import ScenarioValidationError, build_scenario
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, build_scenario
 
     with pytest.raises(ScenarioValidationError):
         build_scenario(
@@ -378,7 +378,7 @@ def test_build_scenario_rejects_ambiguous_time_semantics(
 
 
 def test_source_provenance_is_complete_repo_relative_and_deeply_immutable():
-    from control.rolling_horizon import load_data
+    from greenhouse_energy_hub.simulation import load_data
 
     scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
 
@@ -414,7 +414,7 @@ def test_source_provenance_is_complete_repo_relative_and_deeply_immutable():
 
 
 def test_source_resolving_outside_repository_is_rejected(tmp_path):
-    from scenarios import ScenarioValidationError, _load_source_bundle
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _load_source_bundle
 
     source_path, _, _ = _write_source_bundle(tmp_path)
 
@@ -428,7 +428,7 @@ def test_source_resolving_outside_repository_is_rejected(tmp_path):
 
 
 def test_missing_companion_provenance_sidecar_is_rejected(tmp_path):
-    from scenarios import ScenarioValidationError, _load_source_bundle
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _load_source_bundle
 
     source_path, sidecar_path, _ = _write_source_bundle(
         tmp_path, include_sidecar=False
@@ -457,7 +457,7 @@ def test_missing_companion_provenance_sidecar_is_rejected(tmp_path):
     ],
 )
 def test_source_sidecar_must_match_validated_bytes_and_coverage(tmp_path, mutation):
-    from scenarios import ScenarioValidationError, _load_source_bundle
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _load_source_bundle
 
     source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
     if mutation == "output_path":
@@ -494,7 +494,7 @@ def test_source_sidecar_must_match_validated_bytes_and_coverage(tmp_path, mutati
     ["source_name", "source_url", "parameters", "timezone", "units", "transforms"],
 )
 def test_source_sidecar_requires_typed_acquisition_metadata(tmp_path, mutation):
-    from scenarios import ScenarioValidationError, _load_source_bundle
+    from greenhouse_energy_hub.scenarios import ScenarioValidationError, _load_source_bundle
 
     source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
     if mutation == "source_name":
@@ -523,7 +523,7 @@ def test_source_sidecar_requires_typed_acquisition_metadata(tmp_path, mutation):
 
 
 def test_replacement_source_identity_and_metadata_come_only_from_sidecar(tmp_path):
-    from scenarios import _load_source_bundle, _source_provenance_from_bundle
+    from greenhouse_energy_hub.scenarios import _load_source_bundle, _source_provenance_from_bundle
 
     source_path, sidecar_path, sidecar = _write_source_bundle(tmp_path)
     bundle = _load_source_bundle(
@@ -588,7 +588,7 @@ def test_replacement_source_identity_and_metadata_come_only_from_sidecar(tmp_pat
 
 
 def test_normal_scenario_provenance_is_anchored_to_validated_sidecars():
-    from control.rolling_horizon import load_data
+    from greenhouse_energy_hub.simulation import load_data
 
     scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
     expected_alignment = {
@@ -670,7 +670,7 @@ def test_provenance_sidecars_match_exact_materialized_bytes_and_schema():
 
 
 def test_materialized_demand_matches_scenario_owned_derivation():
-    from scenarios import (
+    from greenhouse_energy_hub.scenarios import (
         _calendar_transplant,
         _read_validated_source,
         derive_electrical_demand,

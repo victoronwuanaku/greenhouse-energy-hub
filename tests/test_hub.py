@@ -22,7 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from models.hub_model import (  # noqa: E402
+from greenhouse_energy_hub.hub import (  # noqa: E402
     hub_dynamics, initial_state, state_bounds, input_bounds,
     ETA_ELZ, ETA_FC_E, E_H2_LHV_KWH_KG,
     BAT_CAPACITY_KWH, H2_CAPACITY_KG, TES_CAPACITY_KWH,
@@ -69,7 +69,7 @@ def test_characterizes_nominal_multicarrier_step_and_exact_import_fee():
 
 def test_characterizes_limited_baseline_policy_at_fixed_fixtures():
     """Freeze policy decisions without endorsing legacy fairness claims."""
-    from control.rolling_horizon import baseline_control
+    from greenhouse_energy_hub.simulation import baseline_control
 
     cold_expensive = baseline_control(
         initial_state(),
@@ -165,7 +165,7 @@ def test_temperature_update_is_bounded_and_warms_with_heat():
 def test_invalid_control_reports_non_finite_and_out_of_bounds_fields(
     field, value, issue_code
 ):
-    from models.hub_model import HubConfiguration, HubControl, validate_control
+    from greenhouse_energy_hub.hub import HubConfiguration, HubControl, validate_control
 
     values = {
         "battery_charge_kw": 0.0,
@@ -186,7 +186,7 @@ def test_invalid_control_reports_non_finite_and_out_of_bounds_fields(
 
 
 def test_invalid_control_reports_simultaneous_flows_above_exact_tolerance():
-    from models.hub_model import HubConfiguration, HubControl, validate_control
+    from greenhouse_energy_hub.hub import HubConfiguration, HubControl, validate_control
 
     control = HubControl(
         battery_charge_kw=0.0011,
@@ -209,7 +209,7 @@ def test_invalid_control_reports_simultaneous_flows_above_exact_tolerance():
 
 def _parity_case_values():
     """Cover nominal, every state/control edge, and deterministic interiors."""
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         CONTROL_MODEL_NAMES,
         STATE_MODEL_NAMES,
         AssetCapabilities,
@@ -337,7 +337,7 @@ def test_shared_hub_expressions_match_numerical_adapter(
     """The CasADi and numerical adapters must evaluate one physical owner."""
     from casadi import Function, SX, vertcat
 
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         CONTROL_MODEL_NAMES,
         EXOGENOUS_MODEL_NAMES,
         STATE_MODEL_NAMES,
@@ -426,7 +426,7 @@ def test_shared_hub_expressions_match_numerical_adapter(
 
 
 def test_shared_thermal_charge_margin_is_signed_and_validated_numerically():
-    from models.hub_model import (
+    from greenhouse_energy_hub.hub import (
         ExogenousInputs,
         HubConfiguration,
         HubControl,
@@ -464,7 +464,7 @@ def test_legacy_wrapper_delegates_physics_and_conversions_to_shared_owners():
     import inspect
     import textwrap
 
-    import models.hub_model as hub_model
+    import greenhouse_energy_hub.hub as hub_model
 
     wrapper_tree = ast.parse(
         textwrap.dedent(inspect.getsource(hub_model.hub_dynamics))
@@ -505,7 +505,7 @@ def test_legacy_wrapper_delegates_physics_and_conversions_to_shared_owners():
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------
 def _mpc_forecast_points(price, pv, load, tout, irr):
-    from control.rolling_horizon import _LegacyScenarioPoint
+    from greenhouse_energy_hub.simulation import _LegacyScenarioPoint
 
     timestamps = pd.date_range("2023-01-01", periods=len(price), freq="h", tz="UTC")
     return tuple(
@@ -524,12 +524,12 @@ def _mpc_forecast_points(price, pv, load, tout, irr):
 
 
 def _configured_mpc(horizon_steps=24):
-    from control.mpc_controller import (
+    from greenhouse_energy_hub.controllers.mpc import (
         MpcConfiguration,
         MpcControllerAdapter,
         build_mpc,
     )
-    from models.hub_model import HubConfiguration
+    from greenhouse_energy_hub.hub import HubConfiguration
 
     config = MpcConfiguration(horizon_steps=horizon_steps)
     mpc, model = build_mpc(HubConfiguration(), config)
@@ -545,8 +545,8 @@ def _configured_mpc(horizon_steps=24):
 
 
 def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
-    from control.rolling_horizon import ControlDecision
-    from models.hub_model import BALANCE_STATE_TOLERANCE, STATE_SCALE
+    from greenhouse_energy_hub.simulation import ControlDecision
+    from greenhouse_energy_hub.hub import BALANCE_STATE_TOLERANCE, STATE_SCALE
 
     n = 25
     forecast = _mpc_forecast_points(
@@ -595,8 +595,8 @@ def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
 
 def test_mpc_builds_steps_and_respects_balance():
     """A few closed-loop MPC steps solve and yield balance-feasible controls."""
-    from control.rolling_horizon import ControlDecision
-    from models.hub_model import HubState
+    from greenhouse_energy_hub.simulation import ControlDecision
+    from greenhouse_energy_hub.hub import HubState
     n = 30
     rng = np.random.default_rng(0)
     price = 0.05 + 0.05 * np.sin(np.linspace(0, 6, n)) + 0.01 * rng.standard_normal(n)
@@ -678,7 +678,7 @@ def assert_physical_invariants(df):
 def test_integration_short_run_full_invariants_and_mpc_not_worse():
     """Regenerate a short real-data window for both controllers and assert the SAME
     physical-invariant suite used on committed results, plus MPC <= baseline cost."""
-    from control.rolling_horizon import ValidRun, load_data, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
     df = load_data(start_month=1, n_days=2)          # deterministic 2-day winter window
     base_run = run_simulation(df, mode="baseline")
     mpc_run = run_simulation(df, mode="mpc")
@@ -698,7 +698,7 @@ def test_integration_short_run_full_invariants_and_mpc_not_worse():
 def results():
     b, m = RESULTS / "baseline_results.csv", RESULTS / "mpc_results.csv"
     if not (b.exists() and m.exists()):
-        pytest.skip("Run `python3 control/rolling_horizon.py` first to generate results.")
+        pytest.skip("Run `python3 src/greenhouse_energy_hub/simulation.py` first to generate results.")
     return pd.read_csv(b), pd.read_csv(m)
 
 
@@ -751,8 +751,8 @@ def test_summary_consistent_with_scenario_csvs():
     scen = RESULTS / "scenarios"
     if not (scen / "summary.csv").exists():
         pytest.skip("No scenario summary committed yet.")
-    import accounting
-    from accounting import (
+    import greenhouse_energy_hub.evaluation as accounting
+    from greenhouse_energy_hub.evaluation import (
         _legacy_grid_inventory_adjusted_cost,
         saving_pct,
         stored_equiv_kwh,

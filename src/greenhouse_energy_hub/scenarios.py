@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
 AMSTERDAM_TIMEZONE = "Europe/Amsterdam"
 UTC_TIMEZONE = "UTC"
