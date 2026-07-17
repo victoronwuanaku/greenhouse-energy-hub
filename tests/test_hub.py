@@ -69,7 +69,7 @@ def test_characterizes_nominal_multicarrier_step_and_exact_import_fee():
 
 def test_characterizes_limited_baseline_policy_at_fixed_fixtures():
     """Freeze policy decisions without endorsing legacy fairness claims."""
-    from greenhouse_energy_hub.simulation import baseline_control
+    from greenhouse_energy_hub.controllers.baseline import baseline_control
 
     cold_expensive = baseline_control(
         initial_state(),

@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import greenhouse_energy_hub.controllers.baseline as baseline_controller
+
 
 INPUT_NAMES = (
     "P_bat_ch",
@@ -358,7 +360,7 @@ def test_invalid_control_returns_invalid_run_without_applying_control(
     def decide(_self, _state, forecast):
         return ControlDecision(control=control, diagnostics=_test_diagnostics(forecast))
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
 
     def must_not_advance(*_args, **_kwargs):
         raise AssertionError("invalid controls must not reach the hub")
@@ -398,7 +400,7 @@ def test_invalid_successor_or_flows_never_append_an_operating_record(
             control=_zero_control(), diagnostics=_test_diagnostics(forecast)
         )
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
 
     valid_state = HubState(
         soc_battery_kwh=500.0,
@@ -456,7 +458,7 @@ def test_malformed_physics_schema_returns_invalid_run_without_record(
             control=_zero_control(), diagnostics=_test_diagnostics(forecast)
         )
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
     malformed_step = (
         object()
         if malformed_shape == "object"
@@ -507,9 +509,9 @@ def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
     def decide(_self, _state, forecast):
         return ControlDecision(control=control, diagnostics=_test_diagnostics(forecast))
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
     monkeypatch.setattr(
-        rolling_horizon.BaselineControllerAdapter,
+        baseline_controller.BaselineControllerAdapter,
         "requires_operational_storage_bounds",
         True,
     )
@@ -659,6 +661,58 @@ def _mpc_adapter(mpc, horizon_steps):
     )
 
 
+def test_both_owned_controller_adapters_cross_simulate_run(
+    monkeypatch,
+    hourly_frame,
+):
+    import greenhouse_energy_hub.simulation as simulation
+    from greenhouse_energy_hub.controllers.baseline import BaselineControllerAdapter
+    from greenhouse_energy_hub.hub import (
+        HubConfiguration,
+        HubFlows,
+        HubStep,
+    )
+    from greenhouse_energy_hub.simulation import ValidRun
+
+    scenario = simulation._scenario_from_frame(
+        hourly_frame.iloc[:2],
+        forecast_horizon_steps=1,
+        operating_step_count=1,
+    )
+    hub_configuration = HubConfiguration()
+    monkeypatch.setattr(
+        simulation,
+        "advance_hub",
+        lambda state, *_args: HubStep(
+            successor=state,
+            flows=HubFlows(
+                grid_kw=0.0,
+                generated_heat_kw=0.0,
+                heat_to_air_kw=0.0,
+                thermal_charge_margin_kw=0.0,
+                hydrogen_production_kg_per_h=0.0,
+                hydrogen_consumption_kg_per_h=0.0,
+            ),
+        ),
+    )
+
+    baseline = simulation.simulate_run(
+        scenario,
+        BaselineControllerAdapter(hub_configuration),
+        hub_configuration,
+    )
+    mpc = simulation.simulate_run(
+        scenario,
+        _mpc_adapter(_ForecastAwareMpc(), horizon_steps=1),
+        hub_configuration,
+    )
+
+    assert isinstance(baseline, ValidRun)
+    assert isinstance(mpc, ValidRun)
+    assert (baseline.controller_name, mpc.controller_name) == ("baseline", "mpc")
+    assert len(baseline.records) == len(mpc.records) == 1
+
+
 def test_mpc_rejects_wrong_length_forecast_before_solver():
     from greenhouse_energy_hub.simulation import ControllerFailure
     from greenhouse_energy_hub.hub import initial_state
@@ -776,7 +830,7 @@ def test_scenario_iterates_only_operating_window(monkeypatch, hourly_frame):
             control=_zero_control(), diagnostics=_test_diagnostics(forecast)
         )
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
     monkeypatch.setattr(
         rolling_horizon,
         "advance_hub",
@@ -816,11 +870,11 @@ def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
 
     import greenhouse_energy_hub.simulation as rolling_horizon
     from greenhouse_energy_hub.simulation import (
-        BaselineControllerAdapter,
         ControlDecision,
         DecisionDiagnostics,
         ValidRun,
     )
+    from greenhouse_energy_hub.controllers.baseline import BaselineControllerAdapter
     from greenhouse_energy_hub.hub import HubConfiguration, HubFlows, HubStep
 
     scenario = rolling_horizon.load_data(
@@ -925,88 +979,90 @@ def test_missing_final_forecast_coverage_fails_before_run(hourly_frame):
         )
 
 
-def test_cli_does_not_serialize_invalid_run(monkeypatch, tmp_path, hourly_frame):
-    import greenhouse_energy_hub.simulation as rolling_horizon
-    from greenhouse_energy_hub.simulation import ControllerFailure, DecisionDiagnostics
+def test_experiment_configuration_constructs_one_asset_capability_owner():
+    from experiments.run_scenario import build_hub_configuration
 
-    def decide(_self, _state, forecast):
-        diagnostics = DecisionDiagnostics(
-            **{
-                **_test_diagnostics(forecast).__dict__,
-                "decision_status": "failure",
-            }
-        )
-        return ControllerFailure(
-            code="test_failure", message="forced failure", diagnostics=diagnostics
-        )
-
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
-    monkeypatch.setattr(
-        rolling_horizon, "load_data", lambda **_kwargs: hourly_frame.iloc[:1]
-    )
-    monkeypatch.setattr(rolling_horizon, "RESULTS_DIR", tmp_path)
-    monkeypatch.setattr(
-        rolling_horizon.sys,
-        "argv",
-        ["rolling_horizon.py", "--days", "1", "--mode", "baseline"],
+    config = build_hub_configuration(
+        battery=True,
+        hydrogen=False,
+        thermal_store=False,
     )
 
-    csv_writes = []
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "to_csv",
-        lambda _self, path, **_kwargs: csv_writes.append(path),
-    )
-
-    rolling_horizon.main()
-
-    assert csv_writes == []
-
-
-def test_cli_constructs_one_asset_capability_configuration(
-    monkeypatch, tmp_path, hourly_frame
-):
-    from types import SimpleNamespace
-
-    import greenhouse_energy_hub.simulation as rolling_horizon
-
-    observed_configurations = []
-
-    def capture_run(_data, *, mode, hub_config, **_kwargs):
-        observed_configurations.append((mode, hub_config))
-        return SimpleNamespace(
-            failed_step=0,
-            failure_code="test_stop",
-            message="configuration captured",
-        )
-
-    monkeypatch.setattr(
-        rolling_horizon, "load_data", lambda **_kwargs: hourly_frame.iloc[:1]
-    )
-    monkeypatch.setattr(rolling_horizon, "run_simulation", capture_run)
-    monkeypatch.setattr(rolling_horizon, "RESULTS_DIR", tmp_path)
-    monkeypatch.setattr(
-        rolling_horizon.sys,
-        "argv",
-        [
-            "rolling_horizon.py",
-            "--days",
-            "1",
-            "--mode",
-            "baseline",
-            "--disable-h2",
-            "--disable-tes",
-        ],
-    )
-
-    rolling_horizon.main()
-
-    assert len(observed_configurations) == 1
-    mode, config = observed_configurations[0]
-    assert mode == "baseline"
     assert config.capabilities.battery is True
     assert config.capabilities.hydrogen is False
     assert config.capabilities.thermal_store is False
+
+
+def test_publication_candidate_map_records_only_a_verified_full_identifier(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from experiments import run_scenario
+    from greenhouse_energy_hub.evaluation import RunBundle
+
+    identifier = "a" * 64
+    bundle = RunBundle(
+        identifier=identifier,
+        specification_identifier="b" * 64,
+        path=tmp_path / "runs" / f"scenario--baseline--{identifier}",
+        manifest={},
+    )
+    verified = []
+
+    def verify(path, requested_identifier, *, repository_root):
+        verified.append((path, requested_identifier, repository_root))
+        return bundle
+
+    monkeypatch.setattr(run_scenario, "verify_run_bundle", verify)
+    candidate_index = tmp_path / "diagnostics" / "publication-candidates.json"
+
+    run_scenario.record_publication_candidate(
+        "winter-baseline",
+        bundle,
+        candidate_index=candidate_index,
+        repository_root=tmp_path,
+    )
+
+    assert json.loads(candidate_index.read_text(encoding="utf-8")) == {
+        "winter-baseline": identifier
+    }
+    assert verified == [(bundle.path, identifier, tmp_path)]
+    assert list(candidate_index.parent.glob(".publication-candidates.json.*")) == []
+
+    candidate_index.write_text('{"legacy-short-id":"abc123"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="full lowercase SHA-256"):
+        run_scenario.record_publication_candidate(
+            "winter-baseline",
+            bundle,
+            candidate_index=candidate_index,
+            repository_root=tmp_path,
+        )
+
+
+def test_baseline_adapter_policy_metadata_has_one_stable_owner():
+    from greenhouse_energy_hub.controllers.baseline import (
+        BASELINE_TARGET_C,
+        BaselineControllerAdapter,
+    )
+    from greenhouse_energy_hub.hub import T_MIN_C
+
+    assert BaselineControllerAdapter.__module__ == (
+        "greenhouse_energy_hub.controllers.baseline"
+    )
+    assert BASELINE_TARGET_C == T_MIN_C + 0.5
+    assert BaselineControllerAdapter.configuration == {
+        "target_indoor_temperature_c": BASELINE_TARGET_C
+    }
+    assert BaselineControllerAdapter.capability_policy == {
+        "hydrogen_dispatch": False,
+        "thermal_store_charging": False,
+        "grid_battery_charging": False,
+        "battery_discharge_price_threshold_eur_per_kwh": 0.12,
+    }
+    with pytest.raises(TypeError):
+        BaselineControllerAdapter.capability_policy["hydrogen_dispatch"] = True
 
 
 @pytest.mark.parametrize(
@@ -1145,7 +1201,7 @@ def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording
             diagnostics=_test_diagnostics(forecast),
         )
 
-    monkeypatch.setattr(rolling_horizon.BaselineControllerAdapter, "decide", decide)
+    monkeypatch.setattr(baseline_controller.BaselineControllerAdapter, "decide", decide)
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
     )

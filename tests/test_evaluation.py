@@ -718,16 +718,15 @@ def test_solver_only_configuration_changes_do_not_change_evaluation():
 def test_ablation_variants_use_hub_configuration_and_publish_separate_scorecard():
     from greenhouse_energy_hub.evaluation import evaluate_run
     from experiments import ablations
-    from greenhouse_energy_hub.hub import HubConfiguration
 
     assert not hasattr(ablations, "effective_cost")
     assert not hasattr(ablations, "COMFORT_PENALTY_EUR_PER_CH")
-    for variant in ablations.VARIANTS.values():
-        assert isinstance(variant["hub_configuration"], HubConfiguration)
-        assert not {
-            "disable_h2",
-            "disable_tes",
-        }.intersection(variant["mpc_options"])
+    assert ablations.VARIANTS == {
+        "full": {"horizon_steps": 24},
+        "no-h2": {"horizon_steps": 24, "hydrogen": False},
+        "no-tes": {"horizon_steps": 24, "thermal_store": False},
+        "one-step": {"horizon_steps": 1},
+    }
 
     policy = _policy()
     report = evaluate_run(_two_step_valid_run(), policy)
@@ -1730,26 +1729,30 @@ def test_entrypoints_capture_complete_publication_context_before_execution():
     import inspect
 
     import greenhouse_energy_hub.simulation as rolling_horizon
-    from experiments import ablations
+    from experiments import ablations, run_scenario
 
-    rolling_source = inspect.getsource(rolling_horizon.main)
+    cli_source = inspect.getsource(run_scenario.main)
+    execution_source = inspect.getsource(run_scenario.execute_experiment)
     ablation_source = inspect.getsource(ablations.main)
     marker = "_capture_publication_context"
-    assert marker in rolling_source
-    assert marker in ablation_source
-    assert rolling_source.index(marker) < rolling_source.index("run_simulation(")
-    assert ablation_source.index(marker) < ablation_source.index("run_simulation(")
+    assert not hasattr(rolling_horizon, "main")
+    assert "execute_experiment(" in cli_source
+    assert "execute_experiment(" in ablation_source
+    assert marker in execution_source
+    assert execution_source.index(marker) < execution_source.index("simulate_run(")
+    executable_paths = "\n".join(run_scenario.CORE_EXECUTABLE_PATHS)
     for dependency in (
         "src/greenhouse_energy_hub/evaluation.py",
         "src/greenhouse_energy_hub/scenarios.py",
         "src/greenhouse_energy_hub/hub.py",
         "src/greenhouse_energy_hub/simulation.py",
     ):
-        assert dependency in rolling_source
-        assert dependency in ablation_source
-    assert "src/greenhouse_energy_hub/controllers/mpc.py" in rolling_source
-    assert "src/greenhouse_energy_hub/controllers/mpc.py" in ablation_source
-    assert "experiments/ablations.py" in ablation_source
+        assert dependency in executable_paths
+    assert (
+        "src/greenhouse_energy_hub/controllers/mpc.py"
+        in inspect.getsource(run_scenario.executable_paths_for_controller)
+    )
+    assert '"experiments/ablations.py"' in ablation_source
 
 
 def test_one_specification_retains_divergent_valid_outputs(tmp_path):
@@ -2023,9 +2026,10 @@ def test_legacy_entry_points_no_longer_write_mutable_csv_or_figure_artifacts():
     import inspect
 
     import greenhouse_energy_hub.simulation as rolling_horizon
-    from experiments import ablations
+    from experiments import ablations, run_scenario
 
-    rolling_source = inspect.getsource(rolling_horizon.main)
+    assert not hasattr(rolling_horizon, "main")
+    rolling_source = inspect.getsource(run_scenario.main)
     ablation_source = inspect.getsource(ablations.main)
     assert ".to_csv(" not in rolling_source
     assert "baseline_results.csv" not in rolling_source

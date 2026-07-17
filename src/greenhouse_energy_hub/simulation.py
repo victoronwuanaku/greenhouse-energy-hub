@@ -10,40 +10,28 @@ Workflow
       apply the first control action; (baseline) apply the rule-based action.
    b. Advance the plant through the shared numerical hub adapter.
    c. Record states, controls, costs and diagnostics.
-4. Run the identical loop for both controllers and apply one named scorecard.
+4. Return a Valid Run or explicit Invalid Run for the evaluation Module.
 
 Heat is implicit: there is no prescribed heat-demand series. Both controllers
 must keep the greenhouse temperature inside the comfort band by supplying heat
 (heat pump, e-boiler, fuel-cell heat, TES) and opening ventilation.
 
-Baseline controller (limited capability, naive, no look-ahead)
----------------------------------------------------------------
-  - A frugal thermostat: reactively heats to hold the LOWER comfort bound
-    (BASELINE_TARGET_C = T_MIN + 0.5 = 16.5 degC), the cheapest in-band temperature,
-    via heat pump first, then e-boiler, then TES discharge.
-  - Holding the lower bound (not a 19 degC setpoint) aligns the comfort target, while
-    its exact capability limits remain explicit in every comparison.
-  - Vent fully when solar gain would push the air above the comfort band.
-  - Battery charges from PV surplus, discharges when price > 0.12 EUR/kWh.
-  - No hydrogen use, no thermal pre-storage, no price look-ahead.
+The Baseline and MPC implementations live in ``controllers/`` and cross the same
+Controller Adapter seam. Their policy and solver details do not live here.
 
 Result schema note: each results frame has one row per simulated hour plus a final
 `is_terminal=True` row carrying the true terminal state (zero controls/cost, NaN
 exogenous inputs) so inventory settlement uses the real end state. Operating-step
 aggregations should filter `is_terminal == False`.
 
-Usage
------
-    python3 src/greenhouse_energy_hub/simulation.py [--days 14] [--start-month 6] [--mode both]
-    # winter fortnight: --start-month 1 ;  summer fortnight: --start-month 6
+The command-line entry point lives in ``experiments/run_scenario.py``. This
+module exposes simulation interfaces without owning CLI parsing or presentation.
 """
 
-import argparse
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from numbers import Integral, Real
-import sys
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, TypeAlias
@@ -52,30 +40,23 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 
 from greenhouse_energy_hub.hub import (
-    AssetCapabilities, ExogenousInputs, HubConfiguration, HubControl, HubFlows,
+    ExogenousInputs, HubConfiguration, HubControl, HubFlows,
     HubState, HubStep, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
-    initial_state, normalize_control, state_bounds, validate_control, validate_flows,
+    initial_state, normalize_control, validate_control, validate_flows,
     validate_successor, SOLVER_BOUND_TOLERANCE_KW,
-    BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
-    HP_P_MAX_KW, HP_COP, EBOILER_P_MAX_KW, ETA_EBOILER,
-    TES_P_MAX_KW,
-    C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
-    Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
+    DT_H,
 )
 from greenhouse_energy_hub.evaluation import (
     DEFAULT_EVALUATION_POLICY,
     EvaluationPolicy,
     RunBundle,
     _PublicationContext,
-    _capture_publication_context,
     build_run_specification,
     create_run_bundle,
     evaluate_run,
     evaluate_step,
-    saving_percent,
     write_failure_diagnostics,
 )
 from greenhouse_energy_hub.scenarios import (
@@ -85,15 +66,8 @@ from greenhouse_energy_hub.scenarios import (
     ScenarioValidationError,
     build_scenario,
 )
-# NOTE: build_mpc is imported lazily inside run_simulation() so that importing this
-# module (e.g. for load_data or the baseline) does not pull in the do-mpc/IPOPT stack.
-
-# Limited-capability Baseline: a frugal thermostat that holds the lower comfort
-# bound. Its exact missing capabilities are declared by BaselineControllerAdapter.
-BASELINE_TARGET_C = T_MIN_C + 0.5
-
-DATA_DIR = ROOT / "data"
-RESULTS_DIR = ROOT / "results"   # created in main(), not at import time
+# NOTE: Controller Adapters are imported lazily inside run_simulation() so importing
+# the validated simulation Module does not pull in the do-mpc/IPOPT stack.
 
 # Decision variables solved by the MPC (P_grid is the derived slack bus, not a control)
 INPUT_NAMES = ["P_bat_ch", "P_bat_dis", "P_elz", "P_fc", "P_hp",
@@ -273,164 +247,12 @@ def load_data(
         f"2023-{int(start_month):02d}-{start_day:02d} 00:00",
         tz="Europe/Amsterdam",
     )
-    scenario = build_scenario(
+    return build_scenario(
         name=scenario_tag(int(start_month), int(n_days)),
         operating_start=start,
         calendar_days=int(n_days),
         max_horizon_steps=int(forecast_hours),
     )
-    operating_points = scenario.points[: scenario.operating_step_count]
-    prices_mwh = np.array(
-        [point.price_eur_per_kwh * 1000.0 for point in scenario.points]
-    )
-    print(
-        f"Simulation: {scenario.operating_start} -> "
-        f"{operating_points[-1].timestamp_utc}  "
-        f"({scenario.operating_step_count} operating steps + "
-        f"{scenario.forecast_horizon_capacity_steps} forecast hours)"
-    )
-    print(
-        f"  Price: {prices_mwh.min():.1f} - {prices_mwh.max():.1f} EUR/MWh "
-        f"(negative: {(prices_mwh < 0).sum()} h)"
-    )
-    print(
-        f"  PV peak: {max(point.pv_kw for point in scenario.points):.0f} kW   "
-        f"Elec load: {min(point.electric_load_kw for point in scenario.points):.0f}-"
-        f"{max(point.electric_load_kw for point in scenario.points):.0f} kW   "
-        f"T_out: {min(point.outdoor_temperature_c for point in scenario.points):.1f}-"
-        f"{max(point.outdoor_temperature_c for point in scenario.points):.1f} C"
-    )
-    return scenario
-
-
-# ---------------------------------------------------------------------------
-# Baseline controller (rule-based, no look-ahead)
-# ---------------------------------------------------------------------------
-def baseline_control(
-    x: Mapping[str, object],
-    p: Mapping[str, object],
-    hub_config: HubConfiguration = HubConfiguration(),
-) -> dict[str, object]:
-    """Naive reactive dispatch: hold the lower comfort bound (BASELINE_TARGET_C)
-    with HP/e-boiler/TES, plus a simple PV-charge / high-price-discharge battery rule."""
-    sb = state_bounds(hub_config)
-    T_in, T_out, G = x["T_in"], p["T_out"], p["G_Wm2"]
-    P_pv, P_load, price = p["P_pv"], p["P_load"], p["price"]
-
-    Q_solar = SOLAR_GAIN_FRAC * G * FLOOR_AREA_M2 / 1000.0
-    C = C_AIR_KWH_K / DT_H
-    U = U_EFF_KW_K
-
-    # Generated heat needed to reach the target this step (vents closed, no TES charge)
-    Q_air_req = BASELINE_TARGET_C * (C + U) - C * T_in - U * T_out + Q_CROP_LATENT_KW
-    Q_heat_req = max(0.0, Q_air_req - Q_solar)
-
-    # Heat dispatch: heat pump (cheapest) -> e-boiler -> TES discharge
-    Q_hp = min(Q_heat_req, HP_COP * HP_P_MAX_KW)
-    P_hp = Q_hp / HP_COP
-    rem = Q_heat_req - Q_hp
-    Q_eb = min(rem, ETA_EBOILER * EBOILER_P_MAX_KW)
-    P_eboiler = Q_eb / ETA_EBOILER
-    rem -= Q_eb
-    tes_avail = max(0.0, x["SOC_tes"] - sb["SOC_tes"][0])
-    Q_tes_dis = min(rem, TES_P_MAX_KW, tes_avail)
-    Q_tes_ch = 0.0
-
-    # Ventilation: vent fully if solar gain would overheat the (unheated) greenhouse
-    Q_air_novent = Q_hp + Q_eb + Q_tes_dis + Q_solar
-    T_next_novent = (C * T_in + Q_air_novent + U * T_out - Q_CROP_LATENT_KW) / (C + U)
-    vent = 1.0 if T_next_novent > T_MAX_C else 0.0
-
-    P_elz = 0.0
-    P_fc = 0.0
-
-    # Battery: charge PV surplus, discharge when expensive (clamped to SOC bounds)
-    P_bat_ch = 0.0
-    P_bat_dis = 0.0
-    headroom = max(0.0, sb["SOC_bat"][1] - x["SOC_bat"]) / (ETA_BAT_CH * DT_H)
-    available = max(0.0, x["SOC_bat"] - sb["SOC_bat"][0]) * ETA_BAT_DIS / DT_H
-    pv_surplus = P_pv - P_load - P_hp - P_eboiler
-    if hub_config.capabilities.battery and pv_surplus > 0:
-        P_bat_ch = min(BAT_P_MAX_KW, pv_surplus, headroom)
-    elif hub_config.capabilities.battery and price > 0.12:
-        P_bat_dis = min(BAT_P_MAX_KW, available)
-
-    return {
-        "P_bat_ch": P_bat_ch, "P_bat_dis": P_bat_dis,
-        "P_elz": P_elz, "P_fc": P_fc,
-        "P_hp": P_hp, "P_eboiler": P_eboiler,
-        "Q_tes_ch": Q_tes_ch, "Q_tes_dis": Q_tes_dis,
-        "vent": vent,
-    }
-
-
-class BaselineControllerAdapter:
-    name = "baseline"
-    configuration: Mapping[str, JSONValue] = _read_only_mapping(
-        {"target_indoor_temperature_c": BASELINE_TARGET_C}
-    )
-    capability_policy: Mapping[str, JSONValue] = _read_only_mapping(
-        {
-            "hydrogen_dispatch": False,
-            "thermal_store_charging": False,
-            "grid_battery_charging": False,
-            "battery_discharge_price_threshold_eur_per_kwh": 0.12,
-        }
-    )
-    forecast_horizon_steps = 0
-    requires_operational_storage_bounds = False
-
-    def __init__(
-        self, hub_config: HubConfiguration = HubConfiguration()
-    ) -> None:
-        self._hub_config = hub_config
-
-    def decide(
-        self,
-        state: HubState,
-        forecast: tuple[ScenarioPoint, ...],
-    ) -> ControlDecision | ControllerFailure:
-        point = forecast[0]
-        legacy_control = baseline_control(
-            state,
-            {
-                "P_pv": point.pv_kw,
-                "P_load": point.electric_load_kw,
-                "price": point.price_eur_per_kwh,
-                "T_out": point.outdoor_temperature_c,
-                "G_Wm2": point.irradiance_w_per_m2,
-            },
-            self._hub_config,
-        )
-        stable_values = {
-            field_name: legacy_control[model_name]
-            for field_name, model_name in {
-                "battery_charge_kw": "P_bat_ch",
-                "battery_discharge_kw": "P_bat_dis",
-                "electrolyser_kw": "P_elz",
-                "fuel_cell_kw": "P_fc",
-                "heat_pump_kw": "P_hp",
-                "electric_boiler_kw": "P_eboiler",
-                "thermal_charge_kw": "Q_tes_ch",
-                "thermal_discharge_kw": "Q_tes_dis",
-                "ventilation_fraction": "vent",
-            }.items()
-        }
-        return ControlDecision(
-            control=HubControl(**stable_values),
-            diagnostics=DecisionDiagnostics(
-                adapter="baseline",
-                decision_status="success",
-                solver_success=None,
-                solver_return_status=None,
-                solver_iterations=None,
-                solver_wall_seconds=None,
-                forecast_start_utc=point.timestamp_utc,
-                forecast_end_utc=point.timestamp_utc,
-                terminal_electric_value_eur_per_kwh=None,
-                terminal_heat_value_eur_per_kwhth=None,
-            ),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1119,6 +941,10 @@ def run_simulation(
         raise TypeError("evaluation_policy must be an EvaluationPolicy")
 
     if mode == "baseline":
+        from greenhouse_energy_hub.controllers.baseline import (
+            BaselineControllerAdapter,
+        )
+
         if mpc_kwargs:
             unexpected = ", ".join(sorted(mpc_kwargs))
             raise TypeError(f"unexpected Baseline options: {unexpected}")
@@ -1143,10 +969,6 @@ def run_simulation(
     )
 
     horizon_steps = int(mpc_kwargs.get("n_horizon", N_HORIZON))
-    print(
-        f"\nBuilding MPC controller (horizon={horizon_steps}h, "
-        f"{', '.join(key for key, value in mpc_kwargs.items() if value) or 'full'})..."
-    )
     config_field_names = {field.name for field in fields(MpcConfiguration)}
     unexpected = set(mpc_kwargs) - config_field_names - {"n_horizon"}
     if unexpected:
@@ -1205,7 +1027,6 @@ def run_simulation(
         )
     else:
         raise TypeError("data must be a Scenario or DataFrame")
-    print("MPC controller ready.\n")
     return simulate_run(scenario, controller, hub_config)
 
 
@@ -1251,137 +1072,3 @@ def scenario_tag(start_month: int, n_days: int) -> str:
               6: "summer", 7: "summer", 8: "summer",
               9: "autumn", 10: "autumn", 11: "autumn"}[start_month]
     return f"{season}_m{start_month:02d}_{n_days}d"
-
-
-def update_summary(summary_path: Path, row: dict):
-    """Append/replace this scenario's row in an auditable summary table."""
-    cols = list(row.keys())
-    if summary_path.exists():
-        table = pd.read_csv(summary_path)
-        table = table[table["scenario"] != row["scenario"]]   # replace if rerun
-        table = pd.concat([table, pd.DataFrame([row])], ignore_index=True)
-    else:
-        table = pd.DataFrame([row], columns=cols)
-    table.sort_values("scenario").to_csv(summary_path, index=False)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="Greenhouse energy hub MPC rolling-horizon simulation.")
-    parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--start-month", type=int, default=6)
-    parser.add_argument("--mode", type=str, default="both",
-                        choices=["mpc", "baseline", "both"])
-    parser.add_argument("--disable-h2", action="store_true")
-    parser.add_argument("--disable-tes", action="store_true")
-    args = parser.parse_args()
-
-    hub_config = HubConfiguration(
-        capabilities=AssetCapabilities(
-            hydrogen=not args.disable_h2,
-            thermal_store=not args.disable_tes,
-        )
-    )
-
-    RESULTS_DIR.mkdir(exist_ok=True)
-    tag = scenario_tag(args.start_month, args.days)
-
-    print("=" * 65)
-    print(f"  Greenhouse Energy Hub MPC - {tag}")
-    print("  Location: Westland, Netherlands")
-    print("=" * 65)
-
-    scenario = load_data(start_month=args.start_month, n_days=args.days)
-    runs: dict[str, ValidRun] = {}
-
-    for i, mode in enumerate(["baseline", "mpc"]):
-        if args.mode not in (mode, "both"):
-            continue
-        print(f"\n[{i+1}/2] {mode.upper()}...")
-        executable_paths: tuple[str | Path, ...] = (
-            "src/greenhouse_energy_hub/evaluation.py",
-            "src/greenhouse_energy_hub/scenarios.py",
-            "src/greenhouse_energy_hub/hub.py",
-            "src/greenhouse_energy_hub/simulation.py",
-        )
-        if mode == "mpc":
-            executable_paths += ("src/greenhouse_energy_hub/controllers/mpc.py",)
-        publication_context = _capture_publication_context(
-            executable_paths,
-            repository_root=ROOT,
-        )
-        outcome = run_simulation(
-            scenario,
-            mode=mode,
-            hub_config=hub_config,
-            evaluation_policy=DEFAULT_EVALUATION_POLICY,
-        )
-        artifact: RunBundle | Path | None = None
-        if isinstance(outcome, (ValidRun, InvalidRun)):
-            try:
-                artifact = _persist_outcome(
-                    outcome,
-                    DEFAULT_EVALUATION_POLICY,
-                    results_root=RESULTS_DIR,
-                    executable_paths=executable_paths,
-                    publication_context=publication_context,
-                )
-            except ValueError as exc:
-                # Compatibility-frame Runs deliberately lack source provenance and
-                # therefore cannot cross the Task 7 publication boundary.
-                print(f"  ARTIFACT REJECTED: {exc}")
-        if not isinstance(outcome, ValidRun):
-            print(
-                f"  INVALID RUN at step {outcome.failed_step}: "
-                f"{outcome.failure_code}: {outcome.message}"
-            )
-            if artifact is not None:
-                print(f"  Diagnostics -> {artifact}")
-            continue
-        runs[mode] = outcome
-        if artifact is not None:
-            assert isinstance(artifact, RunBundle)
-            print(f"  Verified Run Bundle -> {artifact.path}")
-
-    if "baseline" in runs and "mpc" in runs:
-        baseline_report = evaluate_run(
-            runs["baseline"], DEFAULT_EVALUATION_POLICY
-        )
-        mpc_report = evaluate_run(runs["mpc"], DEFAULT_EVALUATION_POLICY)
-        baseline = baseline_report.nominal
-        mpc = mpc_report.nominal
-
-        print("\n" + "=" * 65)
-        print(f"  RESULTS SUMMARY - {tag}")
-        print("=" * 65)
-        print(
-            "  Baseline (limited capability): "
-            f"Grid EUR {baseline.grid_cost_eur:>9.2f}; "
-            f"Operating EUR {baseline.operating_cost_eur:>9.2f}; "
-            f"Inventory-Adjusted EUR "
-            f"{baseline.inventory_adjusted_cost_eur:>9.2f}; "
-            f"Comfort {baseline.comfort_violation_c_h:>6.1f} C.h"
-        )
-        print(
-            "  MPC                          : "
-            f"Grid EUR {mpc.grid_cost_eur:>9.2f}; "
-            f"Operating EUR {mpc.operating_cost_eur:>9.2f}; "
-            f"Inventory-Adjusted EUR "
-            f"{mpc.inventory_adjusted_cost_eur:>9.2f}; "
-            f"Comfort {mpc.comfort_violation_c_h:>6.1f} C.h"
-        )
-        print(
-            "  Inventory-Adjusted saving   : "
-            f"EUR {baseline.inventory_adjusted_cost_eur - mpc.inventory_adjusted_cost_eur:>9.2f} "
-            f"({saving_percent(baseline.inventory_adjusted_cost_eur, mpc.inventory_adjusted_cost_eur):+.1f}%)"
-        )
-        print("=" * 65)
-
-        print("  Published inputs are the verified full-ID Run Bundles above.")
-
-
-if __name__ == "__main__":
-    main()

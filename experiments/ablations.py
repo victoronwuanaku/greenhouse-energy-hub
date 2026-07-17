@@ -1,61 +1,45 @@
-"""Evaluate validated MPC variants under one shared Evaluation Policy.
+"""Evaluate the approved MPC ablations through the shared experiment path."""
 
-The Baseline is a deliberately limited-capability reference.  This script reports
-each named economic quantity and physical comfort violation separately; causal
-publication claims remain gated on valid, provenance-backed Run Bundles.
-
-Usage:  python3 experiments/ablations.py [--days 14] [--start-month 1]
-"""
+from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
+from typing import Sequence
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
 from greenhouse_energy_hub.evaluation import (
-    DEFAULT_EVALUATION_POLICY,
+    EvaluationPolicy,
     EvaluationReport,
     RunBundle,
-    _capture_publication_context,
     evaluate_run,
     saving_percent,
 )
-from greenhouse_energy_hub.simulation import (
-    ValidRun,
-    _persist_outcome,
-    load_data,
-    run_simulation,
-)
-from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
+from greenhouse_energy_hub.simulation import InvalidRun, ValidRun
 
+if __package__:
+    from .run_scenario import (
+        CANDIDATE_INDEX,
+        RESULTS_ROOT,
+        ROOT,
+        _amsterdam_timestamp,
+        execute_experiment,
+    )
+else:
+    from run_scenario import (
+        CANDIDATE_INDEX,
+        RESULTS_ROOT,
+        ROOT,
+        _amsterdam_timestamp,
+        execute_experiment,
+    )
 
-EVALUATION_POLICY = DEFAULT_EVALUATION_POLICY
 
 VARIANTS = {
-    "MPC (full)": {
-        "hub_configuration": HubConfiguration(),
-        "mpc_options": {},
-    },
-    "no H2": {
-        "hub_configuration": HubConfiguration(
-            capabilities=AssetCapabilities(hydrogen=False)
-        ),
-        "mpc_options": {},
-    },
-    "no TES": {
-        "hub_configuration": HubConfiguration(
-            capabilities=AssetCapabilities(thermal_store=False)
-        ),
-        "mpc_options": {},
-    },
-    "myopic (1h)": {
-        "hub_configuration": HubConfiguration(),
-        "mpc_options": {"n_horizon": 1},
-    },
+    "full": {"horizon_steps": 24},
+    "no-h2": {"horizon_steps": 24, "hydrogen": False},
+    "no-tes": {"horizon_steps": 24, "thermal_store": False},
+    "one-step": {"horizon_steps": 1},
 }
 
 
@@ -88,112 +72,101 @@ def _scorecard_row(
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="MPC ablation study.")
-    parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--start-month", type=int, default=1)
-    args = parser.parse_args()
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the approved greenhouse energy hub MPC ablations."
+    )
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--start", required=True, type=_amsterdam_timestamp)
+    window = parser.add_mutually_exclusive_group(required=True)
+    window.add_argument("--end", type=_amsterdam_timestamp)
+    window.add_argument("--days", type=int)
+    parser.add_argument("--scenario-max-horizon", type=int, default=24)
+    parser.add_argument("--terminal-weight", type=float, default=1.0)
+    parser.add_argument("--price-path", type=Path)
+    parser.add_argument("--pv-path", type=Path)
+    parser.add_argument("--repository-root", type=Path, default=ROOT)
+    parser.add_argument("--results-root", type=Path, default=RESULTS_ROOT)
+    parser.add_argument("--candidate-index", type=Path, default=CANDIDATE_INDEX)
+    return parser
 
-    scenario = load_data(start_month=args.start_month, n_days=args.days)
 
-    print("\nBaseline (limited-capability reference)...")
-    baseline_executable_paths = (
-        "src/greenhouse_energy_hub/evaluation.py",
-        "src/greenhouse_energy_hub/scenarios.py",
-        "src/greenhouse_energy_hub/hub.py",
-        "src/greenhouse_energy_hub/simulation.py",
-        "experiments/ablations.py",
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    policy = EvaluationPolicy()
+    common = {
+        "name": args.name,
+        "operating_start": args.start,
+        "operating_end": args.end,
+        "calendar_days": args.days,
+        "scenario_max_horizon_steps": args.scenario_max_horizon,
+        "terminal_weight": args.terminal_weight,
+        "price_path": args.price_path,
+        "pv_path": args.pv_path,
+        "repository_root": args.repository_root,
+        "results_root": args.results_root,
+        "extra_executable_paths": ("experiments/ablations.py",),
+        "evaluation_policy": policy,
+    }
+
+    baseline_result = execute_experiment(
+        controller_name="baseline",
+        **common,
     )
-    baseline_publication_context = _capture_publication_context(
-        baseline_executable_paths,
-        repository_root=ROOT,
-    )
-    baseline_outcome = run_simulation(
-        scenario,
-        mode="baseline",
-        hub_config=HubConfiguration(),
-        evaluation_policy=EVALUATION_POLICY,
-    )
-    baseline_artifact = _persist_outcome(
-        baseline_outcome,
-        EVALUATION_POLICY,
-        results_root=ROOT / "results",
-        executable_paths=baseline_executable_paths,
-        publication_context=baseline_publication_context,
-    )
-    if not isinstance(baseline_outcome, ValidRun):
+    if isinstance(baseline_result.outcome, InvalidRun):
         print(
-            f"INVALID baseline Run at step {baseline_outcome.failed_step}: "
-            f"{baseline_outcome.failure_code}: {baseline_outcome.message}"
+            f"INVALID baseline Run at step {baseline_result.outcome.failed_step}: "
+            f"{baseline_result.outcome.failure_code}: "
+            f"{baseline_result.outcome.message}"
         )
-        print(f"Diagnostics -> {baseline_artifact}")
-        return
-    assert isinstance(baseline_artifact, RunBundle)
-    print(f"Verified Run Bundle -> {baseline_artifact.path}")
-    baseline_report = evaluate_run(baseline_outcome, EVALUATION_POLICY)
+        print(f"Diagnostics -> {baseline_result.artifact}")
+        return 2
+    assert isinstance(baseline_result.outcome, ValidRun)
+    assert isinstance(baseline_result.artifact, RunBundle)
+    print(
+        "Verified Baseline Run Bundle "
+        f"{baseline_result.artifact.identifier} -> {baseline_result.artifact.path}"
+    )
+    baseline_report = evaluate_run(baseline_result.outcome, policy)
 
     rows: list[dict[str, object]] = []
-    for name, variant in VARIANTS.items():
-        hub_configuration = variant["hub_configuration"]
-        mpc_options = variant["mpc_options"]
-        print(f"\nMPC variant: {name} {mpc_options}")
-        mpc_executable_paths = (
-            "src/greenhouse_energy_hub/evaluation.py",
-            "src/greenhouse_energy_hub/scenarios.py",
-            "src/greenhouse_energy_hub/hub.py",
-            "src/greenhouse_energy_hub/simulation.py",
-            "src/greenhouse_energy_hub/controllers/mpc.py",
-            "experiments/ablations.py",
+    for variant_name, variant in VARIANTS.items():
+        variant_result = execute_experiment(
+            controller_name="mpc",
+            horizon_steps=variant["horizon_steps"],
+            hydrogen=variant.get("hydrogen", True),
+            thermal_store=variant.get("thermal_store", True),
+            candidate_key=f"ablation-{variant_name}",
+            candidate_index=args.candidate_index,
+            **common,
         )
-        mpc_publication_context = _capture_publication_context(
-            mpc_executable_paths,
-            repository_root=ROOT,
-        )
-        outcome = run_simulation(
-            scenario,
-            mode="mpc",
-            hub_config=hub_configuration,
-            evaluation_policy=EVALUATION_POLICY,
-            **mpc_options,
-        )
-        artifact = _persist_outcome(
-            outcome,
-            EVALUATION_POLICY,
-            results_root=ROOT / "results",
-            executable_paths=mpc_executable_paths,
-            publication_context=mpc_publication_context,
-        )
-        if not isinstance(outcome, ValidRun):
+        if isinstance(variant_result.outcome, InvalidRun):
             print(
-                f"INVALID {name} Run at step {outcome.failed_step}: "
-                f"{outcome.failure_code}: {outcome.message}"
+                f"INVALID {variant_name} Run at step "
+                f"{variant_result.outcome.failed_step}: "
+                f"{variant_result.outcome.failure_code}: "
+                f"{variant_result.outcome.message}"
             )
-            print(f"Diagnostics -> {artifact}")
-            return
-        assert isinstance(artifact, RunBundle)
-        print(f"Verified Run Bundle -> {artifact.path}")
+            print(f"Diagnostics -> {variant_result.artifact}")
+            return 2
+        assert isinstance(variant_result.outcome, ValidRun)
+        assert isinstance(variant_result.artifact, RunBundle)
+        print(
+            f"Verified {variant_name} Run Bundle "
+            f"{variant_result.artifact.identifier} -> {variant_result.artifact.path}"
+        )
         rows.append(
             _scorecard_row(
-                name,
-                evaluate_run(outcome, EVALUATION_POLICY),
+                variant_name,
+                evaluate_run(variant_result.outcome, policy),
                 baseline_report,
             )
         )
 
-    table = pd.DataFrame(rows)
-
-    baseline = baseline_report.nominal
-    print("\n" + "=" * 78)
-    print(
-        "  ABLATION — baseline Inventory-Adjusted Cost "
-        f"EUR {baseline.inventory_adjusted_cost_eur:.2f}; "
-        f"Comfort Violation {baseline.comfort_violation_c_h:.2f} C.h"
-    )
-    print("=" * 78)
-    print(table.to_string(index=False))
-
-    print("\nEvery row above is backed by the verified full-ID Run Bundle printed above.")
+    print(pd.DataFrame(rows).to_string(index=False))
+    print("Every row is backed by the verified full-ID Run Bundle printed above.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
