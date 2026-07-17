@@ -39,8 +39,13 @@ Usage
 """
 
 import argparse
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import sys
 from pathlib import Path
+from types import MappingProxyType
+from typing import Protocol, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -49,12 +54,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from models.hub_model import (
-    hub_dynamics, initial_state, state_bounds,
+    AssetCapabilities, ExogenousInputs, HubConfiguration, HubControl, HubFlows,
+    HubState, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
+    initial_state, normalize_control, state_bounds, validate_control, validate_flows,
+    validate_successor, SOLVER_BOUND_TOLERANCE_KW,
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
     HP_P_MAX_KW, HP_COP, EBOILER_P_MAX_KW, ETA_EBOILER,
     TES_P_MAX_KW,
     C_AIR_KWH_K, U_EFF_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
-    Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
+    GRID_IMPORT_FEE_EUR_KWH, Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, DT_H,
 )
 from accounting import stored_equiv_kwh, inventory_adjusted_cost, saving_pct
 # NOTE: build_mpc is imported lazily inside run_simulation() so that importing this
@@ -71,6 +79,168 @@ RESULTS_DIR = ROOT / "results"   # created in main(), not at import time
 # Decision variables solved by the MPC (P_grid is the derived slack bus, not a control)
 INPUT_NAMES = ["P_bat_ch", "P_bat_dis", "P_elz", "P_fc", "P_hp",
                "P_eboiler", "Q_tes_ch", "Q_tes_dis", "vent"]
+
+JSONScalar: TypeAlias = str | int | float | bool | None
+JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
+
+
+def _read_only_mapping(
+    values: Mapping[str, JSONValue],
+) -> Mapping[str, JSONValue]:
+    return MappingProxyType(dict(values))
+
+
+@dataclass(frozen=True)
+class _LegacyScenarioPoint:
+    timestamp_utc: datetime
+    price_eur_per_kwh: float
+    pv_kw: float
+    electric_load_kw: float
+    outdoor_temperature_c: float
+    irradiance_w_per_m2: float
+
+
+@dataclass(frozen=True)
+class _LegacyScenario:
+    """Small DataFrame bridge retained only until the Scenario migration task."""
+
+    name: str
+    operating_start: datetime
+    operating_end: datetime
+    forecast_end: datetime
+    forecast_horizon_capacity_steps: int
+    step_duration: timedelta
+    operating_step_count: int
+    points: tuple[_LegacyScenarioPoint, ...]
+    provenance: tuple[object, ...] = ()
+
+    def forecast_view(
+        self, operating_step: int, horizon_steps: int
+    ) -> tuple[_LegacyScenarioPoint, ...]:
+        required = horizon_steps + 1
+        view = self.points[operating_step : operating_step + required]
+        if view and len(view) < required:
+            # Preserve the legacy end-of-frame TVP clamp. Task 5 replaces this
+            # temporary bridge with strict Scenario coverage semantics.
+            view = (*view, *((view[-1],) * (required - len(view))))
+        return tuple(view)
+
+
+@dataclass(frozen=True)
+class DecisionDiagnostics:
+    adapter: str
+    decision_status: str
+    solver_success: bool | None
+    solver_return_status: str | None
+    solver_iterations: int | None
+    solver_wall_seconds: float | None
+    forecast_start_utc: datetime | None
+    forecast_end_utc: datetime | None
+    terminal_electric_value_eur_per_kwh: float | None
+    terminal_heat_value_eur_per_kwhth: float | None
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    control: HubControl
+    diagnostics: DecisionDiagnostics
+
+
+@dataclass(frozen=True)
+class ControllerFailure:
+    code: str
+    message: str
+    diagnostics: DecisionDiagnostics
+
+
+class ControllerAdapter(Protocol):
+    name: str
+    configuration: Mapping[str, JSONValue]
+    capability_policy: Mapping[str, JSONValue]
+    forecast_horizon_steps: int
+    requires_operational_storage_bounds: bool
+
+    def decide(
+        self,
+        state: HubState,
+        forecast: tuple[_LegacyScenarioPoint, ...],
+    ) -> ControlDecision | ControllerFailure:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    complete: bool
+    valid: bool
+    checked_operating_steps: int
+    issues: tuple[ValidationIssue, ...]
+
+
+@dataclass(frozen=True)
+class OperatingRecord:
+    operating_step: int
+    timestamp_utc: datetime
+    start_state: HubState
+    control: HubControl
+    exogenous: ExogenousInputs
+    reached_state: HubState
+    flows: HubFlows
+
+
+@dataclass(frozen=True)
+class ValidRun:
+    scenario: _LegacyScenario
+    controller_name: str
+    controller_configuration: Mapping[str, JSONValue]
+    capability_policy: Mapping[str, JSONValue]
+    hub_configuration: HubConfiguration
+    initial_state: HubState
+    records: tuple[OperatingRecord, ...]
+    controller_diagnostics: tuple[DecisionDiagnostics, ...]
+    terminal_state: HubState
+    validation: ValidationReport
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "controller_configuration",
+            _read_only_mapping(self.controller_configuration),
+        )
+        object.__setattr__(
+            self,
+            "capability_policy",
+            _read_only_mapping(self.capability_policy),
+        )
+
+    def to_frame(self) -> pd.DataFrame:
+        """Explicit legacy serialization, available only for a Valid Run."""
+        return _valid_run_to_frame(self)
+
+
+@dataclass(frozen=True)
+class InvalidRun:
+    scenario: _LegacyScenario
+    controller_name: str
+    controller_configuration: Mapping[str, JSONValue]
+    capability_policy: Mapping[str, JSONValue]
+    hub_configuration: HubConfiguration
+    failed_step: int
+    failure_code: str
+    message: str
+    partial_records: tuple[OperatingRecord, ...]
+    controller_diagnostics: tuple[DecisionDiagnostics, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "controller_configuration",
+            _read_only_mapping(self.controller_configuration),
+        )
+        object.__setattr__(
+            self,
+            "capability_policy",
+            _read_only_mapping(self.capability_policy),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -188,92 +358,434 @@ def baseline_control(x: dict, p: dict) -> dict:
     }
 
 
+class BaselineControllerAdapter:
+    name = "baseline"
+    configuration: Mapping[str, JSONValue] = _read_only_mapping(
+        {"target_indoor_temperature_c": BASELINE_TARGET_C}
+    )
+    capability_policy: Mapping[str, JSONValue] = _read_only_mapping(
+        {
+            "hydrogen": False,
+            "thermal_store_charging": False,
+            "grid_battery_charging": False,
+            "battery_discharge_price_threshold_eur_per_kwh": 0.12,
+        }
+    )
+    forecast_horizon_steps = 0
+    requires_operational_storage_bounds = False
+
+    def decide(
+        self,
+        state: HubState,
+        forecast: tuple[_LegacyScenarioPoint, ...],
+    ) -> ControlDecision | ControllerFailure:
+        point = forecast[0]
+        legacy_control = baseline_control(
+            state,
+            {
+                "P_pv": point.pv_kw,
+                "P_load": point.electric_load_kw,
+                "price": point.price_eur_per_kwh,
+                "T_out": point.outdoor_temperature_c,
+                "G_Wm2": point.irradiance_w_per_m2,
+            },
+        )
+        stable_values = {
+            field_name: legacy_control[model_name]
+            for field_name, model_name in {
+                "battery_charge_kw": "P_bat_ch",
+                "battery_discharge_kw": "P_bat_dis",
+                "electrolyser_kw": "P_elz",
+                "fuel_cell_kw": "P_fc",
+                "heat_pump_kw": "P_hp",
+                "electric_boiler_kw": "P_eboiler",
+                "thermal_charge_kw": "Q_tes_ch",
+                "thermal_discharge_kw": "Q_tes_dis",
+                "ventilation_fraction": "vent",
+            }.items()
+        }
+        return ControlDecision(
+            control=HubControl(**stable_values),
+            diagnostics=DecisionDiagnostics(
+                adapter="baseline",
+                decision_status="success",
+                solver_success=None,
+                solver_return_status=None,
+                solver_iterations=None,
+                solver_wall_seconds=None,
+                forecast_start_utc=point.timestamp_utc,
+                forecast_end_utc=point.timestamp_utc,
+                terminal_electric_value_eur_per_kwh=None,
+                terminal_heat_value_eur_per_kwhth=None,
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Simulation loop
 # ---------------------------------------------------------------------------
-def run_simulation(df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs) -> pd.DataFrame:
-    """
-    Run one full simulation (mode = 'mpc' or 'baseline') over the window.
+def _timestamp_utc(value: object) -> datetime:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(timezone.utc)
+    else:
+        timestamp = timestamp.tz_convert(timezone.utc)
+    return timestamp.to_pydatetime()
 
-    Extra keyword arguments (n_horizon, disable_h2, disable_tes, terminal_weight)
-    are forwarded to build_mpc to support ablation studies.
-    """
-    assert mode in ("mpc", "baseline"), f"Unknown mode: {mode}"
-    n = len(df)
-    prices = df["price_EUR_kWh"].values
-    pv = df["P_pv_kW"].values
-    p_load = df["P_elec_kW"].values
-    t_out = df["T_out_C"].values
-    irr = df["G_Wm2"].values
 
-    x = initial_state()
-
-    if mode == "mpc":
-        from control.mpc_controller import build_mpc, N_HORIZON   # lazy (heavy do-mpc import)
-        print(f"\nBuilding MPC controller (horizon={mpc_kwargs.get('n_horizon', N_HORIZON)}h, "
-              f"{', '.join(k for k, v in mpc_kwargs.items() if v) or 'full'})...")
-        mpc, _ = build_mpc(
-            price_forecast=prices, pv_forecast=pv,
-            load_elec_forecast=p_load, temp_out_forecast=t_out,
-            irr_forecast=irr, **mpc_kwargs,
+def _legacy_scenario_from_frame(
+    frame: pd.DataFrame, forecast_horizon_steps: int
+) -> _LegacyScenario:
+    points = tuple(
+        _LegacyScenarioPoint(
+            timestamp_utc=_timestamp_utc(timestamp),
+            price_eur_per_kwh=float(row.price_EUR_kWh),
+            pv_kw=float(row.P_pv_kW),
+            electric_load_kw=float(row.P_elec_kW),
+            outdoor_temperature_c=float(row.T_out_C),
+            irradiance_w_per_m2=float(row.G_Wm2),
         )
-        x0 = np.array([x["SOC_bat"], x["SOC_h2"], x["SOC_tes"], x["T_in"]])
-        mpc.x0 = x0
-        mpc.set_initial_guess()
-        print("MPC controller ready.\n")
+        for timestamp, row in frame.iterrows()
+    )
+    if not points:
+        raise ValueError("legacy simulation frame must contain at least one operating step")
+    duration = timedelta(hours=DT_H)
+    return _LegacyScenario(
+        name="legacy_frame",
+        operating_start=points[0].timestamp_utc,
+        operating_end=points[-1].timestamp_utc + duration,
+        forecast_end=points[-1].timestamp_utc,
+        forecast_horizon_capacity_steps=forecast_horizon_steps,
+        step_duration=duration,
+        operating_step_count=len(points),
+        points=points,
+    )
 
-    records = []
-    for k in range(n):
-        p = {"P_pv": pv[k], "P_load": p_load[k], "price": prices[k],
-             "T_out": t_out[k], "G_Wm2": irr[k]}
 
-        if mode == "mpc":
-            x0 = np.array([[x["SOC_bat"]], [x["SOC_h2"]], [x["SOC_tes"]], [x["T_in"]]])
-            mpc.x0 = x0
-            mpc.make_step(x0)
-            u = {name: float(np.squeeze(mpc.u0[name])) for name in INPUT_NAMES}
-        else:
-            u = baseline_control(x, p)
+def _invalid_run(
+    scenario: _LegacyScenario,
+    controller: ControllerAdapter,
+    hub_config: HubConfiguration,
+    failed_step: int,
+    failure_code: str,
+    message: str,
+    records: list[OperatingRecord],
+    diagnostics: list[DecisionDiagnostics],
+) -> InvalidRun:
+    return InvalidRun(
+        scenario=scenario,
+        controller_name=controller.name,
+        controller_configuration=dict(controller.configuration),
+        capability_policy=dict(controller.capability_policy),
+        hub_configuration=hub_config,
+        failed_step=failed_step,
+        failure_code=failure_code,
+        message=message,
+        partial_records=tuple(records),
+        controller_diagnostics=tuple(diagnostics),
+    )
 
-        x_next, metrics = hub_dynamics(x, u, p)
 
-        rec = {
-            "timestamp": df.index[k],
-            "SOC_bat_kWh": x["SOC_bat"], "SOC_h2_kg": x["SOC_h2"],
-            "SOC_tes_kWh": x["SOC_tes"], "T_in_C": x["T_in"],
-            **{f"u_{key}": val for key, val in u.items()},
-            "u_P_grid": metrics["P_grid_kW"],   # derived slack bus
-            "P_pv_kW": pv[k], "P_load_kW": p_load[k],
-            "price_EUR_kWh": prices[k], "T_out_C": t_out[k], "G_Wm2": irr[k],
-            "grid_cost_EUR": metrics["grid_cost_EUR"],
-            "elec_residual_kW": metrics["elec_residual_kW"],
-            "Q_air_kW": metrics["Q_air_kW"],
-            "T_violation_C": metrics["T_violation_C"],
+def _issue_message(issues: tuple[ValidationIssue, ...]) -> str:
+    return "; ".join(
+        f"{issue.code} [{issue.field}]: {issue.message}" for issue in issues
+    )
+
+
+def _exogenous_from_point(point: _LegacyScenarioPoint) -> ExogenousInputs:
+    exogenous = ExogenousInputs(
+        pv_kw=float(point.pv_kw),
+        electric_load_kw=float(point.electric_load_kw),
+        price_eur_per_kwh=float(point.price_eur_per_kwh),
+        outdoor_temperature_c=float(point.outdoor_temperature_c),
+        irradiance_w_per_m2=float(point.irradiance_w_per_m2),
+    )
+    if not all(np.isfinite(float(value)) for value in exogenous.values()):
+        raise ValueError("scenario point contains a non-finite exogenous value")
+    return exogenous
+
+
+def simulate_run(
+    scenario: _LegacyScenario,
+    controller: ControllerAdapter,
+    hub_config: HubConfiguration,
+) -> ValidRun | InvalidRun:
+    start = initial_state(hub_config)
+    state = start
+    records: list[OperatingRecord] = []
+    diagnostics: list[DecisionDiagnostics] = []
+
+    for operating_step in range(scenario.operating_step_count):
+        try:
+            forecast = scenario.forecast_view(
+                operating_step, controller.forecast_horizon_steps
+            )
+            if not forecast:
+                raise ValueError("controller forecast is empty")
+        except Exception as exc:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "scenario_error",
+                str(exc),
+                records,
+                diagnostics,
+            )
+
+        # Gate 1: request a decision and reject controller failure immediately.
+        try:
+            decision = controller.decide(state, forecast)
+        except Exception as exc:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "controller_error",
+                str(exc),
+                records,
+                diagnostics,
+            )
+        if isinstance(decision, ControllerFailure):
+            diagnostics.append(decision.diagnostics)
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                decision.code,
+                decision.message,
+                records,
+                diagnostics,
+            )
+        if not isinstance(decision, ControlDecision):
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "controller_schema_error",
+                "controller returned neither ControlDecision nor ControllerFailure",
+                records,
+                diagnostics,
+            )
+        diagnostics.append(decision.diagnostics)
+
+        # Gate 2: validate and normalize the returned control before physics.
+        control_issues = validate_control(
+            decision.control,
+            hub_config,
+            tolerance=SOLVER_BOUND_TOLERANCE_KW,
+        )
+        if control_issues:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "invalid_control",
+                _issue_message(control_issues),
+                records,
+                diagnostics,
+            )
+        control = normalize_control(
+            decision.control,
+            hub_config,
+            zero_small_flows=False,
+        )
+
+        # Gate 3: evaluate existing hub physics only after the control is accepted.
+        try:
+            exogenous = _exogenous_from_point(forecast[0])
+            step = advance_hub(state, control, exogenous, hub_config)
+        except Exception as exc:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "physics_error",
+                str(exc),
+                records,
+                diagnostics,
+            )
+
+        # Gate 4: validate reached flows and state before recording or advancing.
+        flow_issues = validate_flows(step.flows)
+        if flow_issues:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "invalid_flows",
+                _issue_message(flow_issues),
+                records,
+                diagnostics,
+            )
+        successor_issues = validate_successor(
+            step.successor,
+            hub_config,
+            controller.requires_operational_storage_bounds,
+        )
+        if successor_issues:
+            return _invalid_run(
+                scenario,
+                controller,
+                hub_config,
+                operating_step,
+                "invalid_successor",
+                _issue_message(successor_issues),
+                records,
+                diagnostics,
+            )
+
+        records.append(
+            OperatingRecord(
+                operating_step=operating_step,
+                timestamp_utc=forecast[0].timestamp_utc,
+                start_state=state,
+                control=control,
+                exogenous=exogenous,
+                reached_state=step.successor,
+                flows=step.flows,
+            )
+        )
+        state = step.successor
+
+    return ValidRun(
+        scenario=scenario,
+        controller_name=controller.name,
+        controller_configuration=dict(controller.configuration),
+        capability_policy=dict(controller.capability_policy),
+        hub_configuration=hub_config,
+        initial_state=start,
+        records=tuple(records),
+        controller_diagnostics=tuple(diagnostics),
+        terminal_state=state,
+        validation=ValidationReport(
+            complete=True,
+            valid=True,
+            checked_operating_steps=len(records),
+            issues=(),
+        ),
+    )
+
+
+def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for record in run.records:
+        serialized_control = normalize_control(
+            record.control,
+            run.hub_configuration,
+        )
+        grid_kw = float(record.flows.grid_kw)
+        price = float(record.exogenous.price_eur_per_kwh)
+        reached_temperature = float(record.reached_state.indoor_temperature_c)
+        row = {
+            "timestamp": pd.Timestamp(record.timestamp_utc),
+            "SOC_bat_kWh": float(record.start_state.soc_battery_kwh),
+            "SOC_h2_kg": float(record.start_state.soc_hydrogen_kg),
+            "SOC_tes_kWh": float(record.start_state.soc_thermal_kwh),
+            "T_in_C": float(record.start_state.indoor_temperature_c),
+            **{
+                f"u_{name}": float(value)
+                for name, value in serialized_control.items()
+            },
+            "u_P_grid": grid_kw,
+            "P_pv_kW": float(record.exogenous.pv_kw),
+            "P_load_kW": float(record.exogenous.electric_load_kw),
+            "price_EUR_kWh": price,
+            "T_out_C": float(record.exogenous.outdoor_temperature_c),
+            "G_Wm2": float(record.exogenous.irradiance_w_per_m2),
+            "grid_cost_EUR": (
+                grid_kw * price
+                + GRID_IMPORT_FEE_EUR_KWH * max(0.0, grid_kw)
+            )
+            * DT_H,
+            "elec_residual_kW": 0.0,
+            "Q_air_kW": float(record.flows.heat_to_air_kw),
+            "T_violation_C": max(0.0, reached_temperature - T_MAX_C)
+            + max(0.0, T_MIN_C - reached_temperature),
             "is_terminal": False,
         }
-        records.append(rec)
-        x = x_next
+        rows.append(row)
 
-        if (k + 1) % 24 == 0:
-            cum = sum(r["grid_cost_EUR"] for r in records)
-            print(f"  Step {k+1:4d}/{n}  SOC_bat={x['SOC_bat']:.0f} "
-                  f"SOC_h2={x['SOC_h2']:.1f} SOC_tes={x['SOC_tes']:.0f} "
-                  f"T_in={x['T_in']:.1f}C  cum cost EUR{cum:.0f}")
+    terminal_timestamp = (
+        pd.Timestamp(rows[-1]["timestamp"]) + run.scenario.step_duration
+        if rows
+        else pd.Timestamp(run.scenario.operating_start)
+    )
+    terminal = run.terminal_state
+    rows.append(
+        {
+            "timestamp": terminal_timestamp,
+            "SOC_bat_kWh": float(terminal.soc_battery_kwh),
+            "SOC_h2_kg": float(terminal.soc_hydrogen_kg),
+            "SOC_tes_kWh": float(terminal.soc_thermal_kwh),
+            "T_in_C": float(terminal.indoor_temperature_c),
+            **{f"u_{name}": 0.0 for name in INPUT_NAMES},
+            "u_P_grid": 0.0,
+            "P_pv_kW": np.nan,
+            "P_load_kW": np.nan,
+            "price_EUR_kWh": np.nan,
+            "T_out_C": np.nan,
+            "G_Wm2": np.nan,
+            "grid_cost_EUR": 0.0,
+            "elec_residual_kW": 0.0,
+            "Q_air_kW": np.nan,
+            "T_violation_C": 0.0,
+            "is_terminal": True,
+        }
+    )
+    return pd.DataFrame(rows).set_index("timestamp")
 
-    # Append the TRUE terminal state (state after the final control) as the last row,
-    # so inventory settlement and SOC plots use the real end state, not the pre-step
-    # state of the last step. Controls/cost are zero here (no step is taken).
-    term = {"timestamp": df.index[-1] + pd.Timedelta(hours=DT_H),
-            "SOC_bat_kWh": x["SOC_bat"], "SOC_h2_kg": x["SOC_h2"],
-            "SOC_tes_kWh": x["SOC_tes"], "T_in_C": x["T_in"],
-            **{f"u_{name}": 0.0 for name in INPUT_NAMES}, "u_P_grid": 0.0,
-            "P_pv_kW": np.nan, "P_load_kW": np.nan, "price_EUR_kWh": np.nan,
-            "T_out_C": np.nan, "G_Wm2": np.nan, "grid_cost_EUR": 0.0,
-            "elec_residual_kW": 0.0, "Q_air_kW": np.nan, "T_violation_C": 0.0,
-            "is_terminal": True}
-    records.append(term)
 
-    return pd.DataFrame(records).set_index("timestamp")
+def run_simulation(
+    df: pd.DataFrame, mode: str = "mpc", **mpc_kwargs
+) -> ValidRun | InvalidRun:
+    """Compatibility wrapper from a legacy frame to the stable Run outcome union."""
+    if mode not in ("mpc", "baseline"):
+        raise ValueError(f"Unknown mode: {mode}")
+
+    hub_config = HubConfiguration()
+    if mode == "baseline":
+        controller: ControllerAdapter = BaselineControllerAdapter()
+        scenario = _legacy_scenario_from_frame(df, controller.forecast_horizon_steps)
+        return simulate_run(scenario, controller, hub_config)
+
+    from control.mpc_controller import MpcControllerAdapter, N_HORIZON, build_mpc
+
+    horizon_steps = int(mpc_kwargs.get("n_horizon", N_HORIZON))
+    print(
+        f"\nBuilding MPC controller (horizon={horizon_steps}h, "
+        f"{', '.join(key for key, value in mpc_kwargs.items() if value) or 'full'})..."
+    )
+    mpc, _ = build_mpc(
+        price_forecast=df["price_EUR_kWh"].to_numpy(),
+        pv_forecast=df["P_pv_kW"].to_numpy(),
+        load_elec_forecast=df["P_elec_kW"].to_numpy(),
+        temp_out_forecast=df["T_out_C"].to_numpy(),
+        irr_forecast=df["G_Wm2"].to_numpy(),
+        **mpc_kwargs,
+    )
+    mpc.x0 = hub_state_array(initial_state(hub_config))
+    mpc.set_initial_guess()
+    controller = MpcControllerAdapter(
+        mpc=mpc,
+        forecast_horizon_steps=horizon_steps,
+        configuration={"horizon_steps": horizon_steps, **mpc_kwargs},
+        capability_policy={
+            "battery": True,
+            "hydrogen": not bool(mpc_kwargs.get("disable_h2", False)),
+            "thermal_store": not bool(mpc_kwargs.get("disable_tes", False)),
+        },
+    )
+    scenario = _legacy_scenario_from_frame(df, horizon_steps)
+    print("MPC controller ready.\n")
+    return simulate_run(scenario, controller, hub_config)
 
 
 def scenario_tag(start_month: int, n_days: int) -> str:
@@ -326,7 +838,14 @@ def main():
         if args.mode not in (mode, "both"):
             continue
         print(f"\n[{i+1}/2] {mode.upper()}...")
-        res = run_simulation(df, mode=mode)
+        outcome = run_simulation(df, mode=mode)
+        if not isinstance(outcome, ValidRun):
+            print(
+                f"  INVALID RUN at step {outcome.failed_step}: "
+                f"{outcome.failure_code}: {outcome.message}"
+            )
+            continue
+        res = outcome.to_frame()
         results[mode] = res
         res.to_csv(RESULTS_DIR / f"{mode}_results.csv")          # canonical (latest run)
         res.to_csv(scen_dir / f"{tag}_{mode}.csv")               # scenario archive

@@ -47,11 +47,22 @@ References
     Control. arXiv:2506.13278.
 """
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+
 import numpy as np
 import do_mpc
 from casadi import sqrt
 
+from control.rolling_horizon import (
+    ControlDecision,
+    ControllerFailure,
+    DecisionDiagnostics,
+    JSONValue,
+)
 from models.hub_model import (
+    HubState, hub_control_from_array, hub_state_array,
     BAT_P_MAX_KW, ETA_BAT_CH, ETA_BAT_DIS,
     ETA_ELZ, E_H2_LHV_KWH_KG,
     FC_P_MAX_KW, ETA_FC_E, ETA_FC_H,
@@ -60,7 +71,7 @@ from models.hub_model import (
     GRID_P_MAX_KW, GRID_IMPORT_FEE_EUR_KWH,
     C_AIR_KWH_K, U_EFF_KW_K, K_VENT_KW_K, SOLAR_GAIN_FRAC, FLOOR_AREA_M2,
     Q_CROP_LATENT_KW, T_MIN_C, T_MAX_C, T_SETPOINT_C,
-    state_bounds, input_bounds, STATE_SCALE, INPUT_SCALE,
+    state_bounds, input_bounds, BALANCE_STATE_TOLERANCE, STATE_SCALE, INPUT_SCALE,
 )
 
 # ---------------------------------------------------------------------------
@@ -78,6 +89,90 @@ W_COMPL     = 1e-3      # complementarity penalty (anti simultaneous ch/dis)
 W_TBAND     = 10.0      # soft temperature-band violation penalty [EUR per slack]
 W_TERMINAL  = 1.0       # terminal stored-energy value weight
 W_RTERM     = 1e-4      # input-move smoothing (rterm)
+
+
+@dataclass(frozen=True)
+class MpcConfiguration:
+    horizon_steps: int = 24
+    terminal_weight: float = 1.0
+    battery_wear_eur_per_kwh: float = 0.005
+    thermal_store_wear_eur_per_kwh: float = 0.0005
+    electrolyser_wear_eur_per_kwh: float = 0.002
+    fuel_cell_wear_eur_per_kwh: float = 0.002
+    complementarity_weight: float = 0.001
+    comfort_slack_weight: float = 10.0
+    input_move_weight: float = 0.0001
+    solver_max_iterations: int = 800
+    solver_tolerance: float = 1e-6
+
+
+class MpcControllerAdapter:
+    name = "mpc"
+    requires_operational_storage_bounds = True
+
+    def __init__(
+        self,
+        mpc: object,
+        forecast_horizon_steps: int,
+        configuration: Mapping[str, JSONValue],
+        capability_policy: Mapping[str, JSONValue],
+    ) -> None:
+        self._mpc = mpc
+        self.forecast_horizon_steps = forecast_horizon_steps
+        self.configuration = MappingProxyType(dict(configuration))
+        self.capability_policy = MappingProxyType(dict(capability_policy))
+
+    def decide(
+        self,
+        state: HubState,
+        forecast: tuple[object, ...],
+    ) -> ControlDecision | ControllerFailure:
+        x0 = hub_state_array(state)
+        self._mpc.x0 = x0
+        raw_control = self._mpc.make_step(x0)
+        stats = dict(self._mpc.solver_stats)
+        diagnostics = DecisionDiagnostics(
+            adapter="mpc",
+            decision_status="success" if stats.get("success") is True else "failure",
+            solver_success=bool(stats.get("success", False)),
+            solver_return_status=str(stats.get("return_status", "")),
+            solver_iterations=int(stats["iter_count"]) if "iter_count" in stats else None,
+            solver_wall_seconds=(
+                float(stats["t_wall_total"]) if "t_wall_total" in stats else None
+            ),
+            forecast_start_utc=forecast[0].timestamp_utc,
+            forecast_end_utc=forecast[-1].timestamp_utc,
+            terminal_electric_value_eur_per_kwh=None,
+            terminal_heat_value_eur_per_kwhth=None,
+        )
+        if stats.get("success") is not True:
+            return ControllerFailure(
+                code="solver_failure",
+                message=f"MPC solve failed: {stats.get('return_status', 'unknown')}",
+                diagnostics=diagnostics,
+            )
+        control = hub_control_from_array(np.asarray(raw_control).reshape(-1))
+        return ControlDecision(control=control, diagnostics=diagnostics)
+
+
+def _enable_text_solver_stat_storage(mpc: object) -> None:
+    """Let do-mpc 5.1 store its declared string-valued return_status field.
+
+    do-mpc accepts ``return_status`` in ``store_solver_stats`` but its numeric data
+    writer calls ``reshape`` on the raw string. Converting just text statistics to
+    arrays preserves the configured field and the original data update behavior.
+    """
+    original_update = mpc.data.update
+
+    def update_with_text_arrays(**values: object) -> None:
+        original_update(
+            **{
+                key: np.asarray(value) if isinstance(value, str) else value
+                for key, value in values.items()
+            }
+        )
+
+    mpc.data.update = update_with_text_arrays
 
 
 def build_mpc(price_forecast: np.ndarray,
@@ -186,12 +281,23 @@ def build_mpc(price_forecast: np.ndarray,
         t_step=DT_H * 3600,      # do-mpc expects seconds
         n_robust=0,
         store_full_solution=True,
+        store_solver_stats=[
+            "success",
+            "return_status",
+            "iter_count",
+            "t_wall_total",
+        ],
         nlpsol_opts={
             "ipopt.print_level": 0,
             "ipopt.sb": "yes",
             "print_time": 0,
             "ipopt.max_iter": 800,
             "ipopt.tol": 1e-6,
+            # do-mpc enforces continuity in state-scaled NLP coordinates.
+            # Convert the physical state tolerance to the tightest scale.
+            "ipopt.constr_viol_tol": (
+                BALANCE_STATE_TOLERANCE / max(STATE_SCALE.values())
+            ),
         },
     )
 
@@ -300,4 +406,5 @@ def build_mpc(price_forecast: np.ndarray,
 
     mpc.set_tvp_fun(tvp_fun)
     mpc.setup()
+    _enable_text_solver_stat_storage(mpc)
     return mpc, model

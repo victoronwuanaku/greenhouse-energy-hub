@@ -23,7 +23,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from control.rolling_horizon import load_data, run_simulation
+from control.rolling_horizon import ValidRun, load_data, run_simulation
 from accounting import saving_pct
 
 VARIANTS = {
@@ -52,7 +52,14 @@ def main():
     df = load_data(start_month=args.start_month, n_days=args.days)
 
     print("\nBaseline...")
-    base = run_simulation(df, mode="baseline")
+    base_outcome = run_simulation(df, mode="baseline")
+    if not isinstance(base_outcome, ValidRun):
+        print(
+            f"INVALID baseline Run at step {base_outcome.failed_step}: "
+            f"{base_outcome.failure_code}: {base_outcome.message}"
+        )
+        return
+    base = base_outcome.to_frame()
     base_cost = base["grid_cost_EUR"].sum()
     base_viol = base["T_violation_C"].sum()
     base_eff = effective_cost(base_cost, base_viol)
@@ -60,7 +67,14 @@ def main():
     rows = []
     for name, kw in VARIANTS.items():
         print(f"\nMPC variant: {name} {kw}")
-        m = run_simulation(df, mode="mpc", **kw)
+        outcome = run_simulation(df, mode="mpc", **kw)
+        if not isinstance(outcome, ValidRun):
+            print(
+                f"INVALID {name} Run at step {outcome.failed_step}: "
+                f"{outcome.failure_code}: {outcome.message}"
+            )
+            return
+        m = outcome.to_frame()
         grid = m["grid_cost_EUR"].sum()
         viol = m["T_violation_C"].sum()
         rows.append({

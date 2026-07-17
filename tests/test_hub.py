@@ -155,9 +155,103 @@ def test_temperature_update_is_bounded_and_warms_with_heat():
     assert T_HARD_MIN_C < t_cold < T_HARD_MAX_C   # remains finite/bounded
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "issue_code"),
+    [
+        ("battery_charge_kw", np.inf, "non_finite"),
+        ("battery_discharge_kw", 500.01, "out_of_bounds"),
+    ],
+)
+def test_invalid_control_reports_non_finite_and_out_of_bounds_fields(
+    field, value, issue_code
+):
+    from models.hub_model import HubConfiguration, HubControl, validate_control
+
+    values = {
+        "battery_charge_kw": 0.0,
+        "battery_discharge_kw": 0.0,
+        "electrolyser_kw": 0.0,
+        "fuel_cell_kw": 0.0,
+        "heat_pump_kw": 0.0,
+        "electric_boiler_kw": 0.0,
+        "thermal_charge_kw": 0.0,
+        "thermal_discharge_kw": 0.0,
+        "ventilation_fraction": 0.0,
+    }
+    values[field] = value
+
+    issues = validate_control(HubControl(**values), HubConfiguration())
+
+    assert [(issue.code, issue.field) for issue in issues] == [(issue_code, field)]
+
+
+def test_invalid_control_reports_simultaneous_flows_above_exact_tolerance():
+    from models.hub_model import HubConfiguration, HubControl, validate_control
+
+    control = HubControl(
+        battery_charge_kw=0.0011,
+        battery_discharge_kw=0.0011,
+        electrolyser_kw=0.0,
+        fuel_cell_kw=0.0,
+        heat_pump_kw=0.0,
+        electric_boiler_kw=0.0,
+        thermal_charge_kw=0.0,
+        thermal_discharge_kw=0.0,
+        ventilation_fraction=0.0,
+    )
+
+    issues = validate_control(control, HubConfiguration())
+
+    assert [(issue.code, issue.field) for issue in issues] == [
+        ("simultaneous_charge_discharge", "battery")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------
+def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
+    from control.mpc_controller import build_mpc
+    from models.hub_model import BALANCE_STATE_TOLERANCE, STATE_SCALE
+
+    n = 25
+    mpc, _ = build_mpc(
+        price_forecast=np.full(n, 0.10),
+        pv_forecast=np.zeros(n),
+        load_elec_forecast=np.full(n, 400.0),
+        temp_out_forecast=np.full(n, 5.0),
+        irr_forecast=np.zeros(n),
+    )
+    state = initial_state()
+    x0 = np.array(
+        [state["SOC_bat"], state["SOC_h2"], state["SOC_tes"], state["T_in"]]
+    ).reshape(-1, 1)
+    mpc.x0 = x0
+    mpc.set_initial_guess()
+
+    raw_control = mpc.make_step(x0)
+
+    required_statistics = (
+        "success",
+        "return_status",
+        "iter_count",
+        "t_wall_total",
+    )
+    assert tuple(mpc.settings.store_solver_stats) == required_statistics
+    assert mpc.settings.nlpsol_opts["ipopt.constr_viol_tol"] == (
+        BALANCE_STATE_TOLERANCE / max(STATE_SCALE.values())
+    )
+    for statistic in required_statistics:
+        stored = getattr(mpc.data, statistic)
+        if statistic in mpc.solver_stats:
+            assert stored.shape[0] == 1
+            assert stored[-1, 0] == mpc.solver_stats[statistic]
+        else:
+            assert stored.shape[0] == 0
+    np.testing.assert_allclose(mpc.data._x[-1], x0.reshape(-1))
+    np.testing.assert_allclose(mpc.data._u[-1], raw_control.reshape(-1))
+
+
 def test_mpc_builds_steps_and_respects_balance():
     """A few closed-loop MPC steps solve and yield balance-feasible controls."""
     from control.mpc_controller import build_mpc
@@ -180,6 +274,18 @@ def test_mpc_builds_steps_and_respects_balance():
         x0 = np.array([[x["SOC_bat"]], [x["SOC_h2"]], [x["SOC_tes"]], [x["T_in"]]])
         mpc.x0 = x0
         mpc.make_step(x0)
+        if k == 0:
+            configured_statistics = (
+                "success",
+                "return_status",
+                "iter_count",
+                "t_wall_total",
+            )
+            assert tuple(mpc.settings.store_solver_stats) == configured_statistics
+            for statistic in configured_statistics:
+                expected_rows = 1 if statistic in mpc.solver_stats else 0
+                assert getattr(mpc.data, statistic).shape[0] == expected_rows
+            assert mpc.data.return_status[-1, 0] == "Solve_Succeeded"
         u = {name: float(np.squeeze(mpc.u0[name])) for name in ib}
         for name, (lo, hi) in ib.items():
             # 1e-4 tolerance absorbs IPOPT's constraint-satisfaction noise
@@ -223,10 +329,14 @@ def assert_physical_invariants(df):
 def test_integration_short_run_full_invariants_and_mpc_not_worse():
     """Regenerate a short real-data window for both controllers and assert the SAME
     physical-invariant suite used on committed results, plus MPC <= baseline cost."""
-    from control.rolling_horizon import load_data, run_simulation
+    from control.rolling_horizon import ValidRun, load_data, run_simulation
     df = load_data(start_month=1, n_days=2)          # deterministic 2-day winter window
-    base = run_simulation(df, mode="baseline")
-    mpc = run_simulation(df, mode="mpc")
+    base_run = run_simulation(df, mode="baseline")
+    mpc_run = run_simulation(df, mode="mpc")
+    assert isinstance(base_run, ValidRun)
+    assert isinstance(mpc_run, ValidRun)
+    base = base_run.to_frame()
+    mpc = mpc_run.to_frame()
     assert_physical_invariants(base)
     assert_physical_invariants(mpc)
     assert mpc["grid_cost_EUR"].sum() <= base["grid_cost_EUR"].sum() + 1e-6

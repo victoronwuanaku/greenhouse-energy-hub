@@ -80,6 +80,152 @@ References
   IEA (2023). Hydrogen. IEA, Paris. https://www.iea.org/reports/hydrogen
 """
 
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, fields
+import math
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    code: str
+    field: str
+    message: str
+    actual: float | None = None
+    lower: float | None = None
+    upper: float | None = None
+
+
+@dataclass(frozen=True)
+class AssetCapabilities:
+    battery: bool = True
+    hydrogen: bool = True
+    thermal_store: bool = True
+
+
+@dataclass(frozen=True)
+class HubConfiguration:
+    capabilities: AssetCapabilities = AssetCapabilities()
+
+
+@dataclass(frozen=True)
+class HubState(Mapping[str, object]):
+    soc_battery_kwh: object
+    soc_hydrogen_kg: object
+    soc_thermal_kwh: object
+    indoor_temperature_c: object
+
+    def __getitem__(self, model_name: str) -> object:
+        for field_name, mapped_name in STATE_MODEL_NAMES.items():
+            if model_name == mapped_name:
+                return getattr(self, field_name)
+        raise KeyError(model_name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(STATE_MODEL_NAMES.values())
+
+    def __len__(self) -> int:
+        return len(STATE_MODEL_NAMES)
+
+
+@dataclass(frozen=True)
+class HubControl(Mapping[str, object]):
+    battery_charge_kw: object
+    battery_discharge_kw: object
+    electrolyser_kw: object
+    fuel_cell_kw: object
+    heat_pump_kw: object
+    electric_boiler_kw: object
+    thermal_charge_kw: object
+    thermal_discharge_kw: object
+    ventilation_fraction: object
+
+    def __getitem__(self, model_name: str) -> object:
+        for field_name, mapped_name in CONTROL_MODEL_NAMES.items():
+            if model_name == mapped_name:
+                return getattr(self, field_name)
+        raise KeyError(model_name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(CONTROL_MODEL_NAMES.values())
+
+    def __len__(self) -> int:
+        return len(CONTROL_MODEL_NAMES)
+
+
+@dataclass(frozen=True)
+class ExogenousInputs(Mapping[str, object]):
+    pv_kw: object
+    electric_load_kw: object
+    price_eur_per_kwh: object
+    outdoor_temperature_c: object
+    irradiance_w_per_m2: object
+
+    def __getitem__(self, model_name: str) -> object:
+        for field_name, mapped_name in EXOGENOUS_MODEL_NAMES.items():
+            if model_name == mapped_name:
+                return getattr(self, field_name)
+        raise KeyError(model_name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(EXOGENOUS_MODEL_NAMES.values())
+
+    def __len__(self) -> int:
+        return len(EXOGENOUS_MODEL_NAMES)
+
+
+@dataclass(frozen=True)
+class HubFlows:
+    grid_kw: object
+    generated_heat_kw: object
+    heat_to_air_kw: object
+    thermal_charge_margin_kw: object
+    hydrogen_production_kg_per_h: object
+    hydrogen_consumption_kg_per_h: object
+
+
+@dataclass(frozen=True)
+class HubStep:
+    successor: HubState
+    flows: HubFlows
+
+
+STATE_MODEL_NAMES = {
+    "soc_battery_kwh": "SOC_bat",
+    "soc_hydrogen_kg": "SOC_h2",
+    "soc_thermal_kwh": "SOC_tes",
+    "indoor_temperature_c": "T_in",
+}
+
+CONTROL_MODEL_NAMES = {
+    "battery_charge_kw": "P_bat_ch",
+    "battery_discharge_kw": "P_bat_dis",
+    "electrolyser_kw": "P_elz",
+    "fuel_cell_kw": "P_fc",
+    "heat_pump_kw": "P_hp",
+    "electric_boiler_kw": "P_eboiler",
+    "thermal_charge_kw": "Q_tes_ch",
+    "thermal_discharge_kw": "Q_tes_dis",
+    "ventilation_fraction": "vent",
+}
+
+EXOGENOUS_MODEL_NAMES = {
+    "pv_kw": "P_pv",
+    "electric_load_kw": "P_load",
+    "price_eur_per_kwh": "price",
+    "outdoor_temperature_c": "T_out",
+    "irradiance_w_per_m2": "G_Wm2",
+}
+
+# Validation tolerances are declared here so every execution and serialization
+# path applies the same numerical policy.
+BALANCE_STATE_TOLERANCE = 1e-6
+SOLVER_BOUND_TOLERANCE_KW = 1e-4
+SIMULTANEOUS_FLOW_TOLERANCE_KW = 1e-3
+
 # ---------------------------------------------------------------------------
 # Physical constants
 # ---------------------------------------------------------------------------
@@ -166,30 +312,72 @@ T_HARD_MAX_C = 40.0
 # ---------------------------------------------------------------------------
 # Bounds
 # ---------------------------------------------------------------------------
-def state_bounds() -> dict:
-    """(lower, upper) bounds for each state [kWh / kg / kWh / degC]."""
+def physical_state_bounds(
+    config: HubConfiguration,
+) -> dict[str, tuple[float, float]]:
+    """Physical Run bounds: zero-to-capacity storage and hard temperature limits.
+
+    Asset capability zeroing is deliberately deferred to the disabled-asset task;
+    the configuration is accepted now so this stable interface need not change.
+    """
+    del config
     return {
-        "SOC_bat": (BAT_SOC_MIN * BAT_CAPACITY_KWH, BAT_SOC_MAX * BAT_CAPACITY_KWH),
-        "SOC_h2":  (H2_SOC_MIN * H2_CAPACITY_KG,    H2_SOC_MAX * H2_CAPACITY_KG),
-        "SOC_tes": (TES_SOC_MIN * TES_CAPACITY_KWH, TES_SOC_MAX * TES_CAPACITY_KWH),
-        "T_in":    (T_HARD_MIN_C, T_HARD_MAX_C),
+        "soc_battery_kwh": (0.0, BAT_CAPACITY_KWH),
+        "soc_hydrogen_kg": (0.0, H2_CAPACITY_KG),
+        "soc_thermal_kwh": (0.0, TES_CAPACITY_KWH),
+        "indoor_temperature_c": (T_HARD_MIN_C, T_HARD_MAX_C),
     }
 
 
-def input_bounds() -> dict:
-    """(lower, upper) bounds for each control input."""
+def operational_state_bounds(
+    config: HubConfiguration,
+) -> dict[str, tuple[float, float]]:
+    """Existing MPC reserve policy plus the common hard temperature limits."""
+    del config
     return {
-        "P_bat_ch":  (0.0, BAT_P_MAX_KW),
-        "P_bat_dis": (0.0, BAT_P_MAX_KW),
-        "P_elz":     (0.0, ELZ_P_MAX_KW),
-        "P_fc":      (0.0, FC_P_MAX_KW),
-        "P_hp":      (0.0, HP_P_MAX_KW),
-        "P_eboiler": (0.0, EBOILER_P_MAX_KW),
-        "Q_tes_ch":  (0.0, TES_P_MAX_KW),
-        "Q_tes_dis": (0.0, TES_P_MAX_KW),
-        "vent":      (0.0, 1.0),
+        "soc_battery_kwh": (
+            BAT_SOC_MIN * BAT_CAPACITY_KWH,
+            BAT_SOC_MAX * BAT_CAPACITY_KWH,
+        ),
+        "soc_hydrogen_kg": (
+            H2_SOC_MIN * H2_CAPACITY_KG,
+            H2_SOC_MAX * H2_CAPACITY_KG,
+        ),
+        "soc_thermal_kwh": (
+            TES_SOC_MIN * TES_CAPACITY_KWH,
+            TES_SOC_MAX * TES_CAPACITY_KWH,
+        ),
+        "indoor_temperature_c": (T_HARD_MIN_C, T_HARD_MAX_C),
+    }
+
+
+def control_bounds(config: HubConfiguration) -> dict[str, tuple[float, float]]:
+    """Physical bounds for each stable HubControl field."""
+    del config
+    return {
+        "battery_charge_kw": (0.0, BAT_P_MAX_KW),
+        "battery_discharge_kw": (0.0, BAT_P_MAX_KW),
+        "electrolyser_kw": (0.0, ELZ_P_MAX_KW),
+        "fuel_cell_kw": (0.0, FC_P_MAX_KW),
+        "heat_pump_kw": (0.0, HP_P_MAX_KW),
+        "electric_boiler_kw": (0.0, EBOILER_P_MAX_KW),
+        "thermal_charge_kw": (0.0, TES_P_MAX_KW),
+        "thermal_discharge_kw": (0.0, TES_P_MAX_KW),
+        "ventilation_fraction": (0.0, 1.0),
         # P_grid is NOT a control: it is the derived slack bus (see hub_dynamics).
     }
+
+
+def state_bounds() -> dict[str, tuple[float, float]]:
+    """Legacy model-name view of MPC operational state bounds."""
+    stable = operational_state_bounds(HubConfiguration())
+    return {STATE_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
+
+
+def input_bounds() -> dict[str, tuple[float, float]]:
+    """Legacy model-name view of physical control bounds."""
+    stable = control_bounds(HubConfiguration())
+    return {CONTROL_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +490,294 @@ def hub_dynamics(x: dict, u: dict, p: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stable hub interface and fail-closed validation
+# ---------------------------------------------------------------------------
+def hub_state_array(state: HubState) -> np.ndarray:
+    return np.asarray(
+        [getattr(state, field_name) for field_name in STATE_MODEL_NAMES], dtype=float
+    ).reshape(-1, 1)
+
+
+def hub_control_from_array(values: Sequence[float]) -> HubControl:
+    raw = np.asarray(values).reshape(-1)
+    if raw.size != len(CONTROL_MODEL_NAMES):
+        raise ValueError(
+            f"expected {len(CONTROL_MODEL_NAMES)} control values, received {raw.size}"
+        )
+    return HubControl(
+        **{
+            field_name: raw[index]
+            for index, field_name in enumerate(CONTROL_MODEL_NAMES)
+        }
+    )
+
+
+def hub_step_expressions(
+    state: HubState,
+    control: HubControl,
+    exogenous: ExogenousInputs,
+    config: HubConfiguration = HubConfiguration(),
+) -> HubStep:
+    """Evaluate the existing plant equations behind stable domain types.
+
+    The do-mpc symbolic model remains untouched until the shared-expression task.
+    """
+    del config
+    successor_values, metrics = hub_dynamics(state, control, exogenous)
+    generated_heat = (
+        metrics["Q_hp_kW"] + metrics["Q_eboiler_kW"] + metrics["Q_fc_heat_kW"]
+    )
+    return HubStep(
+        successor=HubState(
+            soc_battery_kwh=successor_values["SOC_bat"],
+            soc_hydrogen_kg=successor_values["SOC_h2"],
+            soc_thermal_kwh=successor_values["SOC_tes"],
+            indoor_temperature_c=successor_values["T_in"],
+        ),
+        flows=HubFlows(
+            grid_kw=metrics["P_grid_kW"],
+            generated_heat_kw=generated_heat,
+            heat_to_air_kw=metrics["Q_air_kW"],
+            thermal_charge_margin_kw=metrics["tes_charge_excess_kW"],
+            hydrogen_production_kg_per_h=metrics["m_h2_prod_kg_h"],
+            hydrogen_consumption_kg_per_h=metrics["m_h2_fc_kg_h"],
+        ),
+    )
+
+
+def advance_hub(
+    state: HubState,
+    control: HubControl,
+    exogenous: ExogenousInputs,
+    config: HubConfiguration = HubConfiguration(),
+) -> HubStep:
+    return hub_step_expressions(state, control, exogenous, config)
+
+
+def _finite_field_values(instance: object, expected_type: type) -> tuple[
+    dict[str, float], tuple[ValidationIssue, ...]
+]:
+    if not isinstance(instance, expected_type):
+        return {}, (
+            ValidationIssue(
+                code="schema_error",
+                field=expected_type.__name__,
+                message=f"expected {expected_type.__name__}",
+            ),
+        )
+
+    values: dict[str, float] = {}
+    issues: list[ValidationIssue] = []
+    for item in fields(expected_type):
+        raw = getattr(instance, item.name)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            issues.append(
+                ValidationIssue(
+                    code="non_finite",
+                    field=item.name,
+                    message=f"{item.name} must be a finite scalar",
+                )
+            )
+            continue
+        if not math.isfinite(value):
+            issues.append(
+                ValidationIssue(
+                    code="non_finite",
+                    field=item.name,
+                    message=f"{item.name} must be finite",
+                    actual=value,
+                )
+            )
+            continue
+        values[item.name] = value
+    return values, tuple(issues)
+
+
+def validate_control(
+    control: HubControl,
+    config: HubConfiguration,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> tuple[ValidationIssue, ...]:
+    values, finite_issues = _finite_field_values(control, HubControl)
+    issues = list(finite_issues)
+    bounds = control_bounds(config)
+    for field_name, value in values.items():
+        lower, upper = bounds[field_name]
+        field_tolerance = (
+            tolerance
+            if field_name != "ventilation_fraction"
+            else BALANCE_STATE_TOLERANCE
+        )
+        if value < lower - field_tolerance or value > upper + field_tolerance:
+            issues.append(
+                ValidationIssue(
+                    code="out_of_bounds",
+                    field=field_name,
+                    message=f"{field_name} is outside [{lower}, {upper}]",
+                    actual=value,
+                    lower=lower,
+                    upper=upper,
+                )
+            )
+
+    for label, charge_field, discharge_field in (
+        ("battery", "battery_charge_kw", "battery_discharge_kw"),
+        ("hydrogen", "electrolyser_kw", "fuel_cell_kw"),
+        ("thermal_store", "thermal_charge_kw", "thermal_discharge_kw"),
+    ):
+        charge = values.get(charge_field)
+        discharge = values.get(discharge_field)
+        if (
+            charge is not None
+            and discharge is not None
+            and charge > SIMULTANEOUS_FLOW_TOLERANCE_KW
+            and discharge > SIMULTANEOUS_FLOW_TOLERANCE_KW
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="simultaneous_charge_discharge",
+                    field=label,
+                    message=(
+                        f"{label} charge and discharge both exceed "
+                        f"{SIMULTANEOUS_FLOW_TOLERANCE_KW} kW"
+                    ),
+                    actual=min(charge, discharge),
+                    upper=SIMULTANEOUS_FLOW_TOLERANCE_KW,
+                )
+            )
+    return tuple(issues)
+
+
+def normalize_control(
+    control: HubControl,
+    config: HubConfiguration,
+    bound_tolerance: float = SOLVER_BOUND_TOLERANCE_KW,
+    *,
+    zero_small_flows: bool = True,
+) -> HubControl:
+    """Clip accepted bound noise and optionally zero sub-threshold flow noise."""
+    bounds = control_bounds(config)
+    normalized: dict[str, float] = {}
+    for field_name in CONTROL_MODEL_NAMES:
+        value = float(getattr(control, field_name))
+        lower, upper = bounds[field_name]
+        tolerance = (
+            bound_tolerance
+            if field_name != "ventilation_fraction"
+            else BALANCE_STATE_TOLERANCE
+        )
+        if (
+            zero_small_flows
+            and field_name != "ventilation_fraction"
+            and abs(value) <= SIMULTANEOUS_FLOW_TOLERANCE_KW
+        ):
+            value = 0.0
+        if lower - tolerance <= value < lower:
+            value = lower
+        elif upper < value <= upper + tolerance:
+            value = upper
+        normalized[field_name] = value
+    return HubControl(**normalized)
+
+
+def validate_successor(
+    state: HubState,
+    config: HubConfiguration,
+    require_operational_storage: bool,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> tuple[ValidationIssue, ...]:
+    values, finite_issues = _finite_field_values(state, HubState)
+    issues = list(finite_issues)
+    bounds = (
+        operational_state_bounds(config)
+        if require_operational_storage
+        else physical_state_bounds(config)
+    )
+    for field_name, value in values.items():
+        lower, upper = bounds[field_name]
+        if value < lower - tolerance or value > upper + tolerance:
+            issues.append(
+                ValidationIssue(
+                    code="out_of_bounds",
+                    field=field_name,
+                    message=f"{field_name} is outside [{lower}, {upper}]",
+                    actual=value,
+                    lower=lower,
+                    upper=upper,
+                )
+            )
+    return tuple(issues)
+
+
+def validate_grid_flow(
+    flows: HubFlows,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> tuple[ValidationIssue, ...]:
+    try:
+        grid_kw = float(flows.grid_kw)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return ()
+    if math.isfinite(grid_kw) and abs(grid_kw) > GRID_P_MAX_KW + tolerance:
+        return (
+            ValidationIssue(
+                code="grid_limit",
+                field="grid_kw",
+                message=f"grid flow exceeds +/-{GRID_P_MAX_KW} kW",
+                actual=grid_kw,
+                lower=-GRID_P_MAX_KW,
+                upper=GRID_P_MAX_KW,
+            ),
+        )
+    return ()
+
+
+def validate_thermal_charge(
+    flows: HubFlows,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> tuple[ValidationIssue, ...]:
+    try:
+        margin_kw = float(flows.thermal_charge_margin_kw)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return ()
+    if math.isfinite(margin_kw) and margin_kw > tolerance:
+        return (
+            ValidationIssue(
+                code="thermal_charge_infeasible",
+                field="thermal_charge_margin_kw",
+                message="thermal-store charging exceeds generated heat",
+                actual=margin_kw,
+                upper=0.0,
+            ),
+        )
+    return ()
+
+
+def validate_flows(
+    flows: HubFlows,
+    tolerance: float = BALANCE_STATE_TOLERANCE,
+) -> tuple[ValidationIssue, ...]:
+    _, finite_issues = _finite_field_values(flows, HubFlows)
+    return (
+        *finite_issues,
+        *validate_grid_flow(flows, tolerance),
+        *validate_thermal_charge(flows, tolerance),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Initial state (typical operating point, mid-inventory)
 # ---------------------------------------------------------------------------
-def initial_state() -> dict:
+def initial_state(config: HubConfiguration = HubConfiguration()) -> HubState:
     """Physically reasonable initial hub state."""
-    return {
-        "SOC_bat": 0.50 * BAT_CAPACITY_KWH,   # 500 kWh (50%)
-        "SOC_h2":  0.30 * H2_CAPACITY_KG,     # 60 kg (30%)
-        "SOC_tes": 0.40 * TES_CAPACITY_KWH,   # 1600 kWh (40%)
-        "T_in":    T_SETPOINT_C,              # at setpoint
-    }
+    del config
+    return HubState(
+        soc_battery_kwh=0.50 * BAT_CAPACITY_KWH,  # 500 kWh (50%)
+        soc_hydrogen_kg=0.30 * H2_CAPACITY_KG,  # 60 kg (30%)
+        soc_thermal_kwh=0.40 * TES_CAPACITY_KWH,  # 1600 kWh (40%)
+        indoor_temperature_c=T_SETPOINT_C,  # at setpoint
+    )
 
 
 # ---------------------------------------------------------------------------
