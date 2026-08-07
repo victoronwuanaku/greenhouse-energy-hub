@@ -15,13 +15,17 @@ Dutch greenhouses have historically provided grid flexibility through **Combined
 - **Heat pump + electric boiler + thermal store** — power-to-heat that decouples crop heating from the real-time electricity price
 - **Predictive control** — exploiting day-ahead price forecasts and the crop's thermal comfort band as flexibility
 
-This repo implements the **economic-dispatch layer**: a rolling-horizon MPC that coordinates conversion and storage against real NL day-ahead prices to minimise operating cost while keeping the greenhouse inside its comfort band.
+This repo implements the **economic-dispatch layer** of that hub.
 
 ---
 
 ## Results
 
-14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline** in the pinned winter (`509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a`) and summer (`8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2`) bundles. Hydrogen dispatch, thermal-store charging, and grid-battery charging are disabled. Battery discharge requires a price of at least 0.12/kWh. The reactive temperature target is 16.5 °C; look-ahead is disabled. Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
+14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline** in the pinned winter and summer bundles listed below.
+
+The baseline's missing capabilities are declared explicitly in `BASELINE_CAPABILITY_POLICY` (`src/greenhouse_energy_hub/controllers/baseline.py`): hydrogen dispatch, thermal-store charging and grid-battery charging are disabled, battery discharge requires a price of at least €0.12/kWh, its reactive temperature target is 16.5 °C, and it has no look-ahead. **The MPC is subject to none of these restrictions** — the `no H₂` row in the ablation table below is a separate MPC variant, not the configuration used for the headline result.
+
+Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
 
 <!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->
 | Window | Baseline Inventory-Adjusted Cost | MPC Inventory-Adjusted Cost | Saving | Comfort Violation (baseline / MPC) |
@@ -88,7 +92,7 @@ Published tables and figures are regenerated only from the pinned, verified Run 
             │             power-to-heat balance, comfort band
 ```
 
-The electrolyser + tank + fuel cell together replace the dispatchable CHP: cheap/surplus electricity is stored as hydrogen and later reconverted to **both** electricity and (recovered) heat.
+Fuel-cell waste heat is recovered to the heat bus, so stored hydrogen returns **both** electricity and heat.
 
 ---
 
@@ -149,6 +153,8 @@ greenhouse-energy-hub-mpc/
 
 ## Installation and usage
 
+Capitalised domain terms used from here on — Run, Run Specification, Run Bundle, Scenario, Operating Window — are defined in [`CONTEXT.md`](CONTEXT.md).
+
 ```bash
 git clone https://github.com/victoronwuanaku/greenhouse-energy-hub-mpc
 cd greenhouse-energy-hub-mpc
@@ -157,7 +163,7 @@ python -m pip install -e '.[dev]'
 
 The committed files in `data/source/` (and their provenance sidecars) are the
 retained reproduction inputs. Reproducing the published evidence does not need a
-network refresh or the ignored diagnostics candidate index:
+network refresh or the gitignored diagnostics candidate index:
 
 ```bash
 python experiments/publish_results.py \
@@ -166,10 +172,10 @@ python -m pytest -o addopts='' -q -ra tests/test_published_artifacts.py
 git diff --exit-code -- README.md results/publication_manifest.json results/figures
 ```
 
-The publisher reconstructs all eight exact stable candidate roles from the tracked
-manifest when `results/diagnostics/publication-candidates.json` is absent, verifies
-every full-ID Run Bundle and its causal semantics, and then regenerates only the
-pinned manifest, six figures, and marked README result block. The final `git diff`
+When `results/diagnostics/publication-candidates.json` is absent, the publisher
+reconstructs all eight candidate roles from the tracked manifest. It then verifies
+every full-ID Run Bundle and its causal semantics, and regenerates only the pinned
+manifest, the six figures, and the marked README result block. The final `git diff`
 checks that committed publication bytes remain unchanged.
 
 ### Optional input refresh
@@ -186,7 +192,7 @@ python scripts/generate_demand.py --target-year 2023
 
 ### Full publication Run generation
 
-To generate a fresh Task 13 candidate index, run the exact approved 14-local-day
+To generate a fresh candidate index, run the exact approved 14-local-day
 windows below. The shared Scenario always carries 24 forecast-coverage steps; the
 Baseline uses horizon zero, the full MPC uses horizon 24, and only the one-step
 ablation changes controller horizon.
@@ -237,7 +243,7 @@ python -m pytest -o addopts='' -q -ra
 | Greenhouse electrical load | Synthetic, WUR-parameterised (Warmenhoven et al. 2023) | hourly |
 
 PV/weather (2020) and prices (2023) come from different years. The Scenario Module
-validates exact hourly UTC source coverage and explicitly transplants PV/weather by
+validates exact hourly UTC source coverage and transplants PV/weather by
 calendar instant onto each 2023 Operating Window; operating-clock schedules use
 `Europe/Amsterdam`. This is a deliberate synthetic-study simplification. Heat demand
 is **not** prescribed: it is implicit in the greenhouse temperature ODE.
@@ -256,20 +262,20 @@ is **not** prescribed: it is implicit in the greenhouse temperature ODE.
 
 ---
 
-## Honest limitations
+## Limitations
 
 - **Perfect foresight.** Forecasts are the realised data — an upper bound on achievable savings. A natural next step is forecast error / robust or stochastic MPC.
-- **Naive limited-capability baseline.** The baseline is a frugal reactive thermostat, not a tuned commercial greenhouse EMS; the comparison is not against the state of the art.
-- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore still somewhat optimistic. The MPC objective uses a smooth `max(0, P_grid)` (ε = 1 kW) for the import fee; the reported cost uses the exact `max`, so published savings are unaffected (bounded in `tests/`).
+- **Limited-capability baseline.** The baseline is a frugal reactive thermostat, not a tuned commercial greenhouse EMS, so the comparison is not against the state of the art.
+- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore somewhat optimistic. The MPC objective uses a smooth `max(0, P_grid)` (ε = 1 kW) for the import fee; the reported cost uses the exact `max`, so published savings are unaffected (bounded in `tests/`).
 - **Toy thermal model.** A single-zone lumped-capacitance ODE; humidity, CO₂ and crop growth are out of scope.
-- **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling). Reported honestly rather than hidden.
+- **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling).
 - **Indicative asset sizing.** Capacities are reasonable for a high-tech 1 ha greenhouse but are provisional, not calibrated to a specific site.
 
 ---
 
 ## Key references
 
-1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278* — recent work combining reinforcement learning with predictive control for greenhouse climate management.
+1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278*
 2. **Fiedler, F. et al. (2023).** do-mpc: Towards FAIR nonlinear and robust MPC. *Control Engineering Practice, 140*, 105676.
 3. **Geidl, M. & Andersson, G. (2007).** Optimal power flow of multiple energy carriers. *IEEE Trans. Power Syst. 22*(1), 145–155 — the energy-hub framework used in `src/greenhouse_energy_hub/hub.py`.
 4. **Coordinated distributed MPC for multi-energy carrier systems** (2024). *Scientific Reports.*
