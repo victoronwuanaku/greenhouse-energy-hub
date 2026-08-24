@@ -3320,6 +3320,7 @@ def publication_comparison_rows(
                 "window": label,
                 "baseline_inventory_adjusted_cost_eur": baseline_cost,
                 "mpc_inventory_adjusted_cost_eur": mpc_cost,
+                "saving_eur": baseline_cost - mpc_cost,
                 "saving_percent": saving_percent(baseline_cost, mpc_cost),
                 "baseline_comfort_violation_c_h": publication_metric(
                     baseline, "comfort_violation_c_h"
@@ -3373,11 +3374,12 @@ def rewrite_publication_readme_block(
     rows = publication_comparison_rows(summaries)
     ablations = publication_ablation_rows(summaries)
     comparison_lines = [
-        "| Window | Baseline Inventory-Adjusted Cost | MPC Inventory-Adjusted Cost | Saving | Comfort Violation (baseline / MPC) |",
-        "|--------|----------------------------------:|-----------------------------:|:------:|:-----------------------------------:|",
+        "| Window | Baseline Inventory-Adjusted Cost | MPC Inventory-Adjusted Cost | Saving (€) | Saving (%) | Comfort Violation (baseline / MPC) |",
+        "|--------|----------------------------------:|-----------------------------:|-----------:|:----------:|:-----------------------------------:|",
         *[
             f"| **{row['window']}** | €{row['baseline_inventory_adjusted_cost_eur']:,.0f} | "
-            f"€{row['mpc_inventory_adjusted_cost_eur']:,.0f} | {row['saving_percent']:+.1f} % | "
+            f"€{row['mpc_inventory_adjusted_cost_eur']:,.0f} | "
+            f"€{row['saving_eur']:,.0f} | {row['saving_percent']:+.1f} % | "
             f"{row['baseline_comfort_violation_c_h']:.1f} / "
             f"{row['mpc_comfort_violation_c_h']:.1f} °C·h |"
             for row in rows
@@ -3398,9 +3400,9 @@ def rewrite_publication_readme_block(
             for row in ablations
         ],
         "",
-        f"Removing hydrogen raises the winter inventory-adjusted cost relative to the full controller (`{validated['ablation-no-h2']}` versus `{validated['ablation-full']}`).",
-        f"Removing the thermal store raises the winter inventory-adjusted cost relative to the full controller (`{validated['ablation-no-tes']}` versus `{validated['ablation-full']}`).",
-        f"A one-step horizon has substantial comfort violation in this winter run (`{validated['ablation-one-step']}` versus `{validated['ablation-full']}`).",
+        "Every figure and table above is pinned to a specific Run Bundle recorded in"
+        " `results/publication_manifest.json` and verified by"
+        " `tests/test_published_artifacts.py`.",
     ]
     path = Path(readme_path)
     original = path.read_bytes()
