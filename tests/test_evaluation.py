@@ -1217,6 +1217,30 @@ def test_bundle_verification_binds_controller_and_solver_semantics(
         verify_run_bundle(mutated, repository_root=repository)
 
 
+def _pinned_bundle_dir(role: str) -> Path:
+    """Resolve a publication role to its committed Run Bundle directory.
+
+    The publication manifest pins the authoritative full identifier, so
+    verification fixtures follow regeneration instead of hard-coding hashes.
+    """
+    root = Path(__file__).resolve().parent.parent
+    publication = json.loads(
+        (root / "results" / "publication_manifest.json").read_text(encoding="utf-8")
+    )
+    if role == "winter-mpc":
+        identifier = publication["comparisons"]["winter"]["mpc_bundle_id"]
+    elif role == "winter-baseline":
+        identifier = publication["comparisons"]["winter"]["baseline_bundle_id"]
+    else:
+        raise ValueError(f"unsupported publication role: {role}")
+    matches = list((root / "results" / "runs").glob(f"*--{identifier}"))
+    assert len(matches) == 1, (
+        f"expected exactly one pinned Run Bundle directory for {role}, "
+        f"found {len(matches)}"
+    )
+    return matches[0]
+
+
 @pytest.mark.parametrize(
     "forgery",
     [
@@ -1234,7 +1258,7 @@ def test_bundle_verification_rejects_rehashed_forecast_semantic_forgery(
     from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     root = Path(__file__).resolve().parent.parent
-    source = next(root.glob("results/runs/winter-2023-14d--mpc--1e9ee84c*"))
+    source = _pinned_bundle_dir("winter-mpc")
     copied = tmp_path / source.name
     shutil.copytree(source, copied)
 
@@ -1270,7 +1294,7 @@ def test_bundle_verification_rejects_rehashed_baseline_terminal_coefficients(tmp
     from greenhouse_energy_hub.evaluation import verify_run_bundle
 
     root = Path(__file__).resolve().parent.parent
-    source = next(root.glob("results/runs/winter-2023-14d--baseline--509c81dd*"))
+    source = _pinned_bundle_dir("winter-baseline")
     copied = tmp_path / source.name
     shutil.copytree(source, copied)
 

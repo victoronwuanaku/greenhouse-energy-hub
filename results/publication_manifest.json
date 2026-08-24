@@ -2,44 +2,44 @@
   "schema_version": "publication-manifest-v1",
   "comparisons": {
     "winter": {
-      "baseline_bundle_id": "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
-      "mpc_bundle_id": "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "baseline_bundle_id": "8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f",
+      "mpc_bundle_id": "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     },
     "summer": {
-      "baseline_bundle_id": "8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2",
-      "mpc_bundle_id": "5975dafc40c7bb296fa8861eb1e78b2afc21ff4eeff14ed3e2575b77768cecb1"
+      "baseline_bundle_id": "e160ae84400e59566f0c0d33cb19ef1a6d7f59e1bf19233eb60c1b1ff9eeedf0",
+      "mpc_bundle_id": "351a75129187d7bbc70ea34cc1c744d8eb809ff52eedba37eba4b2f2489005c2"
     }
   },
   "ablations": {
-    "full": "9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a",
-    "no-h2": "9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97",
-    "no-tes": "787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de",
-    "one-step": "df487e8da6980b2d87c7629ee276d92952630f0feebfb6962d2b291838edc5ac"
+    "full": "662c4a1bc52b5cc37fca09b2d2a7ea42f3465f6f0ffb860d2d59c9b8f2a5907f",
+    "no-h2": "3ff4187646cbedee11cf1c9a6a95b270535c1b5d09f4d7f139e8f5321a6be870",
+    "no-tes": "78619f0518d5aa89c710bfa2c15517284baa031b4dbaa0e2798ec02fd60fde66",
+    "one-step": "916785e0a71985bd2471af5930712197629ee699eb8ae3da42838616da4c59c3"
   },
   "figures": {
     "fig1_cumulative_cost.png": [
-      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
-      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f",
+      "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     ],
     "fig2_grid_vs_price.png": [
-      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     ],
     "fig3_soc_trajectories.png": [
-      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
-      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f",
+      "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     ],
     "fig4_temperature.png": [
-      "509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a",
-      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f",
+      "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     ],
     "fig5_heat_shifting.png": [
-      "1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253"
+      "57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83"
     ],
     "fig6_ablation.png": [
-      "9c0b37e82655b6ccef9e1b1d831ee729d37eb4afc289a78045bab85fbe287e4a",
-      "9b36719b929fffcef26084f5efa37bcb2385b9b9199c7e429dec37a86993ad97",
-      "787abda250b5b2f47005452322aa8d65ee5c7bcb8848246797e4e98ea8e1b8de",
-      "df487e8da6980b2d87c7629ee276d92952630f0feebfb6962d2b291838edc5ac"
+      "662c4a1bc52b5cc37fca09b2d2a7ea42f3465f6f0ffb860d2d59c9b8f2a5907f",
+      "3ff4187646cbedee11cf1c9a6a95b270535c1b5d09f4d7f139e8f5321a6be870",
+      "78619f0518d5aa89c710bfa2c15517284baa031b4dbaa0e2798ec02fd60fde66",
+      "916785e0a71985bd2471af5930712197629ee699eb8ae3da42838616da4c59c3"
     ]
   }
 }

@@ -34,10 +34,10 @@ Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
 | **Summer** | €3,571 | €1,872 | €1,698 | +47.6 % | 29.6 / 28.6 °C·h |
 
 Pinned Run Bundle IDs:
-- Winter baseline: `509c81dd1bea108aac1be2073b2b16646771bf65d5cc7f257081bcf81784713a`
-- Winter MPC: `1e9ee84ca78896c082b6d3216bab0d841f027b65f901aeec76bc78f253a90253`
-- Summer baseline: `8d9f6657c04b552f8d4f83f484ba004bcc46a2e7fa9c95cdc67936da9d8998e2`
-- Summer MPC: `5975dafc40c7bb296fa8861eb1e78b2afc21ff4eeff14ed3e2575b77768cecb1`
+- Winter baseline: `8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f`
+- Winter MPC: `57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83`
+- Summer baseline: `e160ae84400e59566f0c0d33cb19ef1a6d7f59e1bf19233eb60c1b1ff9eeedf0`
+- Summer MPC: `351a75129187d7bbc70ea34cc1c744d8eb809ff52eedba37eba4b2f2489005c2`
 
 | Winter ablation | Inventory-Adjusted Cost | Comfort Violation | Cost difference vs full |
 |-----------------|--------------------------:|------------------:|:-----------------------:|
