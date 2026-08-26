@@ -21,7 +21,7 @@ This repo implements the **economic-dispatch layer** of that hub.
 
 ## Results
 
-14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline** in the pinned winter and summer bundles listed below.
+14-day rolling-horizon simulations use do-mpc / IPOPT with a 24-hour receding horizon, hourly steps, and perfect-foresight forecasts. The MPC is compared with a **limited-capability rule-based baseline** in the winter and summer scenarios.
 
 The baseline's missing capabilities are declared explicitly in `BASELINE_CAPABILITY_POLICY` (`src/greenhouse_energy_hub/controllers/baseline.py`). Hydrogen dispatch, thermal-store charging and grid-battery charging are disabled. Battery discharge requires a price of at least €0.12/kWh. The reactive temperature target is 16.5 °C, and there is no look-ahead. **The MPC is subject to none of these restrictions** — the `no H₂` row in the ablation table below is a separate MPC variant, not the configuration used for the headline result.
 
@@ -33,12 +33,6 @@ Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
 | **Winter** | €45,389 | €42,560 | €2,829 | +6.2 % | 0.0 / 0.0 °C·h |
 | **Summer** | €3,571 | €1,872 | €1,698 | +47.6 % | 29.6 / 28.6 °C·h |
 
-Pinned Run Bundle IDs:
-- Winter baseline: `8be380ed480884f718eba2f55b9cacc42684a6e4533c73e20864837618fed31f`
-- Winter MPC: `57f0cb6193fcf49601a2514443a5f6437e0ff181bfc4bfc4ae091ef191c32f83`
-- Summer baseline: `e160ae84400e59566f0c0d33cb19ef1a6d7f59e1bf19233eb60c1b1ff9eeedf0`
-- Summer MPC: `351a75129187d7bbc70ea34cc1c744d8eb809ff52eedba37eba4b2f2489005c2`
-
 | Winter ablation | Inventory-Adjusted Cost | Comfort Violation | Cost difference vs full |
 |-----------------|--------------------------:|------------------:|:-----------------------:|
 | MPC (full) | €42,560 | 0.0 °C·h | +0.0 % |
@@ -46,10 +40,10 @@ Pinned Run Bundle IDs:
 | no thermal store | €43,303 | 0.0 °C·h | +1.7 % |
 | one-step horizon | €41,082 | 2,826.4 °C·h | -3.5 % |
 
-Every figure and table above is pinned to a specific Run Bundle recorded in `results/publication_manifest.json` and verified by `tests/test_published_artifacts.py`.
+**Reproducibility.** The tables and figures use [verified Run Bundles](results/runs/) committed with the repository. The [publication manifest](results/publication_manifest.json) maps the published results and figures to their source runs, and the [publication tests](tests/test_published_artifacts.py) recompute the reported values.
 <!-- END GENERATED RESULTS -->
 
-Published tables and figures are regenerated only from the pinned, verified Run Bundles under `results/runs/`. The table reports **Inventory-Adjusted Cost** and **Comfort Violation** separately; it does not use a comfort-priced composite metric. These are simulation-prototype results, not decision-grade evidence for a specific site.
+The tables report **Inventory-Adjusted Cost** and **Comfort Violation** separately; they do not use a comfort-priced composite metric. These are simulation-prototype results, not decision-grade evidence for a specific site.
 
 ### Verified figures
 

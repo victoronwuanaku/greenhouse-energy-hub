@@ -212,6 +212,19 @@ def test_candidates_fall_back_to_the_committed_manifest_when_index_is_missing(tm
     assert candidates == _generated_publication_candidates()
 
 
+def _load_publish_results_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "publish_results",
+        ROOT / "experiments" / "publish_results.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_path):
     from greenhouse_energy_hub.evaluation import (
         load_verified_publication_evidence,
@@ -219,6 +232,7 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
         regenerate_publication_artifacts,
     )
 
+    publisher = _load_publish_results_module()
     missing_candidates = tmp_path / "diagnostics" / "publication-candidates.json"
     manifest_path = tmp_path / "publication_manifest.json"
     readme_path = tmp_path / "README.md"
@@ -240,6 +254,7 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
         figures_root=figures_root,
         readme_path=readme_path,
     )
+    publisher.format_readme_evidence_presentation(readme_path)
     committed = read_publication_manifest(
         ROOT / "results" / "publication_manifest.json"
     )
@@ -264,6 +279,7 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
         )
     }
     assert {path: path.read_bytes() for path in repository_outputs} == before
+    assert readme_path.read_bytes() == (ROOT / "README.md").read_bytes()
 
 
 def test_publisher_cli_accepts_manifest_alone_from_installed_checkout(tmp_path):
@@ -1291,6 +1307,22 @@ def test_readme_rewrite_preserves_bytes_outside_generated_markers(tmp_path):
     after_end = after.index(b"<!-- END GENERATED RESULTS -->")
     assert after[:begin] == before[:begin]
     assert after[after_end:] == before[before_end:]
+
+
+def test_readme_presents_publication_evidence_without_raw_bundle_hashes():
+    publisher = _load_publish_results_module()
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    generated = readme.split(
+        "<!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->", 1
+    )[1].split("<!-- END GENERATED RESULTS -->", 1)[0]
+
+    visible = re.sub(r"\]\([^)]*\)", "]", generated)
+    assert "Pinned Run Bundle IDs:" not in visible
+    assert re.search(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", visible) is None
+    assert "[publication manifest](results/publication_manifest.json)" in generated
+    assert "[verified Run Bundles](results/runs/)" in generated
+    assert "[publication tests](tests/test_published_artifacts.py)" in generated
+    assert publisher.REPRODUCIBILITY_PROSE in generated
 
 
 def test_ablation_cost_difference_is_signed_from_full_to_variant():
