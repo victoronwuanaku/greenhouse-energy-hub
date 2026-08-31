@@ -77,4 +77,4 @@ Adopt Approach A. It separates reproducibility of the requested experiment from 
 
 Keep the Implementation filesystem-based for this repository's present scale. No database, remote object store, signing infrastructure, or general artifact registry is required.
 
-The user approved Approach A. ADR-0007 records the decision, `CONTEXT.md` defines its domain terms, and the architecture design now treats it as authoritative.
+Approach A was adopted. ADR-0007 records the decision, `docs/terminology.md` defines its domain terms.

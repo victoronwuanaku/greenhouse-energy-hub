@@ -62,4 +62,4 @@ This is the most cautious presentation, but it weakens comparability and leaves 
 
 Adopt Approach A. It gives the evaluation/artifact Module one deep Interface, applies identical economics to both Controller Adapters, and keeps Solver Objective tuning separate from realized evaluation. Treat the current throughput/wear coefficients as provisional policy inputs rather than validated equipment economics, and never monetize Comfort Violation without an independently approved valuation.
 
-The user approved Approach A. ADR-0006 records the decision; the architecture design and verification matrix now treat it as authoritative.
+Approach A was adopted. ADR-0006 records the decision; the verification matrix now treats it as authoritative.

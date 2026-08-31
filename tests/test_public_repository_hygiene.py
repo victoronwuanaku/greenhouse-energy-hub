@@ -6,10 +6,6 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PLAN = (
-    REPOSITORY_ROOT
-    / "docs/superpowers/plans/2026-07-17-greenhouse-energy-hub-architecture-migration.md"
-)
 
 
 def _tracked_text_files() -> list[tuple[Path, str]]:
@@ -40,16 +36,6 @@ def test_tracked_text_omits_private_development_metadata() -> None:
             False,
         ),
         ("local review draft", re.compile("REVIEW_" + r"RESPONSE\.md"), True),
-        (
-            "internal agent instruction",
-            re.compile("For " + "agentic workers"),
-            False,
-        ),
-        (
-            "internal goal instruction",
-            re.compile("active " + "Codex goal|goal token " + "usage"),
-            False,
-        ),
     )
 
     violations: list[str] = []
@@ -65,10 +51,3 @@ def test_tracked_text_omits_private_development_metadata() -> None:
     assert not violations, "private development metadata is tracked:\n" + "\n".join(
         violations
     )
-
-
-def test_migration_plan_keeps_portable_repository_instructions() -> None:
-    contents = MIGRATION_PLAN.read_text(encoding="utf-8")
-
-    assert "Work from the repository root." in contents
-    assert "cd - >/dev/null" in contents

@@ -134,10 +134,9 @@ _Avoid_: Crop damage, comfort cost
 - A **Published Result** pins full **Run Bundle Identifiers** belonging to **Valid Runs**.
 - **Grid Cost** is one input to **Operating Cost**; **Inventory-Adjusted Cost** applies an additional declared settlement policy.
 
-## Example dialogue
+## Worked example
 
-> **Developer:** "Can the one-hour **MPC Controller** publish a **Run Bundle** if its reached **Terminal State** violates a storage bound?"
-> **Domain expert:** "No. The reached state belongs to the **Run**, so the run is not a **Valid Run**, even if the solver returned controls for that operating step."
+A **Run** is not a **Valid Run** if its reached **Terminal State** violates a storage bound, even if the solver returned controls for that operating step.
 
 ## Flagged ambiguities
 

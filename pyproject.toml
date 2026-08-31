@@ -9,7 +9,7 @@ description = "Rolling-horizon economic MPC for a multi-carrier greenhouse energ
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Viktor Onwuanaku" }]
+authors = [{ name = "Victor Onwuanaku" }]
 dependencies = [
     "do-mpc>=5.1.1",
     "casadi>=3.7.2",

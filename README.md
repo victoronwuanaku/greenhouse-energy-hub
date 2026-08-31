@@ -45,7 +45,7 @@ Imports pay wholesale plus a transport/levy surcharge; exports earn wholesale.
 
 The tables report **Inventory-Adjusted Cost** and **Comfort Violation** separately; they do not use a comfort-priced composite metric. These are simulation-prototype results, not decision-grade evidence for a specific site.
 
-### Verified figures
+### Figures
 
 ![Cumulative cost](results/figures/fig1_cumulative_cost.png)
 
@@ -54,7 +54,7 @@ The tables report **Inventory-Adjusted Cost** and **Comfort Violation** separate
 ![Storage trajectories](results/figures/fig3_soc_trajectories.png)
 ![Power-to-heat load-shifting](results/figures/fig5_heat_shifting.png)
 
-### Verified ablation evidence
+### Ablation study
 
 ![Ablation](results/figures/fig6_ablation.png)
 
@@ -145,7 +145,7 @@ greenhouse-energy-hub-mpc/
 
 ## Installation and usage
 
-Capitalised domain terms used from here on — Run, Run Specification, Run Bundle, Scenario, Operating Window — are defined in [`CONTEXT.md`](CONTEXT.md).
+Capitalised domain terms used from here on — Run, Run Specification, Run Bundle, Scenario, Operating Window — are defined in [`docs/terminology.md`](docs/terminology.md).
 
 ```bash
 git clone https://github.com/victoronwuanaku/greenhouse-energy-hub-mpc
@@ -277,4 +277,4 @@ is **not** prescribed: it is implicit in the greenhouse temperature ODE.
 
 ## License
 
-MIT — see `pyproject.toml`.
+MIT — see [`LICENSE`](LICENSE).

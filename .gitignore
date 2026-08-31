@@ -11,8 +11,8 @@ results/diagnostics/
 # OS
 .DS_Store
 
-# Local review/working notes (not part of the published project)
-CLAUDE_REVIEW_BRIEF.md
+# IDE project files
+.idea/
 
 # Environments
 .venv/
