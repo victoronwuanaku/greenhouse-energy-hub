@@ -29,12 +29,12 @@ Finite-horizon optimal control problem (solved at each timestep k):
 
 Design notes
 ------------
-* Heat is NOT a prescribed demand: the controller supplies heat and opens vents to
-  hold T_in in band. This removes the old conflicting two-thermal-model formulation.
+* Heat is not a prescribed demand: the controller supplies heat and opens vents to
+  hold T_in in band.
 * Hydrogen has a discharge path (fuel cell -> electricity + heat), so the H2 buffer
   carries economic value instead of being a pure cost sink.
-* Battery/TES throughput costs + a complementarity penalty eliminate the physically
-  meaningless simultaneous charge+discharge that the old formulation exhibited.
+* Battery/TES throughput costs plus a complementarity penalty keep the solver from
+  charging and discharging a store in the same hour.
 * The terminal cost values stored energy at the horizon-average price (a simple
   cost-to-go proxy), avoiding both end-of-horizon dumping and free hoarding.
 
@@ -49,18 +49,17 @@ References
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 
 import numpy as np
 import do_mpc
 from casadi import DM, sqrt
 
 from greenhouse_energy_hub.evaluation import EvaluationPolicy
+from greenhouse_energy_hub.scenarios import JSONValue, freeze_json
 from greenhouse_energy_hub.simulation import (
     ControlDecision,
     ControllerFailure,
     DecisionDiagnostics,
-    JSONValue,
 )
 from greenhouse_energy_hub.hub import (
     ExogenousInputs, HubConfiguration, HubControl, HubState,
@@ -93,23 +92,18 @@ W_TBAND     = 10.0      # soft temperature-band violation penalty [EUR per slack
 W_TERMINAL  = 1.0       # terminal stored-energy value weight
 W_RTERM     = 1e-4      # input-move smoothing (rterm)
 
-
-def _immutable_metadata(values: Mapping[str, object]) -> Mapping[str, object]:
-    def freeze(value: object) -> object:
-        if isinstance(value, Mapping):
-            return MappingProxyType(
-                {str(key): freeze(item) for key, item in value.items()}
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(freeze(item) for item in value)
-        return value
-
-    return freeze(values)
+# Imported energy pays wholesale plus a transport/levy surcharge; exports earn
+# wholesale. The objective needs a smooth max(0, P_grid), so it uses
+# 0.5*(P + sqrt(P^2 + eps^2)) with eps = 1 kW. That charges a phantom ~0.5 kW of
+# import at P_grid = 0 (~0.0125 EUR/h of surcharge) in the solver objective only;
+# the reported grid cost uses the exact max(0, P_grid).
+IMPORT_SMOOTH_EPS2 = 1.0
 
 
 @dataclass(frozen=True)
 class MpcConfiguration:
     horizon_steps: int = N_HORIZON
+    grid_import_fee_eur_per_kwh: float = GRID_IMPORT_FEE_EUR_KWH
     terminal_weight: float = W_TERMINAL
     battery_wear_eur_per_kwh: float = W_BAT_THRU
     thermal_store_wear_eur_per_kwh: float = W_TES_THRU
@@ -127,15 +121,11 @@ class MpcConfiguration:
         policy: EvaluationPolicy,
         **solver_configuration: object,
     ) -> "MpcConfiguration":
-        """Bind declared evaluation wear terms into the Solver Objective."""
+        """Take the economic terms of the objective from the evaluation policy."""
         if not isinstance(policy, EvaluationPolicy):
             raise TypeError("policy must be an EvaluationPolicy")
-        if policy.grid_import_fee_eur_per_kwh != GRID_IMPORT_FEE_EUR_KWH:
-            raise ValueError(
-                "MPC currently supports only the declared grid import fee "
-                f"{GRID_IMPORT_FEE_EUR_KWH} EUR/kWh"
-            )
         economic_names = {
+            "grid_import_fee_eur_per_kwh",
             "battery_wear_eur_per_kwh",
             "thermal_store_wear_eur_per_kwh",
             "electrolyser_wear_eur_per_kwh",
@@ -148,6 +138,7 @@ class MpcConfiguration:
                 f"Solver economic terms come from EvaluationPolicy, not overrides: {names}"
             )
         return cls(
+            grid_import_fee_eur_per_kwh=policy.grid_import_fee_eur_per_kwh,
             battery_wear_eur_per_kwh=policy.wear.battery_eur_per_kwh,
             thermal_store_wear_eur_per_kwh=(
                 policy.wear.thermal_store_eur_per_kwh
@@ -164,6 +155,7 @@ class MpcConfiguration:
         return {
             "horizon_steps": self.horizon_steps,
             "solver_objective_economic_terms": {
+                "grid_import_fee_eur_per_kwh": self.grid_import_fee_eur_per_kwh,
                 "battery_wear_eur_per_kwh": self.battery_wear_eur_per_kwh,
                 "thermal_store_wear_eur_per_kwh": (
                     self.thermal_store_wear_eur_per_kwh
@@ -193,8 +185,8 @@ class _NeutralForecastPoint:
     irradiance_w_per_m2: float = 0.0
 
 
-class _ForecastTVPSource:
-    """Expose only the active N+1 immutable forecast view to do-mpc."""
+class ForecastTVPSource:
+    """do-mpc time-varying-parameter callback fed from the active N+1 forecast."""
 
     def __init__(self, tvp_template: object, horizon_steps: int) -> None:
         self._tvp_template = tvp_template
@@ -251,14 +243,16 @@ class MpcControllerAdapter:
     def __init__(
         self,
         mpc: object,
+        forecast_source: ForecastTVPSource,
         forecast_horizon_steps: int,
         configuration: Mapping[str, JSONValue],
         capability_policy: Mapping[str, JSONValue],
     ) -> None:
         self._mpc = mpc
+        self._forecast_source = forecast_source
         self.forecast_horizon_steps = forecast_horizon_steps
-        self.configuration = _immutable_metadata(configuration)
-        self.capability_policy = _immutable_metadata(capability_policy)
+        self.configuration = freeze_json(configuration)
+        self.capability_policy = freeze_json(capability_policy)
 
     def decide(
         self,
@@ -308,18 +302,15 @@ class MpcControllerAdapter:
 
         x0 = hub_state_array(state)
         self._mpc.x0 = x0
-        forecast_source = getattr(self._mpc, "_forecast_source", None)
-        if forecast_source is not None:
-            forecast_source.activate(
-                forecast,
-                terminal_electric_value,
-                terminal_heat_value,
-            )
+        self._forecast_source.activate(
+            forecast,
+            terminal_electric_value,
+            terminal_heat_value,
+        )
         try:
             raw_control = self._mpc.make_step(x0)
         finally:
-            if forecast_source is not None:
-                forecast_source.clear()
+            self._forecast_source.clear()
         stats = dict(self._mpc.solver_stats)
         diagnostics = DecisionDiagnostics(
             adapter="mpc",
@@ -368,16 +359,13 @@ def _enable_text_solver_stat_storage(mpc: object) -> None:
 def build_mpc(
     hub_config: HubConfiguration,
     config: MpcConfiguration,
-) -> tuple[object, object]:
+) -> tuple[object, ForecastTVPSource]:
     """
-    Construct and return a configured do-mpc MPC controller for the hub.
+    Construct a configured do-mpc controller for the hub.
 
-    The controller is configured from physical and solver policy only. Forecast data
-    is supplied later as an immutable N+1 view to ``MpcControllerAdapter.decide``.
-
-    Returns
-    -------
-    (mpc, model) : configured do_mpc controller + symbolic model
+    Returns the controller and the forecast source that feeds its time-varying
+    parameters; ``MpcControllerAdapter`` binds the two and supplies each N+1
+    forecast view at decision time.
     """
     if config.horizon_steps < 1:
         raise ValueError("MPC horizon_steps must be at least one")
@@ -411,7 +399,7 @@ def build_mpc(
     )
     terminal_heat_value = model.set_variable("_tvp", "terminal_heat_value")
 
-    # Numerical simulation and this CasADi model bind the same physical owner.
+    # Same physics as the numerical plant (advance_hub), evaluated on CasADi symbols.
     shared_step = hub_step_expressions(
         HubState(
             soc_battery_kwh=SOC_bat,
@@ -493,17 +481,10 @@ def build_mpc(
     # ------------------------------------------------------------------
     # 3. Objective
     # ------------------------------------------------------------------
-    # Imported energy pays wholesale + a transport/levy surcharge; exports earn wholesale.
-    # import_kw is a smooth max(0, P_grid) = 0.5*(P + sqrt(P^2 + eps^2)) so the objective
-    # stays C-infinity for IPOPT. eps = 1 kW; this charges a tiny phantom import (~0.5 kW
-    # at P_grid=0, i.e. ~0.0125 EUR/h of surcharge) that biases the SOLVER objective only.
-    # The realised/reported grid cost uses the EXACT max(0, P_grid), so published
-    # savings are unaffected; tests/test_hub.py bounds this approximation error.
-    IMPORT_SMOOTH_EPS2 = 1.0
     P_grid_expr = model.aux["P_grid"]
     import_kw = 0.5 * (P_grid_expr + sqrt(P_grid_expr ** 2 + IMPORT_SMOOTH_EPS2))
     lterm = (
-        (price * P_grid_expr + GRID_IMPORT_FEE_EUR_KWH * import_kw) * DT_H
+        (price * P_grid_expr + config.grid_import_fee_eur_per_kwh * import_kw) * DT_H
         + config.battery_wear_eur_per_kwh * (P_bat_ch + P_bat_dis) * DT_H
         + config.thermal_store_wear_eur_per_kwh
         * (Q_tes_ch + Q_tes_dis)
@@ -589,9 +570,8 @@ def build_mpc(
     # 6. Time-varying parameters (causal N+1 forecast view)
     # ------------------------------------------------------------------
     tvp_template = mpc.get_tvp_template()
-    forecast_source = _ForecastTVPSource(tvp_template, config.horizon_steps)
+    forecast_source = ForecastTVPSource(tvp_template, config.horizon_steps)
     mpc.set_tvp_fun(forecast_source)
     mpc.setup()
     _enable_text_solver_stat_storage(mpc)
-    mpc._forecast_source = forecast_source
-    return mpc, model
+    return mpc, forecast_source

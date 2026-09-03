@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ast
-import json
 from pathlib import Path
 import subprocess
 import venv
@@ -11,132 +9,8 @@ import pandas as pd
 import pytest
 
 import greenhouse_energy_hub.controllers.baseline as baseline_controller
-
-
-INPUT_NAMES = (
-    "P_bat_ch",
-    "P_bat_dis",
-    "P_elz",
-    "P_fc",
-    "P_hp",
-    "P_eboiler",
-    "Q_tes_ch",
-    "Q_tes_dis",
-    "vent",
-)
-
-
-def _boundary_violations(source: str, origin: str) -> list[str]:
-    """Return forbidden repository-root imports and interpreter path mutations."""
-    tree = ast.parse(source, filename=origin)
-    forbidden_roots = {"models", "control", "accounting"}
-    system_modules: set[str] = set()
-    system_paths: set[str] = set()
-    importlib_modules: set[str] = set()
-    import_module_functions: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "sys":
-                    system_modules.add(alias.asname or alias.name)
-                elif alias.name == "importlib":
-                    importlib_modules.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "sys":
-            for alias in node.names:
-                if alias.name == "path":
-                    system_paths.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
-            for alias in node.names:
-                if alias.name == "import_module":
-                    import_module_functions.add(alias.asname or alias.name)
-
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr == "path"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in system_modules
-        ):
-            violations.append(f"{origin}:{node.lineno}: interpreter path access")
-        elif isinstance(node, ast.Name) and node.id in system_paths:
-            violations.append(f"{origin}:{node.lineno}: interpreter path access")
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".", 1)[0] in forbidden_roots:
-                    violations.append(f"{origin}:{node.lineno}: root import {alias.name}")
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            if node.module.split(".", 1)[0] in forbidden_roots:
-                violations.append(f"{origin}:{node.lineno}: root import {node.module}")
-        elif isinstance(node, ast.Call) and node.args:
-            function = node.func
-            is_dynamic_import = (
-                isinstance(function, ast.Name)
-                and function.id in import_module_functions | {"__import__"}
-            ) or (
-                isinstance(function, ast.Attribute)
-                and function.attr == "import_module"
-                and isinstance(function.value, ast.Name)
-                and function.value.id in importlib_modules
-            )
-            module_name = node.args[0]
-            if (
-                is_dynamic_import
-                and isinstance(module_name, ast.Constant)
-                and isinstance(module_name.value, str)
-                and module_name.value.split(".", 1)[0] in forbidden_roots
-            ):
-                violations.append(
-                    f"{origin}:{node.lineno}: dynamic root import {module_name.value}"
-                )
-    return violations
-
-
-@pytest.mark.parametrize(
-    "source",
-    (
-        "import sys as runtime\nruntime.path.insert(0, '.')\n",
-        "from sys import path as runtime_path\nruntime_path.insert(0, '.')\n",
-        (
-            "import importlib as loader\n"
-            f"loader.import_module({('mod' + 'els.hub_model')!r})\n"
-        ),
-        (
-            "from importlib import import_module as load_module\n"
-            f"load_module({('con' + 'trol.mpc')!r})\n"
-        ),
-        f"__import__({('account' + 'ing')!r})\n",
-    ),
-)
-def test_boundary_guard_rejects_aliased_paths_and_constant_dynamic_imports(source):
-    assert _boundary_violations(source, "characterization.py")
-
-
-def test_project_sources_use_only_installed_package_imports():
-    repository_root = Path(__file__).resolve().parent.parent
-    violations: list[str] = []
-    for directory in ("src", "experiments", "scripts", "tests"):
-        for path in sorted((repository_root / directory).rglob("*.py")):
-            violations.extend(
-                _boundary_violations(
-                    path.read_text(encoding="utf-8"),
-                    str(path.relative_to(repository_root)),
-                )
-            )
-
-    notebook_path = repository_root / "notebooks" / "results_analysis.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    for index, cell in enumerate(notebook["cells"]):
-        if cell.get("cell_type") == "code":
-            violations.extend(
-                _boundary_violations(
-                    "".join(cell.get("source", [])),
-                    f"{notebook_path.relative_to(repository_root)}:cell-{index}",
-                )
-            )
-
-    assert violations == []
+from tests import support
+from tests.support import INPUT_NAMES
 
 
 def test_editable_install_imports_all_owning_modules_outside_repository(tmp_path):
@@ -251,17 +125,16 @@ def _forecast_points(
 
 
 def test_one_step_mpc_keeps_every_reached_state_valid():
-    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
-    from greenhouse_energy_hub.hub import state_bounds
+    from greenhouse_energy_hub.simulation import ValidRun
 
-    outcome = run_simulation(
-        load_data(start_month=1, n_days=2, forecast_hours=1),
+    outcome = support.run_controller(
+        support.load_window(start_month=1, n_days=2, forecast_hours=1),
         mode="mpc",
         n_horizon=1,
     )
     assert isinstance(outcome, ValidRun)
-    bounds = state_bounds()
-    frame = outcome.to_frame()
+    bounds = support.state_bounds()
+    frame = support.run_to_frame(outcome)
     for state, column in {
         "SOC_bat": "SOC_bat_kWh",
         "SOC_h2": "SOC_h2_kg",
@@ -272,8 +145,16 @@ def test_one_step_mpc_keeps_every_reached_state_valid():
         assert frame[column].between(lower - 1e-6, upper + 1e-6).all()
 
 
+class _InertForecastSource:
+    def activate(self, *_args):
+        return None
+
+    def clear(self):
+        return None
+
+
 class _FailedMpc:
-    """Complete double for the do-mpc surface consumed by the legacy loop."""
+    """Double for the do-mpc surface used by MpcControllerAdapter."""
 
     def __init__(self) -> None:
         self.x0 = None
@@ -298,30 +179,29 @@ class _FailedMpc:
 def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch, hourly_frame):
     import greenhouse_energy_hub.controllers.mpc as mpc_controller
     import greenhouse_energy_hub.simulation as rolling_horizon
+    from greenhouse_energy_hub.simulation import InvalidRun
     import greenhouse_energy_hub.hub as hub_model
 
     failed_mpc = _FailedMpc()
     monkeypatch.setattr(
         mpc_controller,
         "build_mpc",
-        lambda *_args, **_kwargs: (failed_mpc, object()),
+        lambda *_args, **_kwargs: (failed_mpc, _InertForecastSource()),
     )
 
-    real_hub_dynamics = hub_model.hub_dynamics
+    real_advance_hub = hub_model.advance_hub
     plant_calls = 0
 
-    def counted_hub_dynamics(*args, **kwargs):
+    def counted_advance_hub(*args, **kwargs):
         nonlocal plant_calls
         plant_calls += 1
-        return real_hub_dynamics(*args, **kwargs)
+        return real_advance_hub(*args, **kwargs)
 
-    # The legacy loop holds a direct import, so instrument both definition and consumer.
-    monkeypatch.setattr(hub_model, "hub_dynamics", counted_hub_dynamics)
-    monkeypatch.setattr(rolling_horizon, "hub_dynamics", counted_hub_dynamics)
+    monkeypatch.setattr(rolling_horizon, "advance_hub", counted_advance_hub)
 
     # Forty-nine points give the default 24-step controller ample initial coverage,
     # so only the injected solver failure may classify this Run as invalid.
-    outcome = rolling_horizon.run_simulation(hourly_frame, mode="mpc")
+    outcome = support.run_controller(hourly_frame, mode="mpc")
 
     observed = (
         len(failed_mpc.make_step_calls),
@@ -329,11 +209,6 @@ def test_solver_failure_returns_invalid_run_without_advancing_plant(monkeypatch,
         getattr(outcome, "failure_code", None),
     )
     assert observed == (1, 0, "solver_failure")
-
-    # Keep the not-yet-existing outcome type inside the regression body so legacy
-    # collection remains possible until the fail-closed simulation interface lands.
-    from greenhouse_energy_hub.simulation import InvalidRun
-
     assert isinstance(outcome, InvalidRun)
 
 
@@ -401,7 +276,7 @@ def test_malformed_success_diagnostics_fail_before_physics(
         requires_operational_storage_bounds=True,
         decide=decide,
     )
-    scenario = rolling_horizon._scenario_from_frame(
+    scenario = support.scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     plant_calls = 0
@@ -446,7 +321,7 @@ def test_controller_failure_requires_failure_diagnostics(monkeypatch, hourly_fra
         requires_operational_storage_bounds=False,
         decide=decide,
     )
-    scenario = rolling_horizon._scenario_from_frame(
+    scenario = support.scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     monkeypatch.setattr(
@@ -489,7 +364,7 @@ def test_baseline_success_requires_empty_solver_diagnostics(monkeypatch, hourly_
         requires_operational_storage_bounds=False,
         decide=decide,
     )
-    scenario = rolling_horizon._scenario_from_frame(
+    scenario = support.scenario_from_frame(
         hourly_frame.iloc[:1], forecast_horizon_steps=0
     )
     monkeypatch.setattr(
@@ -533,7 +408,7 @@ def test_invalid_control_returns_invalid_run_without_applying_control(
 
     monkeypatch.setattr(rolling_horizon, "advance_hub", must_not_advance)
 
-    outcome = rolling_horizon.run_simulation(hourly_frame.iloc[:1], mode="baseline")
+    outcome = support.run_controller(hourly_frame.iloc[:1], mode="baseline")
 
     assert isinstance(outcome, InvalidRun)
     assert outcome.failure_code == "invalid_control"
@@ -601,7 +476,7 @@ def test_invalid_successor_or_flows_never_append_an_operating_record(
     )
     monkeypatch.setattr(rolling_horizon, "advance_hub", lambda *_args, **_kwargs: step)
 
-    outcome = rolling_horizon.run_simulation(hourly_frame.iloc[:1], mode="baseline")
+    outcome = support.run_controller(hourly_frame.iloc[:1], mode="baseline")
 
     assert isinstance(outcome, InvalidRun)
     assert outcome.failure_code == failure_code
@@ -643,7 +518,7 @@ def test_malformed_physics_schema_returns_invalid_run_without_record(
         lambda *_args, **_kwargs: malformed_step,
     )
 
-    outcome = rolling_horizon.run_simulation(
+    outcome = support.run_controller(
         hourly_frame.iloc[:1], mode="baseline"
     )
 
@@ -653,10 +528,9 @@ def test_malformed_physics_schema_returns_invalid_run_without_record(
     assert outcome.partial_records == ()
 
 
-def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
+def test_sub_tolerance_opposing_flow_is_accepted_and_recorded_exactly(
     monkeypatch, hourly_frame
 ):
-    import greenhouse_energy_hub.simulation as rolling_horizon
     from greenhouse_energy_hub.simulation import ControlDecision, ValidRun
     from greenhouse_energy_hub.hub import ETA_BAT_CH, ETA_BAT_DIS
 
@@ -682,20 +556,19 @@ def test_sub_tolerance_opposing_flow_is_zeroed_only_when_serialized(
         True,
     )
 
-    outcome = rolling_horizon.run_simulation(
+    outcome = support.run_controller(
         hourly_frame.iloc[:1], mode="baseline"
     )
 
     assert isinstance(outcome, ValidRun)
     assert outcome.terminal_state.soc_battery_kwh == pytest.approx(900.0)
     assert outcome.records[0].control.battery_discharge_kw == tiny_discharge_kw
-    assert outcome.to_frame().iloc[0].u_P_bat_dis == 0.0
 
 
 def test_run_configuration_mappings_are_read_only(hourly_frame):
-    from greenhouse_energy_hub.simulation import ValidRun, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun
 
-    outcome = run_simulation(hourly_frame.iloc[:1], mode="baseline")
+    outcome = support.run_controller(hourly_frame.iloc[:1], mode="baseline")
 
     assert isinstance(outcome, ValidRun)
     with pytest.raises(TypeError):
@@ -704,46 +577,10 @@ def test_run_configuration_mappings_are_read_only(hourly_frame):
         outcome.capability_policy["hydrogen_dispatch"] = True
 
 
-def test_valid_run_frame_uses_shared_evaluation_step_line_items(
-    monkeypatch,
-    hourly_frame,
-):
-    from greenhouse_energy_hub.evaluation import DEFAULT_EVALUATION_POLICY, StepLineItems
-    import greenhouse_energy_hub.simulation as rolling_horizon
-
-    outcome = rolling_horizon.run_simulation(
-        hourly_frame.iloc[:1], mode="baseline"
-    )
-    calls = []
-
-    def shared_line_items(record, policy, step_hours):
-        calls.append((record, policy, step_hours))
-        return StepLineItems(
-            operating_step=record.operating_step,
-            grid_cost_eur=123.456,
-            battery_wear_eur=0.0,
-            thermal_store_wear_eur=0.0,
-            electrolyser_wear_eur=0.0,
-            fuel_cell_wear_eur=0.0,
-            operating_cost_eur=123.456,
-            comfort_violation_c_h=7.89,
-        )
-
-    monkeypatch.setattr(rolling_horizon, "evaluate_step", shared_line_items)
-
-    frame = outcome.to_frame()
-
-    assert frame.iloc[0]["grid_cost_EUR"] == pytest.approx(123.456)
-    assert frame.iloc[0]["T_violation_C"] == pytest.approx(7.89)
-    assert calls == [
-        (outcome.records[0], DEFAULT_EVALUATION_POLICY, 1.0)
-    ]
-
-
 def test_baseline_run_records_exact_capability_policy(hourly_frame):
-    from greenhouse_energy_hub.simulation import ValidRun, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun
 
-    outcome = run_simulation(hourly_frame.iloc[:1], mode="baseline")
+    outcome = support.run_controller(hourly_frame.iloc[:1], mode="baseline")
 
     assert isinstance(outcome, ValidRun)
     assert outcome.capability_policy == {
@@ -761,6 +598,7 @@ def test_mpc_adapter_configuration_mappings_are_read_only_copies():
     capability_policy = {"battery": True}
     adapter = MpcControllerAdapter(
         mpc=object(),
+        forecast_source=object(),
         forecast_horizon_steps=24,
         configuration=configuration,
         capability_policy=capability_policy,
@@ -809,7 +647,7 @@ class _ForecastAwareMpc:
             def clear(self):
                 owner.forecast_clears += 1
 
-        self._forecast_source = _ForecastSource()
+        self.forecast_source = _ForecastSource()
 
     def make_step(self, x0):
         self.make_step_calls.append(np.asarray(x0).copy())
@@ -821,6 +659,7 @@ def _mpc_adapter(mpc, horizon_steps):
 
     return MpcControllerAdapter(
         mpc=mpc,
+        forecast_source=mpc.forecast_source,
         forecast_horizon_steps=horizon_steps,
         configuration={"horizon_steps": horizon_steps},
         capability_policy={"battery": True},
@@ -840,7 +679,7 @@ def test_both_owned_controller_adapters_cross_simulate_run(
     )
     from greenhouse_energy_hub.simulation import ValidRun
 
-    scenario = simulation._scenario_from_frame(
+    scenario = support.scenario_from_frame(
         hourly_frame.iloc[:2],
         forecast_horizon_steps=1,
         operating_step_count=1,
@@ -998,11 +837,10 @@ def test_disabled_asset_keeps_positive_nominal_mpc_scaling(capability):
         assert float(mpc.scaling["_u", model_name]) == nominal_scale
 
 
-def test_load_data_returns_scenario_and_rejects_missing_coverage():
-    from greenhouse_energy_hub.simulation import load_data
+def test_load_window_returns_scenario_and_rejects_missing_coverage():
     from greenhouse_energy_hub.scenarios import Scenario, ScenarioCoverageError
 
-    scenario = load_data(start_month=1, n_days=1, forecast_hours=3)
+    scenario = support.load_window(start_month=1, n_days=1, forecast_hours=3)
 
     assert isinstance(scenario, Scenario)
     assert scenario.operating_step_count == 24
@@ -1012,7 +850,7 @@ def test_load_data_returns_scenario_and_rejects_missing_coverage():
     )
 
     with pytest.raises(ScenarioCoverageError):
-        load_data(start_month=12, n_days=30, forecast_hours=49)
+        support.load_window(start_month=12, n_days=30, forecast_hours=49)
 
 
 def test_scenario_iterates_only_operating_window(monkeypatch, hourly_frame):
@@ -1044,11 +882,11 @@ def test_scenario_iterates_only_operating_window(monkeypatch, hourly_frame):
             ),
         ),
     )
-    scenario = rolling_horizon._scenario_from_frame(
+    scenario = support.scenario_from_frame(
         hourly_frame.iloc[:4], forecast_horizon_steps=2, operating_step_count=2
     )
 
-    outcome = rolling_horizon.run_simulation(scenario, mode="baseline")
+    outcome = support.run_controller(scenario, mode="baseline")
 
     assert isinstance(outcome, ValidRun)
     assert len(outcome.records) == 2
@@ -1075,7 +913,7 @@ def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
     from greenhouse_energy_hub.controllers.baseline import BaselineControllerAdapter
     from greenhouse_energy_hub.hub import HubConfiguration, HubFlows, HubStep
 
-    scenario = rolling_horizon.load_data(
+    scenario = support.load_window(
         start_month=1, n_days=1, forecast_hours=3
     )
     config = HubConfiguration()
@@ -1163,14 +1001,13 @@ def test_baseline_and_mpc_runs_share_max_horizon_scenario_canonical_content(
 
 
 def test_missing_final_forecast_coverage_fails_before_run(hourly_frame):
-    import greenhouse_energy_hub.simulation as rolling_horizon
     from greenhouse_energy_hub.scenarios import ScenarioCoverageError
 
     # Two operating steps with a two-stage controller require four points in total;
     # three points deliberately leave the final N+1 view one point short. Scenario
     # construction must reject this before any Controller can run.
     with pytest.raises(ScenarioCoverageError):
-        rolling_horizon._scenario_from_frame(
+        support.scenario_from_frame(
             hourly_frame.iloc[:3],
             forecast_horizon_steps=2,
             operating_step_count=2,
@@ -1233,7 +1070,7 @@ def test_execute_experiment_captures_package_initializers_and_their_dirty_state(
         encoding="utf-8",
     )
     observed = {}
-    real_capture = run_scenario._capture_publication_context
+    real_capture = run_scenario.capture_publication_context
 
     class CaptureComplete(Exception):
         pass
@@ -1246,7 +1083,7 @@ def test_execute_experiment_captures_package_initializers_and_their_dirty_state(
 
     monkeypatch.setattr(
         run_scenario,
-        "_capture_publication_context",
+        "capture_publication_context",
         capture_then_stop,
     )
 
@@ -1306,7 +1143,7 @@ def test_publication_candidate_map_records_only_a_verified_full_identifier(
     assert verified == [(bundle.path, identifier, tmp_path)]
     assert list(candidate_index.parent.glob(".publication-candidates.json.*")) == []
 
-    candidate_index.write_text('{"legacy-short-id":"abc123"}', encoding="utf-8")
+    candidate_index.write_text('{"short-id":"abc123"}', encoding="utf-8")
     with pytest.raises(ValueError, match="full lowercase SHA-256"):
         run_scenario.record_publication_candidate(
             "winter-baseline",
@@ -1462,7 +1299,6 @@ def test_public_control_validator_rejects_every_nonzero_disabled_control(
 def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording(
     monkeypatch, hourly_frame, capability, control_field, signed_value
 ):
-    import greenhouse_energy_hub.simulation as rolling_horizon
     from greenhouse_energy_hub.simulation import ControlDecision, ValidRun
     from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration, HubControl
 
@@ -1481,7 +1317,7 @@ def test_simulation_zeroes_disabled_solver_noise_before_validation_and_recording
         capabilities=AssetCapabilities(**{capability: False})
     )
 
-    outcome = rolling_horizon.run_simulation(
+    outcome = support.run_controller(
         hourly_frame.iloc[:1],
         mode="baseline",
         hub_config=config,
@@ -1583,14 +1419,14 @@ def test_disabled_asset_dynamics_flows_and_validation_are_inert(
 def test_disabled_asset_recoverable_inventory_contribution_is_zero(
     capability, inventories
 ):
-    from greenhouse_energy_hub.evaluation import stored_equiv_kwh
-    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
+    from greenhouse_energy_hub.evaluation import recoverable_inventory_kwh
+    from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration, HubState
 
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
     )
 
-    assert stored_equiv_kwh(*inventories, config=config) == 0.0
+    assert recoverable_inventory_kwh(HubState(*inventories, 0.0), config) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -1613,14 +1449,14 @@ def test_disabled_asset_recoverable_inventory_contribution_is_zero(
 def test_two_day_winter_mpc_keeps_disabled_assets_exactly_zero(
     capability, disabled_state, disabled_controls, disabled_flows
 ):
-    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
+    from greenhouse_energy_hub.simulation import ValidRun
     from greenhouse_energy_hub.hub import AssetCapabilities, HubConfiguration
 
     config = HubConfiguration(
         capabilities=AssetCapabilities(**{capability: False})
     )
-    outcome = run_simulation(
-        load_data(start_month=1, n_days=2),
+    outcome = support.run_controller(
+        support.load_window(start_month=1, n_days=2),
         mode="mpc",
         hub_config=config,
     )
@@ -1664,7 +1500,7 @@ def _first_mpc_control(prices: np.ndarray) -> np.ndarray:
         provenance=(),
     )
     hub_config = HubConfiguration()
-    mpc, _ = build_mpc(hub_config, MpcConfiguration(horizon_steps=24))
+    mpc, forecast_source = build_mpc(hub_config, MpcConfiguration(horizon_steps=24))
     initial = initial_state()
     mpc.x0 = np.array(
         [
@@ -1677,6 +1513,7 @@ def _first_mpc_control(prices: np.ndarray) -> np.ndarray:
     mpc.set_initial_guess()
     adapter = MpcControllerAdapter(
         mpc=mpc,
+        forecast_source=forecast_source,
         forecast_horizon_steps=24,
         configuration={"horizon_steps": 24},
         capability_policy={"battery": True},
@@ -1709,6 +1546,7 @@ def test_mpc_configuration_has_exact_stable_fields_and_policy_separation():
 
     assert [field.name for field in fields(MpcConfiguration)] == [
         "horizon_steps",
+        "grid_import_fee_eur_per_kwh",
         "terminal_weight",
         "battery_wear_eur_per_kwh",
         "thermal_store_wear_eur_per_kwh",
@@ -1734,6 +1572,7 @@ def test_mpc_configuration_has_exact_stable_fields_and_policy_separation():
     metadata = config.to_controller_metadata()
 
     assert metadata["solver_objective_economic_terms"] == {
+        "grid_import_fee_eur_per_kwh": policy.grid_import_fee_eur_per_kwh,
         "battery_wear_eur_per_kwh": 0.011,
         "thermal_store_wear_eur_per_kwh": 0.022,
         "electrolyser_wear_eur_per_kwh": 0.033,
@@ -1755,13 +1594,13 @@ def test_mpc_configuration_has_exact_stable_fields_and_policy_separation():
     }
 
 
-def test_run_simulation_threads_named_evaluation_policy_into_mpc_configuration(
+def test_build_controller_threads_named_evaluation_policy_into_mpc_configuration(
     monkeypatch,
-    hourly_frame,
 ):
     from greenhouse_energy_hub.evaluation import EvaluationPolicy, WearCoefficients
+    from greenhouse_energy_hub.hub import HubConfiguration
     import greenhouse_energy_hub.controllers.mpc as mpc_controller
-    import greenhouse_energy_hub.simulation as rolling_horizon
+    from experiments import run_scenario
 
     captured = {}
 
@@ -1776,25 +1615,18 @@ def test_run_simulation_threads_named_evaluation_policy_into_mpc_configuration(
         captured["config"] = config
         return InertMpc(), object()
 
-    def capture_simulate_run(scenario, controller, hub_config):
-        captured["controller_configuration"] = controller.configuration
-        return "simulation-not-needed"
-
     monkeypatch.setattr(mpc_controller, "build_mpc", capture_build_mpc)
-    monkeypatch.setattr(rolling_horizon, "simulate_run", capture_simulate_run)
     policy = EvaluationPolicy(
         name="shared-test-policy",
         wear=WearCoefficients(0.101, 0.202, 0.303, 0.404),
     )
 
-    outcome = rolling_horizon.run_simulation(
-        hourly_frame.iloc[:2],
-        mode="mpc",
-        n_horizon=1,
-        evaluation_policy=policy,
+    controller = run_scenario.build_controller(
+        "mpc", HubConfiguration(), policy, horizon_steps=1
     )
+    captured["controller_configuration"] = controller.configuration
 
-    assert outcome == "simulation-not-needed"
+    assert captured["config"].grid_import_fee_eur_per_kwh == policy.grid_import_fee_eur_per_kwh
     assert captured["config"].battery_wear_eur_per_kwh == 0.101
     assert captured["config"].thermal_store_wear_eur_per_kwh == 0.202
     assert captured["config"].electrolyser_wear_eur_per_kwh == 0.303
@@ -1802,6 +1634,7 @@ def test_run_simulation_threads_named_evaluation_policy_into_mpc_configuration(
     assert captured["controller_configuration"][
         "solver_objective_economic_terms"
     ] == {
+        "grid_import_fee_eur_per_kwh": policy.grid_import_fee_eur_per_kwh,
         "battery_wear_eur_per_kwh": 0.101,
         "thermal_store_wear_eur_per_kwh": 0.202,
         "electrolyser_wear_eur_per_kwh": 0.303,

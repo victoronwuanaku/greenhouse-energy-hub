@@ -3,9 +3,9 @@ Fetch hourly solar PV generation data from the PVGIS API (EU JRC).
 
 Location: Westland glasshouse district, Netherlands (52.0°N, 4.25°E).
 System:   1 kWp crystalline silicon, 30° tilt, south-facing, 14% system loss.
-Year:     2020 (most recent full year in PVGIS-SARAH2 database; API caps at 2020).
-          Price data uses 2023 — datasets are reindexed to a common 8760-hour
-          timeline in rolling_horizon.py. Climatically representative for NL.
+Year:     2020 (most recent full year in the PVGIS-SARAH2 database). Price data
+          uses 2023; ``scenarios.py`` transplants the 2020 PV/weather series onto
+          the 2023 operating clock by calendar instant.
 
 Output: data/source/pv_profile.csv
     Columns: timestamp (UTC), P_kW (AC power per kWp), G_Wm2 (irradiance W/m²),
@@ -33,7 +33,7 @@ from greenhouse_energy_hub.scenarios import (
 LAT = 52.0
 LON = 4.25
 YEAR = 2020  # PVGIS-SARAH2 available 2005–2020
-PEAK_POWER_KWP = 1.0   # normalised to 1 kWp; scale in hub_model.py
+PEAK_POWER_KWP = 1.0   # normalised to 1 kWp; scaled by PV_CAPACITY_KWP in scenarios.py
 TILT = 30              # degrees from horizontal
 ASPECT = 0             # 0 = south-facing
 LOSS = 14              # system losses (%)

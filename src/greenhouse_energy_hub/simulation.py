@@ -1,100 +1,41 @@
 """
-Rolling-horizon simulation loop for the greenhouse energy hub MPC.
+Rolling-horizon simulation loop for the greenhouse energy hub.
 
-Workflow
---------
-1. Load aligned PV, weather, price and electrical-demand data for a window.
-2. Initialise hub state (battery, H2, TES, indoor temperature).
-3. At each timestep k:
-   a. (MPC) solve the N-step optimisation with perfect-foresight forecasts,
-      apply the first control action; (baseline) apply the rule-based action.
-   b. Advance the plant through the shared numerical hub adapter.
-   c. Record states, controls, costs and diagnostics.
-4. Return a Valid Run or explicit Invalid Run for the evaluation Module.
+At each operating step the controller is asked for a decision from the current
+Hub State and its forecast view; the decision is validated, the plant advances
+through the shared hub physics, and the reached flows and state are validated
+before being recorded. Any failure ends the Run as an explicit ``InvalidRun``;
+only a fully validated rollout becomes a ``ValidRun``.
 
 Heat is implicit: there is no prescribed heat-demand series. Both controllers
-must keep the greenhouse temperature inside the comfort band by supplying heat
+keep the greenhouse temperature inside the comfort band by supplying heat
 (heat pump, e-boiler, fuel-cell heat, TES) and opening ventilation.
 
-The Baseline and MPC implementations live in ``controllers/`` and cross the same
-Controller Adapter seam. Their policy and solver details do not live here.
-
-Result schema note: each results frame has one row per simulated hour plus a final
-`is_terminal=True` row carrying the true terminal state (zero controls/cost, NaN
-exogenous inputs) so inventory settlement uses the real end state. Operating-step
-aggregations should filter `is_terminal == False`.
-
-The command-line entry point lives in ``experiments/run_scenario.py``. This
-module exposes simulation interfaces without owning CLI parsing or presentation.
+Controller implementations live in ``controllers/``; the command-line entry
+point is ``experiments/run_scenario.py``.
 """
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from numbers import Integral, Real
-from pathlib import Path
-from types import MappingProxyType
-from typing import Protocol, TypeAlias
+from typing import Protocol
 
 import numpy as np
-import pandas as pd
-
-ROOT = Path(__file__).resolve().parents[2]
 
 from greenhouse_energy_hub.hub import (
     ExogenousInputs, HubConfiguration, HubControl, HubFlows,
-    HubState, HubStep, ValidationIssue, advance_hub, hub_dynamics, hub_state_array,
+    HubState, HubStep, ValidationIssue, advance_hub,
     initial_state, normalize_control, validate_control, validate_flows,
     validate_successor, SOLVER_BOUND_TOLERANCE_KW,
-    DT_H,
-)
-from greenhouse_energy_hub.evaluation import (
-    DEFAULT_EVALUATION_POLICY,
-    EvaluationPolicy,
-    RunBundle,
-    _PublicationContext,
-    build_run_specification,
-    create_run_bundle,
-    evaluate_run,
-    evaluate_step,
-    write_failure_diagnostics,
 )
 from greenhouse_energy_hub.scenarios import (
+    JSONValue,
     Scenario,
     ScenarioCoverageError,
     ScenarioPoint,
-    ScenarioValidationError,
-    build_scenario,
+    freeze_json,
 )
-# NOTE: Controller Adapters are imported lazily inside run_simulation() so importing
-# the validated simulation Module does not pull in the do-mpc/IPOPT stack.
-
-# Decision variables solved by the MPC (P_grid is the derived slack bus, not a control)
-INPUT_NAMES = ["P_bat_ch", "P_bat_dis", "P_elz", "P_fc", "P_hp",
-               "P_eboiler", "Q_tes_ch", "Q_tes_dis", "vent"]
-
-JSONScalar: TypeAlias = str | int | float | bool | None
-JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
-
-
-def _read_only_mapping(
-    values: Mapping[str, JSONValue],
-) -> Mapping[str, JSONValue]:
-    def freeze(value: object) -> object:
-        if isinstance(value, Mapping):
-            return MappingProxyType(
-                {str(key): freeze(item) for key, item in value.items()}
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(freeze(item) for item in value)
-        return value
-
-    return freeze(values)
-
-
-# Temporary import aliases keep pre-migration characterization helpers importable;
-# both names resolve to the Scenario Module's real immutable types.
-_LegacyScenarioPoint = ScenarioPoint
 
 
 @dataclass(frozen=True)
@@ -175,17 +116,13 @@ class ValidRun:
         object.__setattr__(
             self,
             "controller_configuration",
-            _read_only_mapping(self.controller_configuration),
+            freeze_json(self.controller_configuration),
         )
         object.__setattr__(
             self,
             "capability_policy",
-            _read_only_mapping(self.capability_policy),
+            freeze_json(self.capability_policy),
         )
-
-    def to_frame(self) -> pd.DataFrame:
-        """Explicit legacy serialization, available only for a Valid Run."""
-        return _valid_run_to_frame(self)
 
 
 @dataclass(frozen=True)
@@ -205,107 +142,13 @@ class InvalidRun:
         object.__setattr__(
             self,
             "controller_configuration",
-            _read_only_mapping(self.controller_configuration),
+            freeze_json(self.controller_configuration),
         )
         object.__setattr__(
             self,
             "capability_policy",
-            _read_only_mapping(self.capability_policy),
+            freeze_json(self.capability_policy),
         )
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def load_data(
-    start_month: int = 6,
-    n_days: int = 14,
-    forecast_hours: int = 24,
-) -> Scenario:
-    """Build the legacy month/day request through the validated Scenario path.
-
-    The acquired 2023 price bytes begin at 2023-01-01T00:00Z, one hour after
-    January 1 local midnight.  January requests therefore start January 2 local,
-    the first complete local-midnight window; direct ``build_scenario`` calls for
-    January 1 fail closed and never clamp or synthesize the missing instant.
-    """
-    if isinstance(start_month, bool) or not isinstance(start_month, Integral):
-        raise ValueError("start_month must be an integer from 1 through 12")
-    if not 1 <= int(start_month) <= 12:
-        raise ValueError("start_month must be an integer from 1 through 12")
-    if isinstance(n_days, bool) or not isinstance(n_days, Integral) or n_days <= 0:
-        raise ValueError("n_days must be a positive integer")
-    if (
-        isinstance(forecast_hours, bool)
-        or not isinstance(forecast_hours, Integral)
-        or forecast_hours < 0
-    ):
-        raise ValueError("forecast_hours must be a nonnegative integer")
-
-    start_day = 2 if int(start_month) == 1 else 1
-    start = pd.Timestamp(
-        f"2023-{int(start_month):02d}-{start_day:02d} 00:00",
-        tz="Europe/Amsterdam",
-    )
-    return build_scenario(
-        name=scenario_tag(int(start_month), int(n_days)),
-        operating_start=start,
-        calendar_days=int(n_days),
-        max_horizon_steps=int(forecast_hours),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Simulation loop
-# ---------------------------------------------------------------------------
-def _timestamp_utc(value: object) -> datetime:
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        raise ScenarioValidationError(
-            "frame compatibility timestamps must be timezone-aware"
-        )
-    timestamp = timestamp.tz_convert(timezone.utc)
-    return timestamp.to_pydatetime()
-
-
-def _scenario_from_frame(
-    frame: pd.DataFrame,
-    forecast_horizon_steps: int,
-    operating_step_count: int | None = None,
-) -> Scenario:
-    points = tuple(
-        ScenarioPoint(
-            timestamp_utc=_timestamp_utc(timestamp),
-            price_eur_per_kwh=float(row.price_EUR_kWh),
-            pv_kw=float(row.P_pv_kW),
-            electric_load_kw=float(row.P_elec_kW),
-            outdoor_temperature_c=float(row.T_out_C),
-            irradiance_w_per_m2=float(row.G_Wm2),
-        )
-        for timestamp, row in frame.iterrows()
-    )
-    if not points:
-        raise ValueError("simulation frame must contain at least one operating step")
-    if operating_step_count is None:
-        operating_step_count = len(points)
-    if not 0 < operating_step_count <= len(points):
-        raise ValueError(
-            "operating_step_count must be positive and no greater than point count"
-        )
-    duration = timedelta(hours=DT_H)
-    return Scenario(
-        name="frame_compatibility",
-        operating_start=points[0].timestamp_utc,
-        operating_end=points[operating_step_count - 1].timestamp_utc + duration,
-        forecast_end=points[operating_step_count - 1].timestamp_utc
-        + duration
-        + forecast_horizon_steps * duration,
-        forecast_horizon_capacity_steps=forecast_horizon_steps,
-        step_duration=duration,
-        operating_step_count=operating_step_count,
-        points=points,
-        provenance=(),
-    )
 
 
 def _invalid_run(
@@ -730,8 +573,8 @@ def simulate_run(
                 diagnostics,
             )
 
-        # Gate 2: absorb only accepted solver-bound noise, including residuals on
-        # Disabled Asset fields, then apply the exact configured public validator.
+        # Gate 2: clip solver noise within tolerance (including on Disabled Asset
+        # fields), then validate the control against the configured bounds.
         try:
             control = normalize_control(
                 decision.control,
@@ -766,7 +609,7 @@ def simulate_run(
                 diagnostics,
             )
 
-        # Gate 3: evaluate existing hub physics only after the control is accepted.
+        # Gate 3: advance the plant only with an accepted control.
         try:
             exogenous = _exogenous_from_point(forecast[0])
             step = advance_hub(state, control, exogenous, hub_config)
@@ -856,219 +699,3 @@ def simulate_run(
             issues=(),
         ),
     )
-
-
-def _valid_run_to_frame(run: ValidRun) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    step_hours = run.scenario.step_duration.total_seconds() / 3600.0
-    for record in run.records:
-        serialized_control = normalize_control(
-            record.control,
-            run.hub_configuration,
-        )
-        line_items = evaluate_step(
-            record,
-            DEFAULT_EVALUATION_POLICY,
-            step_hours,
-        )
-        grid_kw = float(record.flows.grid_kw)
-        price = float(record.exogenous.price_eur_per_kwh)
-        row = {
-            "timestamp": pd.Timestamp(record.timestamp_utc),
-            "SOC_bat_kWh": float(record.start_state.soc_battery_kwh),
-            "SOC_h2_kg": float(record.start_state.soc_hydrogen_kg),
-            "SOC_tes_kWh": float(record.start_state.soc_thermal_kwh),
-            "T_in_C": float(record.start_state.indoor_temperature_c),
-            **{
-                f"u_{name}": float(value)
-                for name, value in serialized_control.items()
-            },
-            "u_P_grid": grid_kw,
-            "P_pv_kW": float(record.exogenous.pv_kw),
-            "P_load_kW": float(record.exogenous.electric_load_kw),
-            "price_EUR_kWh": price,
-            "T_out_C": float(record.exogenous.outdoor_temperature_c),
-            "G_Wm2": float(record.exogenous.irradiance_w_per_m2),
-            "grid_cost_EUR": line_items.grid_cost_eur,
-            "elec_residual_kW": 0.0,
-            "Q_air_kW": float(record.flows.heat_to_air_kw),
-            "T_violation_C": line_items.comfort_violation_c_h,
-            "is_terminal": False,
-        }
-        rows.append(row)
-
-    terminal_timestamp = (
-        pd.Timestamp(rows[-1]["timestamp"]) + run.scenario.step_duration
-        if rows
-        else pd.Timestamp(run.scenario.operating_start)
-    )
-    terminal = run.terminal_state
-    rows.append(
-        {
-            "timestamp": terminal_timestamp,
-            "SOC_bat_kWh": float(terminal.soc_battery_kwh),
-            "SOC_h2_kg": float(terminal.soc_hydrogen_kg),
-            "SOC_tes_kWh": float(terminal.soc_thermal_kwh),
-            "T_in_C": float(terminal.indoor_temperature_c),
-            **{f"u_{name}": 0.0 for name in INPUT_NAMES},
-            "u_P_grid": 0.0,
-            "P_pv_kW": np.nan,
-            "P_load_kW": np.nan,
-            "price_EUR_kWh": np.nan,
-            "T_out_C": np.nan,
-            "G_Wm2": np.nan,
-            "grid_cost_EUR": 0.0,
-            "elec_residual_kW": 0.0,
-            "Q_air_kW": np.nan,
-            "T_violation_C": 0.0,
-            "is_terminal": True,
-        }
-    )
-    return pd.DataFrame(rows).set_index("timestamp")
-
-
-def run_simulation(
-    data: Scenario | pd.DataFrame,
-    mode: str = "mpc",
-    hub_config: HubConfiguration = HubConfiguration(),
-    evaluation_policy: EvaluationPolicy = DEFAULT_EVALUATION_POLICY,
-    **mpc_kwargs: object,
-) -> ValidRun | InvalidRun:
-    """Run one Controller against a Scenario (or a test-only frame adapter)."""
-    if mode not in ("mpc", "baseline"):
-        raise ValueError(f"Unknown mode: {mode}")
-    if not isinstance(evaluation_policy, EvaluationPolicy):
-        raise TypeError("evaluation_policy must be an EvaluationPolicy")
-
-    if mode == "baseline":
-        from greenhouse_energy_hub.controllers.baseline import (
-            BaselineControllerAdapter,
-        )
-
-        if mpc_kwargs:
-            unexpected = ", ".join(sorted(mpc_kwargs))
-            raise TypeError(f"unexpected Baseline options: {unexpected}")
-        controller: ControllerAdapter = BaselineControllerAdapter(hub_config)
-        if isinstance(data, Scenario):
-            scenario = data
-        elif isinstance(data, pd.DataFrame):
-            scenario = _scenario_from_frame(
-                data,
-                controller.forecast_horizon_steps,
-                operating_step_count=len(data),
-            )
-        else:
-            raise TypeError("data must be a Scenario or DataFrame")
-        return simulate_run(scenario, controller, hub_config)
-
-    from greenhouse_energy_hub.controllers.mpc import (
-        MpcConfiguration,
-        MpcControllerAdapter,
-        N_HORIZON,
-        build_mpc,
-    )
-
-    horizon_steps = int(mpc_kwargs.get("n_horizon", N_HORIZON))
-    config_field_names = {field.name for field in fields(MpcConfiguration)}
-    unexpected = set(mpc_kwargs) - config_field_names - {"n_horizon"}
-    if unexpected:
-        names = ", ".join(sorted(unexpected))
-        raise TypeError(
-            f"unexpected MPC options: {names}; pass asset capabilities via "
-            "hub_config"
-        )
-    economic_field_names = {
-        "battery_wear_eur_per_kwh",
-        "thermal_store_wear_eur_per_kwh",
-        "electrolyser_wear_eur_per_kwh",
-        "fuel_cell_wear_eur_per_kwh",
-    }
-    economic_overrides = economic_field_names.intersection(mpc_kwargs)
-    if economic_overrides:
-        names = ", ".join(sorted(economic_overrides))
-        raise TypeError(
-            f"MPC wear terms come from evaluation_policy, not overrides: {names}"
-        )
-    config_values = {
-        key: value
-        for key, value in mpc_kwargs.items()
-        if key in config_field_names and key not in economic_field_names
-    }
-    config_values["horizon_steps"] = horizon_steps
-    mpc_config = MpcConfiguration.from_evaluation_policy(
-        evaluation_policy,
-        **config_values,
-    )
-    mpc, _ = build_mpc(
-        hub_config,
-        mpc_config,
-    )
-    mpc.x0 = hub_state_array(initial_state(hub_config))
-    mpc.set_initial_guess()
-    controller = MpcControllerAdapter(
-        mpc=mpc,
-        forecast_horizon_steps=horizon_steps,
-        configuration=mpc_config.to_controller_metadata(),
-        capability_policy=asdict(hub_config.capabilities),
-    )
-    if isinstance(data, Scenario):
-        scenario = data
-    elif isinstance(data, pd.DataFrame):
-        operating_step_count = len(data) - horizon_steps
-        if operating_step_count <= 0:
-            raise ScenarioCoverageError(
-                "frame compatibility requires Operating Steps plus explicit "
-                "Forecast Coverage"
-            )
-        scenario = _scenario_from_frame(
-            data,
-            horizon_steps,
-            operating_step_count=operating_step_count,
-        )
-    else:
-        raise TypeError("data must be a Scenario or DataFrame")
-    return simulate_run(scenario, controller, hub_config)
-
-
-def _persist_outcome(
-    outcome: ValidRun | InvalidRun,
-    evaluation_policy: EvaluationPolicy,
-    *,
-    results_root: str | Path,
-    executable_paths: tuple[str | Path, ...],
-    repository_root: str | Path = ROOT,
-    publication_context: _PublicationContext | None = None,
-) -> RunBundle | Path:
-    """Route valid evidence to Runs and failed evidence to diagnostics."""
-    specification = build_run_specification(
-        outcome,
-        evaluation_policy,
-        executable_paths=executable_paths,
-        repository_root=repository_root,
-        _publication_context=publication_context,
-    )
-    root = Path(results_root)
-    if isinstance(outcome, ValidRun):
-        report = evaluate_run(outcome, evaluation_policy)
-        return create_run_bundle(
-            outcome,
-            report,
-            specification,
-            root / "runs",
-            repository_root=repository_root,
-        )
-    return write_failure_diagnostics(
-        outcome,
-        specification,
-        root / "diagnostics",
-        policy=evaluation_policy,
-    )
-
-
-def scenario_tag(start_month: int, n_days: int) -> str:
-    """Human-readable scenario label, e.g. 'winter_m01_14d'."""
-    season = {12: "winter", 1: "winter", 2: "winter",
-              3: "spring", 4: "spring", 5: "spring",
-              6: "summer", 7: "summer", 8: "summer",
-              9: "autumn", 10: "autumn", 11: "autumn"}[start_month]
-    return f"{season}_m{start_month:02d}_{n_days}d"

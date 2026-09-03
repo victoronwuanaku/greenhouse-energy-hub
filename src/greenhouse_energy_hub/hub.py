@@ -5,9 +5,10 @@ Framework: Geidl & Andersson (2007) energy hub formulation.
 Location:  Representative Dutch (Westland) greenhouse, Netherlands (1 ha high-tech).
 
 This module defines the physical plant: asset sizing, control/state bounds, and the
-discrete-time state-transition function used by both the MPC internal model
-(`src/greenhouse_energy_hub/controllers/mpc.py`, CasADi adapter) and the rolling-horizon numerical
-simulation (`src/greenhouse_energy_hub/simulation.py`).
+discrete-time state-transition function. ``hub_step_expressions`` is written in
+arithmetic that works on both floats and CasADi symbols, so the MPC internal model
+(``controllers/mpc.py``) and the numerical plant (``advance_hub``, used by
+``simulation.py``) share one set of physics.
 
 Energy carriers
 ---------------
@@ -293,7 +294,7 @@ GRID_P_MAX_KW = 2000.0       # grid connection capacity (+- )
 GRID_IMPORT_FEE_EUR_KWH = 0.025
 
 # ---------------------------------------------------------------------------
-# Greenhouse thermal model (single setpoint ODE; WUR-informed parameterisation)
+# Greenhouse thermal model (single-zone ODE; indicative parameterisation)
 # ---------------------------------------------------------------------------
 FLOOR_AREA_M2 = 10_000.0
 C_AIR_KJ_K = 7.5 * FLOOR_AREA_M2     # air+mass heat capacity: 7.5 kJ/(m2.K) total
@@ -309,7 +310,7 @@ U_EFF_KW_K = 35.0
 K_VENT_KW_K = 200.0
 
 # Sensible solar gain fraction of tilted-plane irradiance entering the air node
-# (glass transmission x shade screens x transpiration latent split). See README.
+# (glass transmission x shade screens x transpiration latent split).
 SOLAR_GAIN_FRAC = 0.08
 
 # Constant latent heat withdrawal from crop transpiration [kW]
@@ -406,24 +407,8 @@ def control_bounds(config: HubConfiguration) -> dict[str, tuple[float, float]]:
             else (0.0, 0.0)
         ),
         "ventilation_fraction": (0.0, 1.0),
-        # P_grid is NOT a control: it is the derived slack bus (see hub_dynamics).
+        # P_grid is not a control: it is the derived slack bus (see advance_hub).
     }
-
-
-def state_bounds(
-    config: HubConfiguration = HubConfiguration(),
-) -> dict[str, tuple[float, float]]:
-    """Legacy model-name view of MPC operational state bounds."""
-    stable = operational_state_bounds(config)
-    return {STATE_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
-
-
-def input_bounds(
-    config: HubConfiguration = HubConfiguration(),
-) -> dict[str, tuple[float, float]]:
-    """Legacy model-name view of physical control bounds."""
-    stable = control_bounds(config)
-    return {CONTROL_MODEL_NAMES[field]: bounds for field, bounds in stable.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -488,78 +473,6 @@ def greenhouse_temperature_next(T_in, Q_air, vent, T_out):
     C = C_AIR_KWH_K / DT_H
     Geff = U_EFF_KW_K + K_VENT_KW_K * vent
     return (C * T_in + Q_air + Geff * T_out - Q_CROP_LATENT_KW) / (C + Geff)
-
-
-# ---------------------------------------------------------------------------
-# Discrete-time state update (Euler, Δt = 1 h)  — the "plant"
-# ---------------------------------------------------------------------------
-def hub_dynamics(
-    x: Mapping[str, object],
-    u: Mapping[str, object],
-    p: Mapping[str, object],
-    config: HubConfiguration = HubConfiguration(),
-) -> tuple[dict[str, object], dict[str, object]]:
-    """Temporary dictionary compatibility wrapper over :func:`advance_hub`.
-
-    Exact realized maxima and legacy presentation metrics intentionally live here,
-    outside the shared expression layer consumed by CasADi.
-    """
-    state = HubState(
-        soc_battery_kwh=x["SOC_bat"],
-        soc_hydrogen_kg=x["SOC_h2"],
-        soc_thermal_kwh=x["SOC_tes"],
-        indoor_temperature_c=x["T_in"],
-    )
-    control = HubControl(
-        battery_charge_kw=u["P_bat_ch"],
-        battery_discharge_kw=u["P_bat_dis"],
-        electrolyser_kw=u["P_elz"],
-        fuel_cell_kw=u["P_fc"],
-        heat_pump_kw=u["P_hp"],
-        electric_boiler_kw=u["P_eboiler"],
-        thermal_charge_kw=u["Q_tes_ch"],
-        thermal_discharge_kw=u["Q_tes_dis"],
-        ventilation_fraction=u["vent"],
-    )
-    exogenous = ExogenousInputs(
-        pv_kw=p["P_pv"],
-        electric_load_kw=p["P_load"],
-        price_eur_per_kwh=p.get("price", 0.0),
-        outdoor_temperature_c=p["T_out"],
-        irradiance_w_per_m2=p.get("G_Wm2", 0.0),
-    )
-    step = advance_hub(state, control, exogenous, config)
-    conversions = _hub_conversions(control, config)
-    grid_kw = step.flows.grid_kw
-    reached_temperature = step.successor.indoor_temperature_c
-    thermal_charge_excess = max(0.0, step.flows.thermal_charge_margin_kw)
-
-    return (
-        {
-            "SOC_bat": step.successor.soc_battery_kwh,
-            "SOC_h2": step.successor.soc_hydrogen_kg,
-            "SOC_tes": step.successor.soc_thermal_kwh,
-            "T_in": step.successor.indoor_temperature_c,
-        },
-        {
-            "P_grid_kW": grid_kw,
-            "elec_residual_kW": 0.0,
-            "tes_charge_excess_kW": thermal_charge_excess,
-            "Q_hp_kW": conversions.heat_pump_heat_kw,
-            "Q_eboiler_kW": conversions.electric_boiler_heat_kw,
-            "Q_fc_heat_kW": conversions.fuel_cell_heat_kw,
-            "Q_air_kW": step.flows.heat_to_air_kw,
-            "m_h2_prod_kg_h": step.flows.hydrogen_production_kg_per_h,
-            "m_h2_fc_kg_h": step.flows.hydrogen_consumption_kg_per_h,
-            "grid_cost_EUR": (
-                grid_kw * exogenous.price_eur_per_kwh
-                + GRID_IMPORT_FEE_EUR_KWH * max(0.0, grid_kw)
-            )
-            * DT_H,
-            "T_violation_C": max(0.0, reached_temperature - T_MAX_C)
-            + max(0.0, T_MIN_C - reached_temperature),
-        },
-    )
 
 
 # ---------------------------------------------------------------------------

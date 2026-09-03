@@ -1,14 +1,16 @@
-"""Limited-capability Baseline Controller Adapter.
+"""Limited-capability baseline controller.
 
-The characterized frugal thermostat and battery rule remain intentionally
-unchanged.  Its exact missing capabilities are explicit policy metadata rather
-than an implicit claim of capability-equivalent Controller performance.
+A frugal thermostat that holds the lower comfort bound, plus a simple
+PV-charge / high-price-discharge battery rule. The capabilities it does not
+use (hydrogen, thermal-store charging, grid charging) are declared explicitly
+in ``BASELINE_CAPABILITY_POLICY`` so comparisons against it are qualified.
 """
 
 from collections.abc import Mapping
 
 from greenhouse_energy_hub.hub import (
     BAT_P_MAX_KW,
+    CONTROL_MODEL_NAMES,
     C_AIR_KWH_K,
     DT_H,
     EBOILER_P_MAX_KW,
@@ -27,22 +29,18 @@ from greenhouse_energy_hub.hub import (
     HubConfiguration,
     HubControl,
     HubState,
-    state_bounds,
+    operational_state_bounds,
 )
-from greenhouse_energy_hub.scenarios import ScenarioPoint
+from greenhouse_energy_hub.scenarios import JSONValue, ScenarioPoint, freeze_json
 from greenhouse_energy_hub.simulation import (
     ControlDecision,
     ControllerFailure,
     DecisionDiagnostics,
-    JSONValue,
-    _read_only_mapping,
 )
 
 
-# Limited-capability Baseline: a frugal thermostat that holds the lower comfort
-# bound. Its exact missing capabilities are declared by BaselineControllerAdapter.
 BASELINE_TARGET_C = T_MIN_C + 0.5
-BASELINE_CAPABILITY_POLICY: Mapping[str, JSONValue] = _read_only_mapping(
+BASELINE_CAPABILITY_POLICY: Mapping[str, JSONValue] = freeze_json(
     {
         "hydrogen_dispatch": False,
         "thermal_store_charging": False,
@@ -57,9 +55,11 @@ def baseline_control(
     p: Mapping[str, object],
     hub_config: HubConfiguration = HubConfiguration(),
 ) -> dict[str, object]:
-    """Naive reactive dispatch: hold the lower comfort bound (BASELINE_TARGET_C)
-    with HP/e-boiler/TES, plus a simple PV-charge / high-price-discharge battery rule."""
-    sb = state_bounds(hub_config)
+    """Reactive dispatch: hold BASELINE_TARGET_C with HP -> e-boiler -> TES
+    discharge, vent against overheating, and run the simple battery rule."""
+    bounds = operational_state_bounds(hub_config)
+    soc_bat_min, soc_bat_max = bounds["soc_battery_kwh"]
+    soc_tes_min = bounds["soc_thermal_kwh"][0]
     T_in, T_out, G = x["T_in"], p["T_out"], p["G_Wm2"]
     P_pv, P_load, price = p["P_pv"], p["P_load"], p["price"]
 
@@ -78,7 +78,7 @@ def baseline_control(
     Q_eb = min(rem, ETA_EBOILER * EBOILER_P_MAX_KW)
     P_eboiler = Q_eb / ETA_EBOILER
     rem -= Q_eb
-    tes_avail = max(0.0, x["SOC_tes"] - sb["SOC_tes"][0])
+    tes_avail = max(0.0, x["SOC_tes"] - soc_tes_min)
     Q_tes_dis = min(rem, TES_P_MAX_KW, tes_avail)
     Q_tes_ch = 0.0
 
@@ -93,8 +93,8 @@ def baseline_control(
     # Battery: charge PV surplus, discharge when expensive (clamped to SOC bounds)
     P_bat_ch = 0.0
     P_bat_dis = 0.0
-    headroom = max(0.0, sb["SOC_bat"][1] - x["SOC_bat"]) / (ETA_BAT_CH * DT_H)
-    available = max(0.0, x["SOC_bat"] - sb["SOC_bat"][0]) * ETA_BAT_DIS / DT_H
+    headroom = max(0.0, soc_bat_max - x["SOC_bat"]) / (ETA_BAT_CH * DT_H)
+    available = max(0.0, x["SOC_bat"] - soc_bat_min) * ETA_BAT_DIS / DT_H
     pv_surplus = P_pv - P_load - P_hp - P_eboiler
     if hub_config.capabilities.battery and pv_surplus > 0:
         P_bat_ch = min(BAT_P_MAX_KW, pv_surplus, headroom)
@@ -112,7 +112,7 @@ def baseline_control(
 
 class BaselineControllerAdapter:
     name = "baseline"
-    configuration: Mapping[str, JSONValue] = _read_only_mapping(
+    configuration: Mapping[str, JSONValue] = freeze_json(
         {"target_indoor_temperature_c": BASELINE_TARGET_C}
     )
     capability_policy = BASELINE_CAPABILITY_POLICY
@@ -130,7 +130,7 @@ class BaselineControllerAdapter:
         forecast: tuple[ScenarioPoint, ...],
     ) -> ControlDecision | ControllerFailure:
         point = forecast[0]
-        legacy_control = baseline_control(
+        control = baseline_control(
             state,
             {
                 "P_pv": point.pv_kw,
@@ -141,22 +141,13 @@ class BaselineControllerAdapter:
             },
             self._hub_config,
         )
-        stable_values = {
-            field_name: legacy_control[model_name]
-            for field_name, model_name in {
-                "battery_charge_kw": "P_bat_ch",
-                "battery_discharge_kw": "P_bat_dis",
-                "electrolyser_kw": "P_elz",
-                "fuel_cell_kw": "P_fc",
-                "heat_pump_kw": "P_hp",
-                "electric_boiler_kw": "P_eboiler",
-                "thermal_charge_kw": "Q_tes_ch",
-                "thermal_discharge_kw": "Q_tes_dis",
-                "ventilation_fraction": "vent",
-            }.items()
-        }
         return ControlDecision(
-            control=HubControl(**stable_values),
+            control=HubControl(
+                **{
+                    field_name: control[model_name]
+                    for field_name, model_name in CONTROL_MODEL_NAMES.items()
+                }
+            ),
             diagnostics=DecisionDiagnostics(
                 adapter="baseline",
                 decision_status="success",

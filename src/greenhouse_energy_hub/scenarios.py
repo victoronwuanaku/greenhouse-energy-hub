@@ -1,8 +1,8 @@
 """Validated Scenario construction, temporal semantics, and input provenance.
 
-This module is the single owner of the experiment clock.  Acquired price and
-PV/weather bytes are validated before alignment; electrical demand is derived
-from target timestamps rather than read from the legacy materialized CSV.
+This module owns the experiment clock.  Acquired price and PV/weather bytes are
+validated before alignment; electrical demand is derived from the target
+timestamps and aligned irradiance.
 """
 
 from __future__ import annotations
@@ -51,16 +51,16 @@ class ScenarioCoverageError(ScenarioValidationError):
     """A requested Operating Window lacks exact Forecast Coverage."""
 
 
-def _freeze_json(value: object) -> object:
+def freeze_json(value: object) -> object:
     """Copy JSON-like values into a deeply immutable representation."""
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError("provenance mapping keys must be strings")
         return MappingProxyType(
-            {key: _freeze_json(item) for key, item in value.items()}
+            {key: freeze_json(item) for key, item in value.items()}
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item) for item in value)
+        return tuple(freeze_json(item) for item in value)
     if isinstance(value, float) and not math.isfinite(value):
         raise TypeError("provenance numeric values must be finite")
     if value is None or isinstance(value, (str, bool, int, float)):
@@ -160,9 +160,9 @@ class SourceProvenance:
         object.__setattr__(
             self,
             "acquisition_parameters",
-            _freeze_json(dict(self.acquisition_parameters)),
+            freeze_json(dict(self.acquisition_parameters)),
         )
-        object.__setattr__(self, "units", _freeze_json(dict(self.units)))
+        object.__setattr__(self, "units", freeze_json(dict(self.units)))
         object.__setattr__(
             self,
             "transformations",
@@ -514,7 +514,7 @@ def _load_source_bundle(
     _sidecar_nonempty_string(source_metadata.get("url"), "source.url")
     parameters = _sidecar_mapping(metadata.get("parameters"), "parameters")
     try:
-        _freeze_json(parameters)
+        freeze_json(parameters)
     except TypeError as exc:
         raise ScenarioValidationError(
             f"{source_name} parameters must contain finite JSON values"
@@ -587,7 +587,7 @@ def _load_source_bundle(
         )
 
     try:
-        frozen_metadata = _freeze_json(dict(metadata))
+        frozen_metadata = freeze_json(dict(metadata))
     except TypeError as exc:
         raise ScenarioValidationError(
             f"{source_name} provenance contains non-JSON metadata"

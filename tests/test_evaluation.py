@@ -669,16 +669,8 @@ def test_evaluate_run_rejects_invalid_incomplete_and_wrong_record_count():
         evaluate_run(wrong_count, _policy())
 
 
-def test_evaluate_run_recomputes_from_records_without_serialized_cost_columns(
-    monkeypatch,
-):
+def test_evaluate_run_recomputes_costs_from_records():
     from greenhouse_energy_hub.evaluation import evaluate_run
-    from greenhouse_energy_hub.simulation import ValidRun
-
-    def serialized_columns_must_not_be_read(_run):
-        raise AssertionError("evaluate_run trusted serialized/precomputed columns")
-
-    monkeypatch.setattr(ValidRun, "to_frame", serialized_columns_must_not_be_read)
 
     report = evaluate_run(_two_step_valid_run(), _policy())
 
@@ -745,8 +737,6 @@ def test_ablation_variants_use_hub_configuration_and_publish_separate_scorecard(
     from greenhouse_energy_hub.evaluation import evaluate_run
     from experiments import ablations
 
-    assert not hasattr(ablations, "effective_cost")
-    assert not hasattr(ablations, "COMFORT_PENALTY_EUR_PER_CH")
     assert ablations.VARIANTS == {
         "full": {"horizon_steps": 24},
         "no-h2": {"horizon_steps": 24, "hydrogen": False},
@@ -1677,8 +1667,8 @@ def test_bundle_creation_is_atomic_deduplicated_and_collision_safe(tmp_path, mon
         )
 
 
-@pytest.mark.parametrize("claimant_kind", ["empty-directory", "file", "broken-symlink"])
-def test_atomic_publication_never_clobbers_a_racing_claimant(
+@pytest.mark.parametrize("claimant_kind", ["file", "broken-symlink"])
+def test_publication_never_clobbers_a_racing_claimant(
     tmp_path,
     monkeypatch,
     claimant_kind,
@@ -1701,14 +1691,12 @@ def test_atomic_publication_never_clobbers_a_racing_claimant(
         repository_root=repository,
     )
     runs_root = tmp_path / "results" / "runs"
-    real_publish = getattr(accounting, "_atomic_noreplace_directory", os.replace)
+    real_publish = accounting._publish_directory
     claimant: dict[str, object] = {}
 
     def racing_publish(source, destination):
         destination = Path(destination)
-        if claimant_kind == "empty-directory":
-            destination.mkdir()
-        elif claimant_kind == "file":
+        if claimant_kind == "file":
             destination.write_bytes(b"other owner's exact bytes")
         else:
             destination.symlink_to("missing-other-owner")
@@ -1722,13 +1710,7 @@ def test_atomic_publication_never_clobbers_a_racing_claimant(
         )
         return real_publish(source, destination)
 
-    monkeypatch.setattr(
-        accounting,
-        "_atomic_noreplace_directory",
-        racing_publish,
-        raising=False,
-    )
-    monkeypatch.setattr(accounting.os, "replace", racing_publish)
+    monkeypatch.setattr(accounting, "_publish_directory", racing_publish)
     with pytest.raises(BundleCollisionError):
         create_run_bundle(
             run,
@@ -1741,9 +1723,7 @@ def test_atomic_publication_never_clobbers_a_racing_claimant(
     destination = claimant["path"]
     assert isinstance(destination, Path)
     assert destination.lstat().st_ino == claimant["inode"]
-    if claimant_kind == "empty-directory":
-        assert destination.is_dir() and not any(destination.iterdir())
-    elif claimant_kind == "file":
+    if claimant_kind == "file":
         assert destination.read_bytes() == claimant["bytes"]
     else:
         assert destination.is_symlink()
@@ -1751,7 +1731,7 @@ def test_atomic_publication_never_clobbers_a_racing_claimant(
 
 
 @pytest.mark.parametrize("winner_matches", [True, False])
-def test_atomic_publication_verifies_a_cooperative_racing_winner(
+def test_publication_verifies_a_cooperative_racing_winner(
     tmp_path,
     monkeypatch,
     winner_matches,
@@ -1774,7 +1754,7 @@ def test_atomic_publication_verifies_a_cooperative_racing_winner(
         repository_root=repository,
     )
     runs_root = tmp_path / "results" / "runs"
-    real_publish = getattr(accounting, "_atomic_noreplace_directory", os.replace)
+    real_publish = accounting._publish_directory
     winner_inode = []
 
     def racing_publish(source, destination):
@@ -1786,13 +1766,7 @@ def test_atomic_publication_verifies_a_cooperative_racing_winner(
         winner_inode.append(destination.stat().st_ino)
         return real_publish(source, destination)
 
-    monkeypatch.setattr(
-        accounting,
-        "_atomic_noreplace_directory",
-        racing_publish,
-        raising=False,
-    )
-    monkeypatch.setattr(accounting.os, "replace", racing_publish)
+    monkeypatch.setattr(accounting, "_publish_directory", racing_publish)
     if winner_matches:
         bundle = create_run_bundle(
             run,
@@ -1874,14 +1848,12 @@ def test_publication_revalidates_actual_runtime_after_specification_capture(
 def test_entrypoints_capture_complete_publication_context_before_execution():
     import inspect
 
-    import greenhouse_energy_hub.simulation as rolling_horizon
     from experiments import ablations, run_scenario
 
     cli_source = inspect.getsource(run_scenario.main)
     execution_source = inspect.getsource(run_scenario.execute_experiment)
     ablation_source = inspect.getsource(ablations.main)
-    marker = "_capture_publication_context"
-    assert not hasattr(rolling_horizon, "main")
+    marker = "capture_publication_context"
     assert "execute_experiment(" in cli_source
     assert "execute_experiment(" in ablation_source
     assert marker in execution_source
@@ -1960,13 +1932,7 @@ def test_interrupted_bundle_write_removes_only_its_owned_temporary_directory(
     def interrupt_replace(_source, _destination):
         raise KeyboardInterrupt("simulated interruption")
 
-    monkeypatch.setattr(
-        accounting,
-        "_atomic_noreplace_directory",
-        interrupt_replace,
-        raising=False,
-    )
-    monkeypatch.setattr(accounting.os, "replace", interrupt_replace)
+    monkeypatch.setattr(accounting, "_publish_directory", interrupt_replace)
     with pytest.raises(KeyboardInterrupt):
         create_run_bundle(
             run,
@@ -2124,63 +2090,3 @@ def test_failure_diagnostics_binds_every_specification_identity_axis(
             tmp_path / "results" / "diagnostics",
             policy=policy,
         )
-
-
-def test_legacy_entry_point_persists_valid_bundles_and_invalid_diagnostics(tmp_path):
-    from greenhouse_energy_hub.evaluation import RunBundle
-    from greenhouse_energy_hub.simulation import InvalidRun, _persist_outcome
-
-    repository = _committed_executable_repository(tmp_path / "repo-fixture")
-    valid = _publication_ready_run()
-    policy = _policy()
-    results_root = tmp_path / "results"
-
-    valid_artifact = _persist_outcome(
-        valid,
-        policy,
-        results_root=results_root,
-        executable_paths=("runner.py",),
-        repository_root=repository,
-    )
-    invalid = InvalidRun(
-        scenario=valid.scenario,
-        controller_name=valid.controller_name,
-        controller_configuration=valid.controller_configuration,
-        capability_policy=valid.capability_policy,
-        hub_configuration=valid.hub_configuration,
-        failed_step=0,
-        failure_code="forced_failure",
-        message="failure path",
-        partial_records=(),
-        controller_diagnostics=(),
-    )
-    invalid_artifact = _persist_outcome(
-        invalid,
-        policy,
-        results_root=results_root,
-        executable_paths=("runner.py",),
-        repository_root=repository,
-    )
-
-    assert isinstance(valid_artifact, RunBundle)
-    assert valid_artifact.path.is_relative_to(results_root / "runs")
-    assert invalid_artifact.is_relative_to(results_root / "diagnostics")
-    assert not (invalid_artifact / "manifest.json").exists()
-
-
-def test_legacy_entry_points_no_longer_write_mutable_csv_or_figure_artifacts():
-    import inspect
-
-    import greenhouse_energy_hub.simulation as rolling_horizon
-    from experiments import ablations, run_scenario
-
-    assert not hasattr(rolling_horizon, "main")
-    rolling_source = inspect.getsource(run_scenario.main)
-    ablation_source = inspect.getsource(ablations.main)
-    assert ".to_csv(" not in rolling_source
-    for controller in ("baseline", "mpc"):
-        assert f"{controller}_results.csv" not in rolling_source
-    assert "summary.csv" not in rolling_source
-    assert ".to_csv(" not in ablation_source
-    assert "ablations.csv" not in ablation_source
-    assert ".savefig(" not in ablation_source

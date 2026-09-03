@@ -1,4 +1,4 @@
-"""Evaluate the approved MPC ablations through the shared experiment path."""
+"""Run the winter MPC ablations (full, no-H2, no-TES, one-step horizon)."""
 
 from __future__ import annotations
 

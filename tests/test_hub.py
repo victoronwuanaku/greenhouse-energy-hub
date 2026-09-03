@@ -1,32 +1,24 @@
 """
 Physical and control invariants for the greenhouse energy hub.
 
-Two groups of tests:
-  1. Unit tests on the plant model (`hub_dynamics`) — fast, no solver.
+  1. Unit tests on the plant model (`advance_hub`) — fast, no solver.
   2. A short live MPC roll-out — builds the do-mpc controller and checks that the
      applied control respects the electricity balance and bounds.
-  3. Invariants on the saved simulation results (run rolling_horizon.py first):
-     balance ~0, no simultaneous charge/discharge, SOC within bounds, comfort band,
-     and MPC total cost <= baseline.
-
-Run:  pytest tests/ -q
+  3. A short two-controller integration run over committed data.
 """
-
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from greenhouse_energy_hub.hub import (
-    hub_dynamics, initial_state, state_bounds, input_bounds,
+    initial_state,
     ETA_ELZ, ETA_FC_E, E_H2_LHV_KWH_KG,
     BAT_CAPACITY_KWH, H2_CAPACITY_KG, TES_CAPACITY_KWH,
     T_HARD_MIN_C, T_HARD_MAX_C,
 )
-
-ROOT = Path(__file__).resolve().parent.parent
-RESULTS = ROOT / "results"
+from greenhouse_energy_hub.scenarios import ScenarioPoint
+from tests.support import hub_step, input_bounds, load_window, run_controller, run_to_frame
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +36,9 @@ def _sample_params():
     return {"P_pv": 80.0, "P_load": 600.0, "price": 0.10, "T_out": 5.0, "G_Wm2": 0.0}
 
 
-def test_characterizes_nominal_multicarrier_step_and_exact_import_fee():
-    """Freeze verified legacy plant outputs before the expression layer moves."""
-    x_next, metrics = hub_dynamics(initial_state(), _sample_controls(), _sample_params())
+def test_nominal_multicarrier_step_and_exact_import_fee():
+    """Pin the plant outputs for one nominal multi-carrier step."""
+    x_next, metrics = hub_step(initial_state(), _sample_controls(), _sample_params())
 
     assert x_next == pytest.approx(
         {
@@ -58,14 +50,12 @@ def test_characterizes_nominal_multicarrier_step_and_exact_import_fee():
     )
     assert metrics["P_grid_kW"] == pytest.approx(970.0)
     assert metrics["grid_cost_EUR"] == pytest.approx(121.25)
-    assert metrics["Q_hp_kW"] == pytest.approx(350.0)
-    assert metrics["Q_eboiler_kW"] == pytest.approx(198.0)
+    assert metrics["Q_gen_kW"] == pytest.approx(548.0)
     assert metrics["m_h2_prod_kg_h"] == pytest.approx(0.9750975097509752)
-    assert metrics["elec_residual_kW"] == pytest.approx(0.0, abs=1e-12)
 
 
-def test_characterizes_limited_baseline_policy_at_fixed_fixtures():
-    """Freeze policy decisions without endorsing legacy fairness claims."""
+def test_baseline_policy_at_fixed_fixtures():
+    """Pin the baseline rule's decisions at a cold/expensive and a sunny/cheap hour."""
     from greenhouse_energy_hub.controllers.baseline import baseline_control
 
     cold_expensive = baseline_control(
@@ -108,10 +98,9 @@ def test_characterizes_limited_baseline_policy_at_fixed_fixtures():
 def test_electricity_balance_is_exact():
     """Derived P_grid must close the electricity balance exactly (slack bus)."""
     x, u, p = initial_state(), _sample_controls(), _sample_params()
-    _, m = hub_dynamics(x, u, p)
+    _, m = hub_step(x, u, p)
     expected = (p["P_load"] + u["P_bat_ch"] + u["P_elz"] + u["P_hp"] + u["P_eboiler"]
                 - p["P_pv"] - u["P_bat_dis"] - u["P_fc"])
-    assert m["elec_residual_kW"] == pytest.approx(0.0, abs=1e-9)
     assert m["P_grid_kW"] == pytest.approx(expected, abs=1e-9)
 
 
@@ -120,7 +109,7 @@ def test_h2_mass_conservation():
     x = initial_state()
     u = {**_sample_controls(), "P_elz": 100.0, "P_fc": 40.0}
     p = _sample_params()
-    x_next, _ = hub_dynamics(x, u, p)
+    x_next, _ = hub_step(x, u, p)
     prod = ETA_ELZ * u["P_elz"] / E_H2_LHV_KWH_KG
     cons = (u["P_fc"] / ETA_FC_E) / E_H2_LHV_KWH_KG
     assert x_next["SOC_h2"] - x["SOC_h2"] == pytest.approx(prod - cons, rel=1e-9)
@@ -131,11 +120,11 @@ def test_tes_cannot_charge_from_nothing_flag():
     x = initial_state()
     u = {**_sample_controls(), "P_hp": 0.0, "P_eboiler": 0.0, "P_fc": 0.0,
          "Q_tes_ch": 100.0}                       # charging with zero generated heat
-    _, m = hub_dynamics(x, u, _sample_params())
+    _, m = hub_step(x, u, _sample_params())
     assert m["tes_charge_excess_kW"] > 0.0
     # With enough generation the flag clears
     u2 = {**u, "P_eboiler": 200.0}                # 200 * 0.99 ~ 198 kW heat > 100
-    _, m2 = hub_dynamics(x, u2, _sample_params())
+    _, m2 = hub_step(x, u2, _sample_params())
     assert m2["tes_charge_excess_kW"] == pytest.approx(0.0, abs=1e-9)
 
 
@@ -146,8 +135,8 @@ def test_temperature_update_is_bounded_and_warms_with_heat():
     cold = {**_sample_controls(), "P_hp": 0.0, "P_eboiler": 0.0,
             "Q_tes_ch": 0.0, "Q_tes_dis": 0.0}
     warm = {**cold, "P_hp": 175.0}                # full heat pump
-    t_cold = hub_dynamics(x, cold, p)[0]["T_in"]
-    t_warm = hub_dynamics(x, warm, p)[0]["T_in"]
+    t_cold = hub_step(x, cold, p)[0]["T_in"]
+    t_warm = hub_step(x, warm, p)[0]["T_in"]
     assert t_warm > t_cold                        # heating raises temperature
     assert T_HARD_MIN_C < t_cold < T_HARD_MAX_C   # remains finite/bounded
 
@@ -455,58 +444,13 @@ def test_shared_thermal_charge_margin_is_signed_and_validated_numerically():
     ]
 
 
-def test_legacy_wrapper_delegates_physics_and_conversions_to_shared_owners():
-    """Prevent compatibility metrics from becoming a second equation owner."""
-    import ast
-    import inspect
-    import textwrap
-
-    import greenhouse_energy_hub.hub as hub_model
-
-    wrapper_tree = ast.parse(
-        textwrap.dedent(inspect.getsource(hub_model.hub_dynamics))
-    )
-    expression_tree = ast.parse(
-        textwrap.dedent(inspect.getsource(hub_model.hub_step_expressions))
-    )
-
-    def called_functions(tree):
-        return {
-            node.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-
-    wrapper_calls = called_functions(wrapper_tree)
-    expression_calls = called_functions(expression_tree)
-    wrapper_names = {
-        node.id for node in ast.walk(wrapper_tree) if isinstance(node, ast.Name)
-    }
-
-    assert {"advance_hub", "_hub_conversions"} <= wrapper_calls
-    assert "_hub_conversions" in expression_calls
-    assert wrapper_names.isdisjoint(
-        {
-            "HP_COP",
-            "ETA_EBOILER",
-            "ETA_ELZ",
-            "ETA_FC_E",
-            "ETA_FC_H",
-            "E_H2_LHV_KWH_KG",
-        }
-    )
-    assert not hasattr(hub_model, "fuel_cell_outputs")
-
-
 # ---------------------------------------------------------------------------
 # 2. Short live MPC roll-out
 # ---------------------------------------------------------------------------
 def _mpc_forecast_points(price, pv, load, tout, irr):
-    from greenhouse_energy_hub.simulation import _LegacyScenarioPoint
-
     timestamps = pd.date_range("2023-01-01", periods=len(price), freq="h", tz="UTC")
     return tuple(
-        _LegacyScenarioPoint(
+        ScenarioPoint(
             timestamp_utc=timestamp.to_pydatetime(),
             price_eur_per_kwh=float(price_value),
             pv_kw=float(pv_value),
@@ -529,16 +473,17 @@ def _configured_mpc(horizon_steps=24):
     from greenhouse_energy_hub.hub import HubConfiguration
 
     config = MpcConfiguration(horizon_steps=horizon_steps)
-    mpc, model = build_mpc(HubConfiguration(), config)
+    mpc, forecast_source = build_mpc(HubConfiguration(), config)
     adapter = MpcControllerAdapter(
         mpc=mpc,
+        forecast_source=forecast_source,
         forecast_horizon_steps=horizon_steps,
         configuration={"horizon_steps": horizon_steps},
         capability_policy={"battery": True},
     )
     mpc.x0 = np.asarray(list(initial_state().values())).reshape(-1, 1)
     mpc.set_initial_guess()
-    return mpc, model, adapter
+    return mpc, adapter
 
 
 def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
@@ -553,7 +498,7 @@ def test_solver_stat_storage_preserves_required_stats_and_numeric_data():
         np.full(n, 5.0),
         np.zeros(n),
     )
-    mpc, _, adapter = _configured_mpc()
+    mpc, adapter = _configured_mpc()
     state = initial_state()
     x0 = np.array(
         [state["SOC_bat"], state["SOC_h2"], state["SOC_tes"], state["T_in"]]
@@ -603,7 +548,7 @@ def test_mpc_builds_steps_and_respects_balance():
     irr = np.zeros(n)
 
     forecast = _mpc_forecast_points(price, pv, load, tout, irr)
-    mpc, _, adapter = _configured_mpc()
+    mpc, adapter = _configured_mpc()
     x = initial_state()
 
     ib = input_bounds()
@@ -638,13 +583,14 @@ def test_mpc_builds_steps_and_respects_balance():
             assert lo - 1e-4 <= u[name] <= hi + 1e-4, f"{name} out of bounds: {u[name]}"
         p = {"P_pv": pv[k], "P_load": load[k], "price": price[k],
              "T_out": tout[k], "G_Wm2": irr[k]}
-        x, m = hub_dynamics(x, u, p)
-        assert m["elec_residual_kW"] == pytest.approx(0.0, abs=1e-6)
+        x, m = hub_step(x, u, p)
+        expected_grid = (p["P_load"] + u["P_bat_ch"] + u["P_elz"] + u["P_hp"]
+                         + u["P_eboiler"] - p["P_pv"] - u["P_bat_dis"] - u["P_fc"])
+        assert m["P_grid_kW"] == pytest.approx(expected_grid, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# Shared physical-invariant suite — used by BOTH the regenerated integration run and
-# the committed-CSV checks, so they assert exactly the same things.
+# 3. Physical invariants on a short two-controller integration run
 # ---------------------------------------------------------------------------
 def operating_rows(df):
     """Drop the terminal-state row (NaN exogenous inputs); keep true operating hours."""
@@ -654,7 +600,9 @@ def operating_rows(df):
 def assert_physical_invariants(df):
     op = operating_rows(df)
     # electricity balance closes exactly (slack-bus construction)
-    assert df["elec_residual_kW"].abs().max() < 1e-6
+    residual = (op.u_P_grid + op.P_pv_kW + op.u_P_bat_dis + op.u_P_fc
+                - op.P_load_kW - op.u_P_bat_ch - op.u_P_elz - op.u_P_hp - op.u_P_eboiler)
+    assert residual.abs().max() < 1e-6
     # no store charges and discharges in the same operating hour (battery, TES, H2)
     assert ((op.u_P_bat_ch > 1.0) & (op.u_P_bat_dis > 1.0)).sum() == 0
     assert ((op.u_Q_tes_ch > 1.0) & (op.u_Q_tes_dis > 1.0)).sum() == 0
@@ -669,20 +617,18 @@ def assert_physical_invariants(df):
     assert df.T_in_C.max() <= T_HARD_MAX_C + 1e-6
 
 
-# ---------------------------------------------------------------------------
-# 2b. Fast deterministic end-to-end integration (does NOT rely on committed CSVs)
-# ---------------------------------------------------------------------------
 def test_integration_short_run_full_invariants_and_mpc_not_worse():
-    """Regenerate a short real-data window for both controllers and assert the SAME
-    physical-invariant suite used on committed results, plus MPC <= baseline cost."""
-    from greenhouse_energy_hub.simulation import ValidRun, load_data, run_simulation
-    df = load_data(start_month=1, n_days=2)          # deterministic 2-day winter window
-    base_run = run_simulation(df, mode="baseline")
-    mpc_run = run_simulation(df, mode="mpc")
+    """Run both controllers over a two-day winter window; check invariants and
+    that MPC grid cost is not worse than the baseline."""
+    from greenhouse_energy_hub.simulation import ValidRun
+
+    scenario = load_window(start_month=1, n_days=2)
+    base_run = run_controller(scenario, mode="baseline")
+    mpc_run = run_controller(scenario, mode="mpc")
     assert isinstance(base_run, ValidRun)
     assert isinstance(mpc_run, ValidRun)
-    base = base_run.to_frame()
-    mpc = mpc_run.to_frame()
+    base = run_to_frame(base_run)
+    mpc = run_to_frame(mpc_run)
     assert_physical_invariants(base)
     assert_physical_invariants(mpc)
     assert mpc["grid_cost_EUR"].sum() <= base["grid_cost_EUR"].sum() + 1e-6
@@ -692,7 +638,9 @@ def test_import_fee_smoothing_error_is_bounded():
     """The MPC's smooth import volume tracks the exact max(0, P_grid) used by the plant
     to within the documented epsilon (worst case 0.5 kW at P_grid=0), so the solver
     objective stays close to the realised/reported cost."""
+    from greenhouse_energy_hub.controllers.mpc import IMPORT_SMOOTH_EPS2
+
     P = np.linspace(-2000.0, 2000.0, 4001)
-    smooth = 0.5 * (P + np.sqrt(P**2 + 1.0))   # must match mpc_controller IMPORT_SMOOTH_EPS2
+    smooth = 0.5 * (P + np.sqrt(P**2 + IMPORT_SMOOTH_EPS2))
     exact = np.maximum(0.0, P)
     assert np.max(np.abs(smooth - exact)) <= 0.5 + 1e-9

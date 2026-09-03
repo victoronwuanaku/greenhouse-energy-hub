@@ -1,6 +1,6 @@
 # Greenhouse Energy Hub MPC
 
-Rolling-horizon economic **Model Predictive Control (MPC)** for a multi-carrier greenhouse energy hub (electricity · heat · hydrogen). The controller coordinates solar PV, a battery, a hydrogen electrolyser/fuel-cell buffer, a heat pump, an electric boiler and thermal storage against real Dutch day-ahead electricity prices, minimising operating cost while keeping the crop inside its temperature comfort band.
+Rolling-horizon economic **Model Predictive Control (MPC)** for a multi-carrier greenhouse energy hub (electricity, heat, hydrogen). The controller coordinates solar PV, a battery, a hydrogen electrolyser/fuel-cell buffer, a heat pump, an electric boiler and thermal storage against real Dutch day-ahead electricity prices, minimising operating cost while keeping the crop inside its temperature comfort band.
 
 **System modelled:** a representative 1 ha (10,000 m²) high-tech, lit Dutch (Westland) tomato greenhouse.
 
@@ -8,7 +8,7 @@ Rolling-horizon economic **Model Predictive Control (MPC)** for a multi-carrier 
 
 ## Motivation
 
-Dutch greenhouses have historically provided grid flexibility through **Combined Heat and Power (CHP)** units — gas engines producing electricity (sold to the grid) and heat (for the crop). As the Netherlands phases out fossil CHP, that dispatchable flexibility disappears. Replacing it requires an MPC-orchestrated multi-carrier hub combining:
+Dutch greenhouses have historically provided grid flexibility through **Combined Heat and Power (CHP)** units,  gas engines producing electricity (sold to the grid) and heat (for the crop). As the Netherlands phases out fossil CHP, that dispatchable flexibility disappears. Replacing it requires an MPC-orchestrated multi-carrier hub combining:
 
 - **Battery** — short-term price arbitrage and peak shaving
 - **Electrolyser + H₂ tank + fuel cell** — a multi-day buffer; the *green analogue of the CHP* (surplus electricity → H₂ → electricity **and** heat on demand)
@@ -97,7 +97,7 @@ $$\min_{u_k,\ldots,u_{k+N-1}} \;\; \sum_{i=0}^{N-1}\Big[\; \underbrace{\lambda(k
 subject to
 
 - **Storage dynamics** — battery SOC, H₂ inventory, thermal store, greenhouse temperature (implicit-Euler thermal node, unconditionally stable).
-- **Electricity balance** — $P_{\text{grid}} + P_{\text{pv}} + P_{\text{bat,dis}} + P_{\text{fc}} = P_{\text{load}} + P_{\text{bat,ch}} + P_{\text{elz}} + P_{\text{hp}} + P_{\text{eb}}$. The grid is the **slack bus** (a derived expression), so the balance holds *exactly by construction* — avoiding the degenerate squared-equality constraint of the original prototype.
+- **Electricity balance** — $P_{\text{grid}} + P_{\text{pv}} + P_{\text{bat,dis}} + P_{\text{fc}} = P_{\text{load}} + P_{\text{bat,ch}} + P_{\text{elz}} + P_{\text{hp}} + P_{\text{eb}}$. The grid is the **slack bus** (a derived expression), so the balance holds exactly by construction.
 - **Asymmetric grid tariff** — imported energy pays wholesale price + a transport/levy surcharge; exports earn wholesale only. This breaks symmetric buy=sell arbitrage and tempers negative-price gaming. The import volume uses a smooth $\max(0, P_{\text{grid}})$ so the objective stays differentiable for IPOPT.
 - **Power-to-heat feasibility** — the thermal store can only charge from generated heat.
 - **Comfort band** — $T_{\text{in}}\in[16,24]\,°\mathrm{C}$ as a *soft* constraint (slack-penalised), so the problem stays feasible when summer solar gain physically exceeds ventilation capacity.
@@ -113,32 +113,29 @@ subject to
 ```
 greenhouse-energy-hub-mpc/
 ├── src/greenhouse_energy_hub/
-│   ├── hub.py               # shared numerical/symbolic physics and capabilities
-│   ├── simulation.py        # validated rolling-horizon execution
-│   ├── scenarios.py         # time semantics, retained inputs, and provenance
-│   ├── evaluation.py        # scorecards, Run Bundles, verification, publication
+│   ├── hub.py               # asset sizing, bounds, shared plant physics
+│   ├── simulation.py        # rolling-horizon loop with run validation
+│   ├── scenarios.py         # scenario clock, input alignment, provenance
+│   ├── evaluation.py        # cost accounting, Run Bundles, verification
 │   └── controllers/
-│       ├── baseline.py      # characterized limited-capability baseline policy
-│       └── mpc.py           # do-mpc/CasADi controller Adapter
+│       ├── baseline.py      # limited-capability rule-based baseline
+│       └── mpc.py           # do-mpc / CasADi controller
 ├── scripts/
-│   ├── fetch_pvgis.py       # optional PV/weather network acquisition
-│   ├── fetch_prices.py      # optional price network acquisition
-│   └── generate_demand.py   # deterministic derived-demand materialization
-├── data/
-│   ├── source/              # retained acquired CSV bytes and provenance sidecars
-│   └── derived/             # reproducible demand view and provenance sidecar
+│   ├── fetch_pvgis.py       # PV/weather acquisition (network)
+│   └── fetch_prices.py      # day-ahead price acquisition (network)
+├── data/source/             # committed input CSVs and provenance sidecars
 ├── experiments/
-│   ├── run_scenario.py      # validated Baseline/MPC Run entry point
-│   ├── ablations.py         # full/no-H₂/no-TES/one-step study
-│   └── publish_results.py   # verified manifest/README/figure regeneration
-├── tests/                   # physics, Scenario, simulation, evaluation, publication
-├── notebooks/
-│   └── results_analysis.ipynb  # shared committed-manifest consumer
-├── pyproject.toml           # installable src-layout package and test configuration
+│   ├── run_scenario.py      # run one baseline or MPC scenario
+│   ├── ablations.py         # full / no-H₂ / no-TES / one-step study
+│   └── publish_results.py   # regenerate manifest, figures, README block
+├── tests/
+├── notebooks/results_analysis.ipynb
+├── docs/                    # terminology and architecture decision records
+├── pyproject.toml
 └── results/
-    ├── runs/                # immutable full-ID Run Bundles
-    ├── publication_manifest.json  # tracked exact publication recipe
-    └── figures/             # regenerated fig1–fig6 used by the README
+    ├── runs/                # immutable Run Bundles
+    ├── publication_manifest.json
+    └── figures/
 ```
 
 ---
@@ -172,22 +169,21 @@ checks that committed publication bytes remain unchanged.
 
 ### Optional input refresh
 
-These commands deliberately perform network acquisition and replace retained input
-bytes. They are for creating a new study, not reproducing the committed publication;
-new source hashes necessarily produce new Run Specification and Run Bundle IDs.
+These commands fetch from the network and overwrite the committed input files. Use
+them to start a new study, not to reproduce the committed publication: new source
+hashes produce new Run Specification and Run Bundle IDs.
 
 ```bash
 python scripts/fetch_pvgis.py
 python scripts/fetch_prices.py
-python scripts/generate_demand.py --target-year 2023
 ```
 
 ### Full publication Run generation
 
-To generate a fresh candidate index, run the exact approved 14-local-day
-windows below. The shared Scenario always carries 24 forecast-coverage steps; the
-Baseline uses horizon zero, the full MPC uses horizon 24, and only the one-step
-ablation changes controller horizon.
+To generate a fresh candidate index, run the 14-day windows below. Each Scenario
+carries 24 steps of forecast coverage beyond the operating window; the baseline
+uses horizon zero, the full MPC uses horizon 24, and only the one-step ablation
+changes the controller horizon.
 
 ```bash
 python experiments/run_scenario.py \
@@ -232,7 +228,7 @@ python -m pytest -o addopts='' -q -ra
 |---------|--------|----------|
 | Solar PV + weather | PVGIS-SARAH2 (EU JRC), Westland 52.0 °N 4.25 °E | 2020, hourly |
 | NL day-ahead prices | energy-charts.info (Fraunhofer ISE / ENTSO-E) | 2023, hourly |
-| Greenhouse electrical load | Synthetic, WUR-parameterised (Warmenhoven et al. 2023) | hourly |
+| Greenhouse electrical load | Synthetic: 12 W/m² base load plus a seasonal 06:00–22:00 LED schedule (≤120 W/m²) dimmed with irradiance (`scenarios.derive_electrical_demand`) | hourly, derived per scenario |
 
 PV/weather (2020) and prices (2023) come from different years. The Scenario Module
 validates exact hourly UTC source coverage and transplants PV/weather by
@@ -254,23 +250,12 @@ is **not** prescribed: it is implicit in the greenhouse temperature ODE.
 
 ---
 
-## Limitations
-
-- **Perfect foresight.** Forecasts are the realised data — an upper bound on achievable savings. A natural next step is forecast error / robust or stochastic MPC.
-- **Limited-capability baseline.** The baseline is a frugal reactive thermostat, not a tuned commercial greenhouse EMS, so the comparison is not against the state of the art.
-- **Simplified market.** A flat import surcharge over the wholesale price — no capacity charges, time-of-use network tariffs, imbalance settlement, or explicit export limits beyond the grid power cap. Arbitrage value is therefore somewhat optimistic. The MPC objective uses a smooth `max(0, P_grid)` (ε = 1 kW) for the import fee; the reported cost uses the exact `max`, so published savings are unaffected (bounded in `tests/`).
-- **Toy thermal model.** A single-zone lumped-capacitance ODE; humidity, CO₂ and crop growth are out of scope.
-- **Summer overheating.** On hot, high-irradiance hours the solar gain physically exceeds ventilation capacity, so the comfort band is violated by both controllers (a real greenhouse would add active cooling).
-- **Indicative asset sizing.** Capacities are reasonable for a high-tech 1 ha greenhouse but are provisional, not calibrated to a specific site.
-
----
-
 ## Key references
 
-1. **McAllister, R.D. et al. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278*
+1. **Msaad, S., Harraway, M. & McAllister, R.D. (2025).** RL-Guided MPC for Autonomous Greenhouse Control. *arXiv:2506.13278*
 2. **Fiedler, F. et al. (2023).** do-mpc: Towards FAIR nonlinear and robust MPC. *Control Engineering Practice, 140*, 105676.
 3. **Geidl, M. & Andersson, G. (2007).** Optimal power flow of multiple energy carriers. *IEEE Trans. Power Syst. 22*(1), 145–155 — the energy-hub framework used in `src/greenhouse_energy_hub/hub.py`.
-4. **Coordinated distributed MPC for multi-energy carrier systems** (2024). *Scientific Reports.*
+4. **El-Afifi, M.I., Eladl, A.A., El-Saadawi, M.M., Sedhom, B.E. & Osman, S.F. (2024).** Coordinated distributed model predictive control for multi energy carrier systems. *Scientific Reports, 14*, 27688. https://doi.org/10.1038/s41598-024-78314-5
 5. **Andersson, J.A.E. et al. (2019).** CasADi: a software framework for nonlinear optimization and optimal control. *Math. Prog. Computation, 11*(1), 1–36.
 
 ---

@@ -229,7 +229,6 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
     from greenhouse_energy_hub.evaluation import (
         load_verified_publication_evidence,
         read_publication_manifest,
-        regenerate_publication_artifacts,
     )
 
     publisher = _load_publish_results_module()
@@ -246,7 +245,7 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
     ]
     before = {path: path.read_bytes() for path in repository_outputs}
 
-    regenerated = regenerate_publication_artifacts(
+    regenerated = publisher.regenerate_publication_artifacts(
         candidate_index=missing_candidates,
         manifest_path=manifest_path,
         repository_root=ROOT,
@@ -254,7 +253,6 @@ def test_clean_checkout_regenerates_exact_publication_from_manifest_only(tmp_pat
         figures_root=figures_root,
         readme_path=readme_path,
     )
-    publisher.format_readme_evidence_presentation(readme_path)
     committed = read_publication_manifest(
         ROOT / "results" / "publication_manifest.json"
     )
@@ -1283,10 +1281,10 @@ def test_publication_rejects_malformed_manifest_mapping():
 def test_readme_rewrite_preserves_bytes_outside_generated_markers(tmp_path):
     from greenhouse_energy_hub.evaluation import (
         read_publication_manifest,
-        rewrite_publication_readme_block,
         load_verified_publication_evidence,
     )
 
+    publisher = _load_publish_results_module()
     readme = tmp_path / "README.md"
     before = (ROOT / "README.md").read_bytes()
     readme.write_bytes(before)
@@ -1296,11 +1294,7 @@ def test_readme_rewrite_preserves_bytes_outside_generated_markers(tmp_path):
         repository_root=ROOT,
     )
 
-    rewrite_publication_readme_block(
-        readme,
-        candidates=evidence.candidates,
-        summaries=evidence.summaries,
-    )
+    publisher.rewrite_readme_block(readme, evidence.summaries)
     after = readme.read_bytes()
     begin = before.index(b"<!-- BEGIN GENERATED RESULTS: DO NOT EDIT -->")
     before_end = before.index(b"<!-- END GENERATED RESULTS -->")

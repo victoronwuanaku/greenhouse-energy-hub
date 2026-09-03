@@ -1,7 +1,8 @@
-"""Run one validated greenhouse-hub experiment and persist its evidence.
+"""Run one greenhouse-hub experiment and persist its evidence.
 
-This entry point selects configurations only. Physics, Run validation,
-evaluation, and serialization remain owned by their package Modules.
+Builds the Scenario, hub configuration and controller from command-line
+options, runs the simulation, and writes either a verified Run Bundle or
+failure diagnostics.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from greenhouse_energy_hub.evaluation import (
     EvaluationPolicy,
     RunBundle,
     RunSpecification,
-    _capture_publication_context,
+    capture_publication_context,
     build_run_specification,
     canonical_json_bytes,
     create_run_bundle,
@@ -115,11 +116,12 @@ def build_controller(
         horizon_steps=horizon_steps,
         terminal_weight=terminal_weight,
     )
-    mpc, _ = build_mpc(hub_configuration, configuration)
+    mpc, forecast_source = build_mpc(hub_configuration, configuration)
     mpc.x0 = hub_state_array(initial_state(hub_configuration))
     mpc.set_initial_guess()
     return MpcControllerAdapter(
         mpc=mpc,
+        forecast_source=forecast_source,
         forecast_horizon_steps=horizon_steps,
         configuration=configuration.to_controller_metadata(),
         capability_policy=asdict(hub_configuration.capabilities),
@@ -226,7 +228,7 @@ def record_publication_candidate(
     candidate_index: str | Path = CANDIDATE_INDEX,
     repository_root: str | Path = ROOT,
 ) -> None:
-    """Atomically update a non-authoritative key-to-verified-full-ID map."""
+    """Update one key in the gitignored candidate index."""
     if not isinstance(candidate_key, str) or CANDIDATE_KEY.fullmatch(candidate_key) is None:
         raise ValueError("publication candidate key must be a stable nonempty name")
     if not isinstance(bundle, RunBundle):
@@ -278,7 +280,7 @@ def execute_experiment(
         controller_name,
         extra_paths=extra_executable_paths,
     )
-    publication_context = _capture_publication_context(
+    publication_context = capture_publication_context(
         paths,
         repository_root=root,
     )
@@ -310,7 +312,7 @@ def execute_experiment(
         policy,
         executable_paths=paths,
         repository_root=root,
-        _publication_context=publication_context,
+        publication_context=publication_context,
     )
     output_root = Path(results_root)
     if not output_root.is_absolute():
