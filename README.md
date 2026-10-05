@@ -185,29 +185,6 @@ carries 24 steps of forecast coverage beyond the operating window; the baseline
 uses horizon zero, the full MPC uses horizon 24, and only the one-step ablation
 changes the controller horizon.
 
-```bash
-python experiments/run_scenario.py \
-    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
-    --days 14 --controller baseline --scenario-max-horizon 24 \
-    --candidate-key winter-baseline
-python experiments/run_scenario.py \
-    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
-    --days 14 --controller mpc --horizon 24 --scenario-max-horizon 24 \
-    --candidate-key winter-mpc
-python experiments/run_scenario.py \
-    --name summer-2023-14d --start 2023-06-01T00:00:00+02:00 \
-    --days 14 --controller baseline --scenario-max-horizon 24 \
-    --candidate-key summer-baseline
-python experiments/run_scenario.py \
-    --name summer-2023-14d --start 2023-06-01T00:00:00+02:00 \
-    --days 14 --controller mpc --horizon 24 --scenario-max-horizon 24 \
-    --candidate-key summer-mpc
-python experiments/ablations.py \
-    --name winter-2023-14d --start 2023-01-02T00:00:00+01:00 \
-    --days 14 --scenario-max-horizon 24 \
-    --candidate-index results/diagnostics/publication-candidates.json
-```
-
 The ablation command records `ablation-full`, `ablation-no-h2`,
 `ablation-no-tes`, and `ablation-one-step`; together with the four explicit
 comparison keys above, the candidate index has exactly the required eight roles.
